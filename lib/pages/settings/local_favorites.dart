@@ -21,6 +21,36 @@ class _LocalFavoritesSettingsState extends State<LocalFavoritesSettings> {
           title: "Auto close favorite panel after operation".tl,
           settingKey: "autoCloseFavoritePanel",
         ).toSliver(),
+        _SwitchSetting(
+          title: "Auto delete read downloaded chapters".tl,
+          subtitle: "Only read downloaded chapters will be removed automatically."
+              .tl,
+          settingKey: "enableAutoDeleteReadDownloadedChapters",
+          onChanged: () {
+            LocalManager().applyReadDownloadedChapterRetention();
+          },
+        ).toSliver(),
+        SliverToBoxAdapter(
+          child: AnimatedBuilder(
+            animation: appdata.settings,
+            builder: (context, child) {
+              if (appdata.settings['enableAutoDeleteReadDownloadedChapters'] !=
+                  true) {
+                return const SizedBox.shrink();
+              }
+              return _SliderSetting(
+                title: "Read downloaded chapter retention limit".tl,
+                settingsIndex: "autoDeleteReadDownloadedChaptersLimit",
+                min: 0,
+                max: 500,
+                interval: 1,
+                onChanged: () {
+                  LocalManager().applyReadDownloadedChapterRetention();
+                },
+              );
+            },
+          ),
+        ),
         SelectSetting(
           title: "Add new favorite to".tl,
           settingKey: "newFavoriteAddTo",

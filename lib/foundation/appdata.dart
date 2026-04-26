@@ -234,6 +234,8 @@ class Settings with ChangeNotifier {
     'readerScrollSpeed': 1.0, // 0.5 - 3.0
     'localFavoritesFirst': true,
     'autoCloseFavoritePanel': false,
+    'enableAutoDeleteReadDownloadedChapters': false,
+    'autoDeleteReadDownloadedChaptersLimit': 100,
     'showChapterComments': true, // show chapter comments in reader
     'showChapterCommentsAtEnd':
         false, // show chapter comments at end of chapter

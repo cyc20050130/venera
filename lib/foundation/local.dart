@@ -5,8 +5,10 @@ import 'package:flutter/widgets.dart' show ChangeNotifier;
 import 'package:flutter_saf/flutter_saf.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:sqlite3/sqlite3.dart';
+import 'package:venera/foundation/appdata.dart';
 import 'package:venera/foundation/comic_source/comic_source.dart';
 import 'package:venera/foundation/comic_type.dart';
+import 'package:venera/foundation/download_chapter_retention.dart';
 import 'package:venera/foundation/favorites.dart';
 import 'package:venera/foundation/log.dart';
 import 'package:venera/network/download.dart';
@@ -277,6 +279,15 @@ class LocalManager with ChangeNotifier {
         PRIMARY KEY (id, comic_type)
       );
     ''');
+    _db.execute('''
+      CREATE TABLE IF NOT EXISTS read_downloaded_chapters (
+        comic_id TEXT NOT NULL,
+        comic_type INTEGER NOT NULL,
+        chapter_id TEXT NOT NULL,
+        finished_read_at INTEGER NOT NULL,
+        PRIMARY KEY (comic_id, comic_type, chapter_id)
+      );
+    ''');
     if (File(FilePath.join(App.dataPath, 'local_path')).existsSync()) {
       path = File(FilePath.join(App.dataPath, 'local_path')).readAsStringSync();
       if (!directory.existsSync()) {
@@ -295,7 +306,9 @@ class LocalManager with ChangeNotifier {
     _checkPathValidation();
     _checkNoMedia();
     await ComicSourceManager().ensureInit();
+    await appdata.ensureInit();
     restoreDownloadingTasks();
+    applyReadDownloadedChapterRetention();
   }
 
   String findValidId(ComicType type) {
@@ -338,6 +351,7 @@ class LocalManager with ChangeNotifier {
   }
 
   void remove(String id, ComicType comicType) async {
+    _deleteReadDownloadedChapterRecordsForComic(id, comicType);
     _db.execute(
       'DELETE FROM comics WHERE id = ? AND comic_type = ?;',
       [id, comicType.value],
@@ -370,6 +384,236 @@ class LocalManager with ChangeNotifier {
       return null;
     }
     return LocalComic.fromRow(res.first);
+  }
+
+  bool get _isAutoDeleteReadDownloadedChaptersEnabled =>
+      appdata.settings['enableAutoDeleteReadDownloadedChapters'] == true;
+
+  int get _autoDeleteReadDownloadedChaptersLimit {
+    final value = appdata.settings['autoDeleteReadDownloadedChaptersLimit'];
+    if (value is num) {
+      return value.toInt();
+    }
+    return 100;
+  }
+
+  void markDownloadedChapterRead(String id, ComicType type, String chapterId) {
+    if (!_isAutoDeleteReadDownloadedChaptersEnabled || chapterId == '0') {
+      return;
+    }
+
+    final comic = find(id, type);
+    if (comic == null ||
+        comic.chapters == null ||
+        !comic.downloadedChapters.contains(chapterId)) {
+      return;
+    }
+
+    _db.execute(
+      '''
+      INSERT OR REPLACE INTO read_downloaded_chapters
+      (comic_id, comic_type, chapter_id, finished_read_at)
+      VALUES (?, ?, ?, ?);
+      ''',
+      [
+        id,
+        type.value,
+        chapterId,
+        DateTime.now().millisecondsSinceEpoch,
+      ],
+    );
+
+    _applyReadDownloadedChapterRetention();
+  }
+
+  void applyReadDownloadedChapterRetention() {
+    if (!_isAutoDeleteReadDownloadedChaptersEnabled) {
+      return;
+    }
+    _applyReadDownloadedChapterRetention();
+  }
+
+  void backfillReadDownloadedChaptersFromHistory() {
+    if (!_isAutoDeleteReadDownloadedChaptersEnabled ||
+        !HistoryManager().isInitialized) {
+      return;
+    }
+
+    final histories = HistoryManager().getAll();
+    for (final history in histories) {
+      final comic = find(history.id, history.type);
+      if (comic == null || comic.chapters == null) {
+        continue;
+      }
+
+      final entries = buildBackfillEntries(
+        comicId: history.id,
+        comicType: history.type.value,
+        chapters: comic.chapters!,
+        downloadedChapterIds: comic.downloadedChapters,
+        readEpisodes: history.readEpisode,
+        finishedReadAt: history.time,
+      );
+
+      for (final entry in entries) {
+        _db.execute(
+          '''
+          INSERT OR IGNORE INTO read_downloaded_chapters
+          (comic_id, comic_type, chapter_id, finished_read_at)
+          VALUES (?, ?, ?, ?);
+          ''',
+          [
+            entry.key.comicId,
+            entry.key.comicType,
+            entry.key.chapterId,
+            entry.finishedReadAt.millisecondsSinceEpoch,
+          ],
+        );
+      }
+    }
+
+    _applyReadDownloadedChapterRetention();
+  }
+
+  void _applyReadDownloadedChapterRetention() {
+    final rows = _db.select('''
+      SELECT comic_id, comic_type, chapter_id, finished_read_at
+      FROM read_downloaded_chapters;
+    ''');
+
+    final loadedEntries = <DownloadChapterRetentionEntry>[];
+    final staleKeys = <DownloadChapterRetentionKey>[];
+
+    for (final row in rows) {
+      final comicId = row['comic_id'] as String;
+      final comicType = row['comic_type'] as int;
+      final chapterId = row['chapter_id'] as String;
+      final finishedReadAt = row['finished_read_at'] as int?;
+
+      final key = DownloadChapterRetentionKey(
+        comicId: comicId,
+        comicType: comicType,
+        chapterId: chapterId,
+      );
+
+      if (finishedReadAt == null) {
+        staleKeys.add(key);
+        continue;
+      }
+      loadedEntries.add(
+        DownloadChapterRetentionEntry(
+          key: key,
+          finishedReadAt: DateTime.fromMillisecondsSinceEpoch(finishedReadAt),
+        ),
+      );
+    }
+
+    final validation = validateRetentionEntries(
+      loadedEntries,
+      isAvailable: (key) {
+        final comic = find(key.comicId, ComicType(key.comicType));
+        return comic != null &&
+            comic.chapters != null &&
+            comic.downloadedChapters.contains(key.chapterId);
+      },
+    );
+
+    final allStaleKeys = [...staleKeys, ...validation.staleKeys];
+    if (allStaleKeys.isNotEmpty) {
+      _deleteReadDownloadedChapterRecords(allStaleKeys);
+    }
+
+    final tracker = DownloadChapterRetentionTracker.fromEntries(
+      validation.validEntries,
+    );
+
+    final excess = tracker.selectExcess(
+      limit: _autoDeleteReadDownloadedChaptersLimit,
+    );
+    if (excess.isEmpty) {
+      return;
+    }
+
+    final chaptersByComic = groupEntriesByComic(excess);
+
+    for (final entry in chaptersByComic.entries) {
+      final comic = find(entry.key.comicId, ComicType(entry.key.comicType));
+      if (comic == null) {
+        _deleteReadDownloadedChapterRecordsForComic(
+          entry.key.comicId,
+          ComicType(entry.key.comicType),
+        );
+        continue;
+      }
+      deleteComicChapters(comic, entry.value);
+    }
+  }
+
+  void _deleteReadDownloadedChapterRecords(
+    Iterable<DownloadChapterRetentionKey> keys,
+  ) {
+    final keyList = keys.toList();
+    if (keyList.isEmpty) {
+      return;
+    }
+
+    _db.execute('BEGIN TRANSACTION;');
+    try {
+      for (final key in keyList) {
+        _db.execute(
+          '''
+          DELETE FROM read_downloaded_chapters
+          WHERE comic_id = ? AND comic_type = ? AND chapter_id = ?;
+          ''',
+          [key.comicId, key.comicType, key.chapterId],
+        );
+      }
+      _db.execute('COMMIT;');
+    } catch (e) {
+      _db.execute('ROLLBACK;');
+      rethrow;
+    }
+  }
+
+  void _deleteReadDownloadedChapterRecordsForComic(
+    String id,
+    ComicType type,
+  ) {
+    _db.execute(
+      '''
+      DELETE FROM read_downloaded_chapters
+      WHERE comic_id = ? AND comic_type = ?;
+      ''',
+      [id, type.value],
+    );
+  }
+
+  void _deleteReadDownloadedChapterRecordsForChapters(
+    String id,
+    ComicType type,
+    Iterable<String> chapterIds,
+  ) {
+    final chapters = chapterIds.toList();
+    if (chapters.isEmpty) {
+      return;
+    }
+
+    _db.execute('BEGIN TRANSACTION;');
+    try {
+      for (final chapterId in chapters) {
+        _db.execute(
+          '''
+          DELETE FROM read_downloaded_chapters
+          WHERE comic_id = ? AND comic_type = ? AND chapter_id = ?;
+          ''',
+          [id, type.value, chapterId],
+        );
+      }
+      _db.execute('COMMIT;');
+    } catch (e) {
+      _db.execute('ROLLBACK;');
+      rethrow;
+    }
   }
 
   @override
@@ -581,6 +825,11 @@ class LocalManager with ChangeNotifier {
     if (chapters.isEmpty) {
       return;
     }
+    _deleteReadDownloadedChapterRecordsForChapters(
+      c.id,
+      c.comicType,
+      chapters,
+    );
     var newDownloadedChapters = c.downloadedChapters
         .where((e) => !chapters.contains(e))
         .toList();
@@ -630,6 +879,7 @@ class LocalManager with ChangeNotifier {
             shouldRemovedDirs.add(dir);
           }
         }
+        _deleteReadDownloadedChapterRecordsForComic(c.id, c.comicType);
         _db.execute(
           'DELETE FROM comics WHERE id = ? AND comic_type = ?;',
           [c.id, c.comicType.value],

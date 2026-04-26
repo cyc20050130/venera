@@ -333,6 +333,9 @@ class _ReaderState extends State<Reader>
       if (page >= maxPage) {
         /// Record the last image of chapter
         history!.page = images?.length ?? 1;
+        if (widget.chapters != null) {
+          LocalManager().markDownloadedChapterRead(cid, type, eid);
+        }
       } else {
         /// Record the first image of the page
         if (!showSingleImageOnFirstPage() || imagesPerPage == 1) {
