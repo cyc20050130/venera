@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
+import 'package:venera/foundation/comic_details_repository.dart';
 import 'package:venera/foundation/favorites.dart';
 import 'package:venera/foundation/log.dart';
 import 'package:venera/utils/channel.dart';
@@ -20,7 +21,12 @@ Future<ComicUpdateResult> updateComic(
       if (comicSource == null) {
         return ComicUpdateResult(false, "Comic source not found");
       }
-      var newInfo = (await comicSource.loadComicInfo!(c.id)).data;
+      var newInfo = (await ComicDetailsRepository().load(
+        comicSource.key,
+        c.id,
+        forceRefresh: true,
+        refreshIfStale: false,
+      )).data;
 
       var newTags = <String>[];
       for (var entry in newInfo.tags.entries) {

@@ -124,7 +124,9 @@ class ImagesDownloadTask extends DownloadTask with _TransferSpeedMixin {
         });
       } else if (chapters != null) {
         for (var c in chapters!) {
-          var dir = Directory(FilePath.join(path!, c));
+          var dir = Directory(
+            FilePath.join(path!, LocalManager.getChapterDirectoryName(c)),
+          );
           if (dir.existsSync()) {
             dir.deleteSync(recursive: true);
           }
@@ -316,6 +318,7 @@ class ImagesDownloadTask extends DownloadTask with _TransferSpeedMixin {
         _cover = res.data;
         notifyListeners();
       }
+      await LocalManager().upsertPartialComic(_buildLocalComic(const []));
       await LocalManager().saveCurrentDownloadingTasks();
     }
 
@@ -376,6 +379,7 @@ class ImagesDownloadTask extends DownloadTask with _TransferSpeedMixin {
           } else {
             _images![i] = res.data;
             _totalCount += _images![i]!.length;
+            cpCount++;
           }
         }
       }
@@ -405,6 +409,7 @@ class ImagesDownloadTask extends DownloadTask with _TransferSpeedMixin {
         await LocalManager().saveCurrentDownloadingTasks();
       }
       _index = 0;
+      _markCurrentChapterDownloaded();
       _chapter++;
     }
 
@@ -487,6 +492,11 @@ class ImagesDownloadTask extends DownloadTask with _TransferSpeedMixin {
 
   @override
   LocalComic toLocalComic() {
+    return _buildLocalComic(chapters ?? comic?.chapters?.ids.toList() ?? []);
+  }
+
+  LocalComic _buildLocalComic(List<String> downloadedChapters) {
+    var old = LocalManager().find(id, comicType);
     return LocalComic(
       id: comic!.id,
       title: title,
@@ -498,9 +508,21 @@ class ImagesDownloadTask extends DownloadTask with _TransferSpeedMixin {
       chapters: comic!.chapters,
       cover: File(_cover!.split("file://").last).name,
       comicType: ComicType(source.key.hashCode),
-      downloadedChapters: chapters ?? comic?.chapters?.ids.toList() ?? [],
-      createdAt: DateTime.now(),
+      downloadedChapters: downloadedChapters,
+      createdAt: old?.createdAt ?? DateTime.now(),
     );
+  }
+
+  void _markCurrentChapterDownloaded() {
+    if (comic?.chapters == null || _images == null || path == null) {
+      return;
+    }
+    var chapterId = _images!.keys.elementAtOrNull(_chapter);
+    if (chapterId == null) {
+      return;
+    }
+    var comicModel = _buildLocalComic(const []);
+    LocalManager().markChapterDownloaded(comicModel, chapterId);
   }
 
   @override

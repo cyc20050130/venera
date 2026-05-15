@@ -1,6 +1,7 @@
 import 'dart:async' show Future;
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:venera/foundation/comic_details_repository.dart';
 import 'package:venera/foundation/local.dart';
 import 'package:venera/network/images.dart';
 import '../history.dart';
@@ -24,10 +25,14 @@ class HistoryImageProvider
       if (localComic != null) {
         return localComic.coverFile.readAsBytes();
       }
-      var comicSource =
-          history.type.comicSource ?? (throw "Comic source not found.");
-      var comic = await comicSource.loadComicInfo!(history.id);
+      var comic = await ComicDetailsRepository().load(
+        history.sourceKey,
+        history.id,
+      );
       checkStop();
+      if (comic.error) {
+        throw comic.errorMessage ?? "Comic source not found.";
+      }
       url = comic.data.cover;
       history.cover = url;
       HistoryManager().addHistory(history);

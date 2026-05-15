@@ -9,6 +9,7 @@ import 'package:flutter/services.dart';
 import 'package:flutter/widgets.dart' show ChangeNotifier;
 import 'package:sqlite3/sqlite3.dart';
 import 'package:venera/foundation/comic_source/comic_source.dart';
+import 'package:venera/foundation/comic_details_repository.dart';
 import 'package:venera/foundation/comic_type.dart';
 import 'package:venera/foundation/favorites.dart';
 import 'package:venera/foundation/image_provider/image_favorites_provider.dart';
@@ -455,7 +456,12 @@ void clearUnfavoritedHistory() {
     int retries = 3;
     while (true) {
       try {
-        var res = await comicSource.loadComicInfo!(history.id);
+        var res = await ComicDetailsRepository().load(
+          history.sourceKey,
+          history.id,
+          forceRefresh: true,
+          refreshIfStale: false,
+        );
         if (res.error) {
           await Future.delayed(const Duration(seconds: 2));
           retries--;

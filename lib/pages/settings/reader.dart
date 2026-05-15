@@ -442,6 +442,15 @@ class _ReaderSettingsState extends State<ReaderSettings> {
             useDeviceSettings: useDeviceSpecificSettings,
           ),
         ),
+        _SwitchSetting(
+          title: "Auto delete read downloaded chapters".tl,
+          subtitle:
+              "Only applies to downloaded chapters from network sources".tl,
+          settingKey: "autoDeleteReadChapters",
+          comicId: isEnabledSpecificSettings ? widget.comicId : null,
+          comicSource: isEnabledSpecificSettings ? widget.comicSource : null,
+          useDeviceSettings: useDeviceSpecificSettings,
+        ).toSliver(),
       ],
     );
   }

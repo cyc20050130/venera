@@ -21,6 +21,7 @@ import 'package:venera/foundation/app.dart';
 import 'package:venera/foundation/appdata.dart';
 import 'package:venera/foundation/cache_manager.dart';
 import 'package:venera/foundation/comic_source/comic_source.dart';
+import 'package:venera/foundation/comic_details_repository.dart';
 import 'package:venera/foundation/comic_type.dart';
 import 'package:venera/foundation/consts.dart';
 import 'package:venera/foundation/favorites.dart';
@@ -110,6 +111,8 @@ class Reader extends StatefulWidget {
 
 class _ReaderState extends State<Reader>
     with _ReaderLocation, _ReaderWindow, _VolumeListener, _ImagePerPageHandler {
+  final Set<int> _completedDownloadedChapters = {};
+
   @override
   void update() {
     setState(() {});
@@ -270,6 +273,7 @@ class _ReaderState extends State<Reader>
 
   @override
   void dispose() {
+    _deleteReadChapterIfNeeded(chapter);
     if (isFullscreen) {
       fullscreen();
     }
@@ -316,6 +320,44 @@ class _ReaderState extends State<Reader>
   }
 
   @override
+  bool toChapter(int c, {bool toLastPage = false}) {
+    final previousChapter = chapter;
+    final changed = super.toChapter(c, toLastPage: toLastPage);
+    if (changed) {
+      _deleteReadChapterIfNeeded(previousChapter);
+    }
+    return changed;
+  }
+
+  void _deleteReadChapterIfNeeded(int chapterNumber) {
+    if (widget.type == ComicType.local ||
+        widget.chapters == null ||
+        appdata.settings.getReaderSetting(
+              cid,
+              type.sourceKey,
+              'autoDeleteReadChapters',
+            ) !=
+            true ||
+        !_completedDownloadedChapters.contains(chapterNumber)) {
+      return;
+    }
+
+    final chapterId = widget.chapters!.ids.elementAtOrNull(chapterNumber - 1);
+    if (chapterId == null) {
+      return;
+    }
+    final localComic = LocalManager().find(cid, type);
+    if (localComic == null ||
+        !localComic.downloadedChapters.contains(chapterId)) {
+      return;
+    }
+    _completedDownloadedChapters.remove(chapterNumber);
+    Future.microtask(() {
+      LocalManager().deleteComicChapters(localComic, [chapterId]);
+    });
+  }
+
+  @override
   int get maxChapter => widget.chapters?.length ?? 1;
 
   @override
@@ -333,6 +375,7 @@ class _ReaderState extends State<Reader>
       if (page >= maxPage) {
         /// Record the last image of chapter
         history!.page = images?.length ?? 1;
+        _completedDownloadedChapters.add(chapter);
       } else {
         /// Record the first image of the page
         if (!showSingleImageOnFirstPage() || imagesPerPage == 1) {

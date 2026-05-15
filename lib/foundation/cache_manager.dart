@@ -3,6 +3,7 @@ import 'dart:isolate';
 
 import 'package:crypto/crypto.dart';
 import 'package:sqlite3/sqlite3.dart';
+import 'package:venera/foundation/log.dart';
 import 'package:venera/utils/io.dart';
 
 import 'app.dart';
@@ -22,6 +23,8 @@ class CacheManager {
   int dir = 0;
 
   int _limitSize = 2 * 1024 * 1024 * 1024;
+
+  bool _maintenanceScheduled = false;
 
   static Future<int> _scanDir(Pointer<void> dbP, String dir) async {
     var res = await Isolate.run(() async {
@@ -80,10 +83,6 @@ class CacheManager {
         type TEXT
       )
     ''');
-    _scanDir(_db.handle, cachePath).then((value) {
-      _currentSize = value;
-      checkCache();
-    });
   }
 
   /// Get the singleton instance of CacheManager.
@@ -92,6 +91,25 @@ class CacheManager {
   /// set cache size limit in MB
   void setLimitSize(int size) {
     _limitSize = size * 1024 * 1024;
+  }
+
+  void scheduleMaintenance([
+    Duration delay = const Duration(seconds: 3),
+  ]) {
+    if (_maintenanceScheduled) {
+      return;
+    }
+    _maintenanceScheduled = true;
+    Future.delayed(delay, () async {
+      try {
+        _currentSize = await _scanDir(_db.handle, cachePath);
+        await checkCache();
+      } catch (e, s) {
+        Log.error("CacheManager", "Failed to maintain cache: $e", s);
+      } finally {
+        _maintenanceScheduled = false;
+      }
+    });
   }
 
   /// Write cache to disk.
@@ -208,10 +226,7 @@ class CacheManager {
         limit 10
       ''');
       if (res.isEmpty) {
-        // There are many files unmanaged by the cache manager.
-        // Clear all cache.
-        await Directory(cachePath).delete(recursive: true);
-        Directory(cachePath).createSync(recursive: true);
+        _currentSize = 0;
         break;
       }
       for (var row in res) {

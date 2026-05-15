@@ -144,7 +144,12 @@ Future<List<FavoriteItem>> updateComicsInfo(String folder) async {
         var comicSource = c.type.comicSource;
         if (comicSource == null) return;
 
-        var newInfo = (await comicSource.loadComicInfo!(c.id)).data;
+        var newInfo = (await ComicDetailsRepository().load(
+          comicSource.key,
+          c.id,
+          forceRefresh: true,
+          refreshIfStale: false,
+        )).data;
 
         var newTags = <String>[];
         for (var entry in newInfo.tags.entries) {
