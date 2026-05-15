@@ -177,6 +177,10 @@ class ImagesDownloadTask extends DownloadTask with _TransferSpeedMixin {
   /// All images to download, key is chapter name
   Map<String, List<String>>? _images;
 
+  final List<String> _completedChapters = [];
+
+  final List<String> _failedChapters = [];
+
   /// Downloaded image count
   int _downloadedCount = 0;
 
@@ -318,7 +322,7 @@ class ImagesDownloadTask extends DownloadTask with _TransferSpeedMixin {
         _cover = res.data;
         notifyListeners();
       }
-      await LocalManager().upsertPartialComic(_buildLocalComic(const []));
+      await LocalManager().upsertPartialComic(_buildLocalComic(_completedChapters));
       await LocalManager().saveCurrentDownloadingTasks();
     }
 
@@ -374,8 +378,9 @@ class ImagesDownloadTask extends DownloadTask with _TransferSpeedMixin {
           }
           if (res.error) {
             Log.error("Download", res.errorMessage!);
-            _setError("Error: ${res.errorMessage}");
-            return;
+            _failedChapters.add(i);
+            cpCount++;
+            continue;
           } else {
             _images![i] = res.data;
             _totalCount += _images![i]!.length;
@@ -391,6 +396,7 @@ class ImagesDownloadTask extends DownloadTask with _TransferSpeedMixin {
     while (_chapter < _images!.length) {
       var images = _images![_images!.keys.elementAt(_chapter)]!;
       tasks.clear();
+      var chapterFailed = false;
       while (_index < images.length) {
         _scheduleTasks();
         var task = tasks[_index]!;
@@ -400,8 +406,9 @@ class ImagesDownloadTask extends DownloadTask with _TransferSpeedMixin {
         }
         if (task.error != null) {
           Log.error("Download", task.error.toString());
-          _setError("Error: ${task.error}");
-          return;
+          await _markCurrentChapterFailed();
+          chapterFailed = true;
+          break;
         }
         _index++;
         _downloadedCount++;
@@ -409,10 +416,18 @@ class ImagesDownloadTask extends DownloadTask with _TransferSpeedMixin {
         await LocalManager().saveCurrentDownloadingTasks();
       }
       _index = 0;
-      _markCurrentChapterDownloaded();
+      if (!chapterFailed) {
+        _markCurrentChapterDownloaded();
+      }
       _chapter++;
     }
 
+    if (_failedChapters.isNotEmpty) {
+      Log.warning(
+        "Download",
+        "Skipped chapters for $comicId: ${_failedChapters.join(', ')}",
+      );
+    }
     LocalManager().completeTask(this);
     stopRecorder();
   }
@@ -452,6 +467,8 @@ class ImagesDownloadTask extends DownloadTask with _TransferSpeedMixin {
       "totalCount": _totalCount,
       "index": _index,
       "chapter": _chapter,
+      "completedChapters": _completedChapters,
+      "failedChapters": _failedChapters,
     };
   }
 
@@ -481,7 +498,9 @@ class ImagesDownloadTask extends DownloadTask with _TransferSpeedMixin {
       .._downloadedCount = json["downloadedCount"]
       .._totalCount = json["totalCount"]
       .._index = json["index"]
-      .._chapter = json["chapter"];
+      .._chapter = json["chapter"]
+      .._completedChapters.addAll(ListOrNull.from(json["completedChapters"]) ?? [])
+      .._failedChapters.addAll(ListOrNull.from(json["failedChapters"]) ?? []);
   }
 
   @override
@@ -492,7 +511,7 @@ class ImagesDownloadTask extends DownloadTask with _TransferSpeedMixin {
 
   @override
   LocalComic toLocalComic() {
-    return _buildLocalComic(chapters ?? comic?.chapters?.ids.toList() ?? []);
+    return _buildLocalComic(_completedChapters);
   }
 
   LocalComic _buildLocalComic(List<String> downloadedChapters) {
@@ -521,8 +540,31 @@ class ImagesDownloadTask extends DownloadTask with _TransferSpeedMixin {
     if (chapterId == null) {
       return;
     }
+    if (!_completedChapters.contains(chapterId)) {
+      _completedChapters.add(chapterId);
+    }
     var comicModel = _buildLocalComic(const []);
     LocalManager().markChapterDownloaded(comicModel, chapterId);
+  }
+
+  Future<void> _markCurrentChapterFailed() async {
+    if (comic?.chapters == null || _images == null || path == null) {
+      return;
+    }
+    var chapterId = _images!.keys.elementAtOrNull(_chapter);
+    if (chapterId == null) {
+      return;
+    }
+    if (!_failedChapters.contains(chapterId)) {
+      _failedChapters.add(chapterId);
+    }
+    var dir = Directory(
+      FilePath.join(path!, LocalManager.getChapterDirectoryName(chapterId)),
+    );
+    await dir.deleteIgnoreError(recursive: true);
+    _message = "Skipped ${comic!.chapters![chapterId] ?? chapterId}";
+    notifyListeners();
+    await LocalManager().saveCurrentDownloadingTasks();
   }
 
   @override

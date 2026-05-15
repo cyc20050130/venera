@@ -139,6 +139,7 @@ class JsEngine with _JSEngineApi, JsUiApi, Init {
             var data = message["data"];
             var source = ComicSource.find(key)!;
             source.data[dataKey] = data;
+            source.clearLoginExpired();
             source.saveData();
           case 'delete_data':
             String key = message["key"];
@@ -165,10 +166,28 @@ class JsEngine with _JSEngineApi, JsUiApi, Init {
           case "load_setting":
             String key = message["key"];
             String settingKey = message["setting_key"];
-            var source = ComicSource.find(key)!;
-            return source.data["settings"]?[settingKey] ??
-                source.settings?[settingKey]!['default'] ??
-                (throw "Setting not found: $settingKey");
+            var source = ComicSource.find(key);
+            if (source == null) {
+              return null;
+            }
+            var storedSettings = source.data["settings"];
+            if (storedSettings is Map && storedSettings.containsKey(settingKey)) {
+              return storedSettings[settingKey];
+            }
+            var settings = source.getSettingsDynamic() ?? source.settings;
+            final configValue = settings?[settingKey];
+            if (configValue != null) {
+              final Map<Object?, Object?> configRaw =
+                  configValue as Map<Object?, Object?>;
+              final configMap = <String, dynamic>{};
+              for (final key in configRaw.keys) {
+                configMap[key.toString()] = configRaw[key];
+              }
+              if (configMap.containsKey("default")) {
+                return configMap["default"];
+              }
+            }
+            return null;
           case "isLogged":
             return ComicSource.find(message["key"])!.isLogged;
           // temporary solution for [setTimeout] function
