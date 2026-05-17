@@ -11,6 +11,7 @@ import 'package:venera/components/rich_comment_content.dart';
 import 'package:venera/foundation/app.dart';
 import 'package:venera/foundation/appdata.dart';
 import 'package:venera/foundation/comic_source/comic_source.dart';
+import 'package:venera/foundation/comic_details_repository.dart';
 import 'package:venera/foundation/comic_type.dart';
 import 'package:venera/foundation/consts.dart';
 import 'package:venera/foundation/favorites.dart';
@@ -68,6 +69,8 @@ class ComicPage extends StatefulWidget {
 
 class _ComicPageState extends LoadingState<ComicPage, ComicDetails>
     with _ComicPageActions {
+  bool _forceRefresh = false;
+
   @override
   History? history;
 
@@ -120,6 +123,12 @@ class _ComicPageState extends LoadingState<ComicPage, ComicDetails>
       );
     }
     return NetworkError(message: error!, retry: retry, action: action);
+  }
+
+  @override
+  void retry() {
+    _forceRefresh = true;
+    super.retry();
   }
 
   @override
@@ -247,7 +256,23 @@ class _ComicPageState extends LoadingState<ComicPage, ComicDetails>
       ComicType.fromKey(widget.sourceKey),
     );
     history = HistoryManager().findBySourceKey(widget.id, widget.sourceKey);
-    return comicSource.loadComicInfo!(widget.id);
+    final forceRefresh = _forceRefresh;
+    _forceRefresh = false;
+    return ComicDetailsRepository().load(
+      widget.sourceKey,
+      widget.id,
+      forceRefresh: forceRefresh,
+      onBackgroundUpdate: (details) async {
+        if (!mounted) {
+          return;
+        }
+        data = details;
+        await onDataLoaded();
+        if (mounted) {
+          update();
+        }
+      },
+    );
   }
 
   @override

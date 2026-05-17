@@ -25,6 +25,7 @@ class CacheManager {
 
   int _limitSize = 2 * 1024 * 1024 * 1024;
 
+  bool _maintenanceScheduled = false;
   bool _isChecking = false;
   bool _checkPending = false;
   Completer<void>? _checkCompleter;
@@ -153,6 +154,26 @@ class CacheManager {
   /// set cache size limit in MB
   void setLimitSize(int size) {
     _limitSize = size * 1024 * 1024;
+  }
+
+  void scheduleMaintenance([Duration delay = const Duration(seconds: 3)]) {
+    if (_maintenanceScheduled) {
+      return;
+    }
+    _maintenanceScheduled = true;
+    Future.delayed(delay, () async {
+      try {
+        await _ready;
+        final scanResult = await _scanDir(cachePath);
+        _currentSize = scanResult.$1;
+        await _cleanupUnmanagedFiles(scanResult.$2);
+        await checkCache();
+      } catch (e, s) {
+        Log.error("CacheManager", "Failed to maintain cache: $e", s);
+      } finally {
+        _maintenanceScheduled = false;
+      }
+    });
   }
 
   /// Write cache to disk.

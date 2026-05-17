@@ -64,7 +64,10 @@ class _ReaderWithLoadingState
         ),
       );
     } else {
-      var comic = await comicSource.loadComicInfo!(widget.id);
+      var comic = await ComicDetailsRepository().load(
+        widget.sourceKey,
+        widget.id,
+      );
       if (comic.error) {
         return Res.fromErrorRes(comic);
       }

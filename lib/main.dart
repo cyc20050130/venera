@@ -14,6 +14,7 @@ import 'components/components.dart';
 import 'components/window_frame.dart';
 import 'foundation/app.dart';
 import 'foundation/appdata.dart';
+import 'foundation/cache_manager.dart';
 import 'headless.dart';
 import 'init.dart';
 
@@ -70,7 +71,13 @@ class _MyAppState extends State<MyApp> with WidgetsBindingObserver {
     App.registerForceRebuild(forceRebuild);
     SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
     WidgetsBinding.instance.addObserver(this);
-    checkUpdates();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      checkUpdates();
+      CacheManager().scheduleMaintenance();
+      Future.microtask(() {
+        App.local.repairAllDownloadedState();
+      });
+    });
     super.initState();
   }
 

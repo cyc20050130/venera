@@ -37,6 +37,20 @@ class Comment {
         score = json["score"],
         isLiked = json["isLiked"],
         voteStatus = json["voteStatus"];
+
+  Map<String, dynamic> toJson() {
+    return {
+      "userName": userName,
+      "avatar": avatar,
+      "content": content,
+      "time": time,
+      "replyCount": replyCount,
+      "id": id,
+      "score": score,
+      "isLiked": isLiked,
+      "voteStatus": voteStatus,
+    };
+  }
 }
 
 class Comic {
@@ -199,7 +213,7 @@ class ComicDetails with HistoryMixin {
 
   ComicDetails.fromJson(Map<String, dynamic> json)
       : title = json["title"],
-        subTitle = json["subtitle"],
+        subTitle = json["subtitle"] ?? json["subTitle"],
         cover = json["cover"],
         description = json["description"],
         tags = _generateMap(json["tags"]),
@@ -234,18 +248,21 @@ class ComicDetails with HistoryMixin {
       "tags": tags,
       "chapters": chapters,
       "thumbnails": thumbnails,
-      "recommend": null,
+      "recommend": recommend?.map((e) => e.toJson()).toList(),
       "sourceKey": sourceKey,
       "comicId": comicId,
       "isFavorite": isFavorite,
       "subId": subId,
       "isLiked": isLiked,
-      "likesCount": likesCount,
-      "commentsCount": commentCount,
-      "uploader": uploader,
-      "uploadTime": uploadTime,
+        "likesCount": likesCount,
+        "commentCount": commentCount,
+        "uploader": uploader,
+        "uploadTime": uploadTime,
       "updateTime": updateTime,
       "url": url,
+      "stars": stars,
+      "maxPage": maxPage,
+      "comments": comments?.map((e) => e.toJson()).toList(),
     };
   }
 

@@ -212,6 +212,7 @@ class ComicSourceParser {
         """);
           var source = ComicSource.find(_key!)!;
           source.data["account"] = <String>[account, pwd];
+          source.clearLoginExpired();
           source.saveData();
           return const Res(true);
         } catch (e, s) {
@@ -809,10 +810,14 @@ class ComicSourceParser {
       }
       var res = await func();
       if (res.error && res.errorMessage!.contains("Login expired")) {
-        var reLoginRes = await ComicSource.find(_key!)!.reLogin();
+        var source = ComicSource.find(_key!)!;
+        var reLoginRes = await source.reLogin();
         if (!reLoginRes) {
+          source.markLoginExpired();
+          source.saveData();
           return const Res.error("Login expired and re-login failed");
         } else {
+          source.clearLoginExpired();
           return func();
         }
       }
@@ -1001,10 +1006,14 @@ class ComicSourceParser {
 
       var res = await func();
       if (res.error && res.errorMessage!.contains("Login expired")) {
-        var reLoginRes = await ComicSource.find(_key!)!.reLogin();
+        var source = ComicSource.find(_key!)!;
+        var reLoginRes = await source.reLogin();
         if (!reLoginRes) {
+          source.markLoginExpired();
+          source.saveData();
           return const Res.error("Login expired and re-login failed");
         } else {
+          source.clearLoginExpired();
           return func();
         }
       }
@@ -1049,10 +1058,14 @@ class ComicSourceParser {
 
       var res = await func();
       if (res.error && res.errorMessage!.contains("Login expired")) {
-        var reLoginRes = await ComicSource.find(_key!)!.reLogin();
+        var source = ComicSource.find(_key!)!;
+        var reLoginRes = await source.reLogin();
         if (!reLoginRes) {
+          source.markLoginExpired();
+          source.saveData();
           return const Res.error("Login expired and re-login failed");
         } else {
+          source.clearLoginExpired();
           return func();
         }
       }

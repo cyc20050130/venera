@@ -32,6 +32,8 @@ part 'models.dart';
 
 part 'types.dart';
 
+part 'source_data_compat.dart';
+
 class ComicSourceManager with ChangeNotifier, Init {
   final List<ComicSource> _sources = [];
 
@@ -160,7 +162,7 @@ class ComicSource {
 
   var data = <String, dynamic>{};
 
-  bool get isLogged => data["account"] != null;
+  bool get isLogged => data["account"] != null && data["_loginExpired"] != true;
 
   final String filePath;
 
@@ -206,7 +208,14 @@ class ComicSource {
   Future<void> loadData() async {
     var file = File("${App.dataPath}/comic_source/$key.data");
     if (await file.exists()) {
-      data = Map.from(jsonDecode(await file.readAsString()));
+      try {
+        data = normalizeSourceData(Map.from(jsonDecode(await file.readAsString())));
+      } catch (e, s) {
+        Log.error("ComicSource", "Failed to load source data for $key: $e", s);
+        data = normalizeSourceData({});
+      }
+    } else {
+      data = normalizeSourceData({});
     }
   }
 
@@ -225,7 +234,7 @@ class ComicSource {
     if (!await file.exists()) {
       await file.create(recursive: true);
     }
-    await file.writeAsString(jsonEncode(data));
+    await file.writeAsString(jsonEncode(normalizeSourceData(data)));
     _isSaving = false;
     DataSync().uploadData();
   }
@@ -238,8 +247,24 @@ class ComicSource {
     var res = await account!.login!(accountData[0], accountData[1]);
     if (res.error) {
       Log.error("Failed to re-login", res.errorMessage ?? "Error");
+      markLoginExpired();
+    } else {
+      clearLoginExpired();
     }
     return !res.error;
+  }
+
+  bool get isLoginExpired => data["_loginExpired"] == true;
+
+  bool get hasStoredAccountCredentials =>
+      data["account"] is List && (data["account"] as List).length >= 2;
+
+  void markLoginExpired() {
+    data["_loginExpired"] = true;
+  }
+
+  void clearLoginExpired() {
+    data.remove("_loginExpired");
   }
 
   /// Get settings dynamically from JavaScript source.

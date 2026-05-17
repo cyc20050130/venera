@@ -92,11 +92,6 @@ Future<void> importAppData(File file, [bool checkVersion = false]) async {
       );
       LocalFavoritesManager().init();
     }
-    if (await appdataFile.exists()) {
-      var content = await appdataFile.readAsString();
-      var data = jsonDecode(content);
-      appdata.syncData(data);
-    }
     if (await cookieFile.exists()) {
       SingleInstanceCookieJar.instance?.dispose();
       File(FilePath.join(App.dataPath, "cookie.db")).deleteIfExistsSync();
@@ -123,9 +118,48 @@ Future<void> importAppData(File file, [bool checkVersion = false]) async {
       }
       await ComicSourceManager().reload();
     }
+    if (await appdataFile.exists()) {
+      var content = await appdataFile.readAsString();
+      var data = jsonDecode(content);
+      appdata.syncData(data);
+      _sanitizeImportedSourceSettings();
+    }
   } finally {
     cacheDir.deleteIgnoreError(recursive: true);
   }
+}
+
+void _sanitizeImportedSourceSettings() {
+  final sources = ComicSource.all();
+  final sourceKeys = sources.map((e) => e.key).toSet();
+  final favoriteKeys =
+      sources.where((e) => e.favoriteData != null).map((e) => e.key).toSet();
+  final searchKeys =
+      sources.where((e) => e.searchPageData != null).map((e) => e.key).toSet();
+  final categoryNames =
+      sources.where((e) => e.categoryData != null).map((e) => e.name).toSet();
+  final exploreNames = sources
+      .expand((e) => e.explorePages.map((page) => page.title))
+      .toSet();
+
+  List<String> sanitize(dynamic value, Set<String> allowed) {
+    if (value is! List) return <String>[];
+    return value.whereType<String>().where(allowed.contains).toSet().toList();
+  }
+
+  appdata.settings['favorites'] =
+      sanitize(appdata.settings['favorites'], favoriteKeys);
+  appdata.settings['searchSources'] =
+      sanitize(appdata.settings['searchSources'], searchKeys);
+  appdata.settings['categories'] =
+      sanitize(appdata.settings['categories'], categoryNames);
+  appdata.settings['explore_pages'] =
+      sanitize(appdata.settings['explore_pages'], exploreNames);
+  if (appdata.settings['defaultSearchTarget'] is String &&
+      !sourceKeys.contains(appdata.settings['defaultSearchTarget'])) {
+    appdata.settings['defaultSearchTarget'] = null;
+  }
+  appdata.saveData(false);
 }
 
 Future<void> importPicaData(File file) async {

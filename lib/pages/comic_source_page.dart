@@ -1000,6 +1000,20 @@ class _SliverComicSourceState extends State<_SliverComicSource> {
   Iterable<Widget> _buildAccount() sync* {
     if (source.account == null) return;
     final bool logged = source.isLogged;
+    if (source.isLoginExpired) {
+      yield ListTile(
+        leading: const Icon(Icons.error_outline),
+        title: Text("Login expired".tl),
+        subtitle: Text("Please login again".tl),
+        onTap: () async {
+          await context.to(
+            () => _LoginPage(config: source.account!, source: source),
+          );
+          source.saveData();
+          setState(() {});
+        },
+      );
+    }
     if (!logged) {
       yield ListTile(
         title: Text("Log in".tl),
@@ -1227,6 +1241,7 @@ class _LoginPageState extends State<_LoginPage> {
       widget.config.validateCookies!(cookies).then((value) {
         if (value) {
           widget.source.data['account'] = 'ok';
+          widget.source.clearLoginExpired();
           widget.source.saveData();
           context.pop();
         } else {
@@ -1283,6 +1298,7 @@ class _LoginPageState extends State<_LoginPage> {
     );
     if (success) {
       widget.source.data['account'] = 'ok';
+      widget.source.clearLoginExpired();
       widget.source.saveData();
       context.pop();
     }
@@ -1301,6 +1317,7 @@ class _LoginPageState extends State<_LoginPage> {
     void onClose() {
       if (success) {
         widget.source.data['account'] = 'ok';
+        widget.source.clearLoginExpired();
         widget.source.saveData();
         context.pop();
       }
@@ -1332,6 +1349,7 @@ class _LoginPageState extends State<_LoginPage> {
         }
         widget.source.data['_localStorage'] = localStorage;
         await widget.source.saveData();
+        widget.source.clearLoginExpired();
         success = true;
         widget.config.onLoginWithWebviewSuccess?.call();
         webview.close();

@@ -315,9 +315,9 @@ class LocalManager with ChangeNotifier {
 
   Future<void> add(LocalComic comic, [String? id]) async {
     var old = find(id ?? comic.id, comic.comicType);
-    var downloaded = comic.downloadedChapters;
+    var downloaded = comic.downloadedChapters.toSet().toList();
     if (old != null) {
-      downloaded.addAll(old.downloadedChapters);
+      downloaded = {...downloaded, ...old.downloadedChapters}.toList();
     }
     _db.execute(
       'INSERT OR REPLACE INTO comics VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);',
@@ -335,6 +335,10 @@ class LocalManager with ChangeNotifier {
       ],
     );
     notifyListeners();
+  }
+
+  Future<void> upsertPartialComic(LocalComic comic, [String? id]) {
+    return add(comic, id);
   }
 
   void remove(String id, ComicType comicType) async {
@@ -452,6 +456,48 @@ class LocalManager with ChangeNotifier {
     return files.map((e) => "file://${e.path}").toList();
   }
 
+  bool isChapterReadable(String id, ComicType type, Object ep,
+      [ComicChapters? chapters]) {
+    if (ep is! String && ep is! int) {
+      return false;
+    }
+    var comic = find(id, type);
+    if (comic == null) {
+      return false;
+    }
+    if (comic.chapters == null) {
+      return Directory(comic.baseDir).existsSync();
+    }
+    var chapterId =
+        ep is int ? comic.chapters!.ids.elementAtOrNull(ep - 1) : ep as String;
+    if (chapterId == null) {
+      return false;
+    }
+    if (chapters != null && comic.chapters?.length != chapters.length) {
+      add(LocalComic(
+        id: comic.id,
+        title: comic.title,
+        subtitle: comic.subtitle,
+        tags: comic.tags,
+        directory: comic.directory,
+        chapters: chapters,
+        cover: comic.cover,
+        comicType: comic.comicType,
+        downloadedChapters: comic.downloadedChapters,
+        createdAt: comic.createdAt,
+      ));
+      comic = find(id, type) ?? comic;
+    }
+    if (!comic.downloadedChapters.contains(chapterId)) {
+      return false;
+    }
+    var isReadable = _chapterDirectoryHasImages(comic, chapterId);
+    if (!isReadable) {
+      repairDownloadedState(id, type);
+    }
+    return isReadable;
+  }
+
   bool isDownloaded(String id, ComicType type,
       [int? ep, ComicChapters? chapters]) {
     var comic = find(id, type);
@@ -474,8 +520,18 @@ class LocalManager with ChangeNotifier {
         ));
       }
     }
-    return comic.downloadedChapters
-        .contains((chapters ?? comic.chapters)!.ids.elementAtOrNull(ep - 1));
+    var chapterId = (chapters ?? comic.chapters)!.ids.elementAtOrNull(ep - 1);
+    if (chapterId == null) {
+      return false;
+    }
+    if (!comic.downloadedChapters.contains(chapterId)) {
+      return false;
+    }
+    if (!_chapterDirectoryHasImages(comic, chapterId)) {
+      repairDownloadedState(id, type);
+      return false;
+    }
+    return true;
   }
 
   List<DownloadTask> downloadingTasks = [];
@@ -556,6 +612,101 @@ class LocalManager with ChangeNotifier {
     notifyListeners();
     saveCurrentDownloadingTasks();
     downloadingTasks.first.resume();
+  }
+
+  void markChapterDownloaded(LocalComic comic, String chapterId) {
+    if (comic.chapters == null || !_chapterDirectoryHasImages(comic, chapterId)) {
+      return;
+    }
+    var downloaded = {...comic.downloadedChapters, chapterId}.toList();
+    add(LocalComic(
+      id: comic.id,
+      title: comic.title,
+      subtitle: comic.subtitle,
+      tags: comic.tags,
+      directory: comic.directory,
+      chapters: comic.chapters,
+      cover: comic.cover,
+      comicType: comic.comicType,
+      downloadedChapters: downloaded,
+      createdAt: comic.createdAt,
+    ));
+  }
+
+  LocalComic? repairDownloadedState(String id, ComicType type) {
+    var comic = find(id, type);
+    if (comic == null || comic.chapters == null) {
+      return comic;
+    }
+    var validDownloaded = comic.downloadedChapters
+        .where((chapterId) => _chapterDirectoryHasImages(comic, chapterId))
+        .toList();
+    if (validDownloaded.length == comic.downloadedChapters.length) {
+      return comic;
+    }
+    if (validDownloaded.isEmpty) {
+      _db.execute(
+        'DELETE FROM comics WHERE id = ? AND comic_type = ?;',
+        [comic.id, comic.comicType.value],
+      );
+      notifyListeners();
+      return null;
+    }
+    _db.execute(
+      'UPDATE comics SET downloadedChapters = ? WHERE id = ? AND comic_type = ?;',
+      [
+        jsonEncode(validDownloaded),
+        comic.id,
+        comic.comicType.value,
+      ],
+    );
+    notifyListeners();
+    return LocalComic(
+      id: comic.id,
+      title: comic.title,
+      subtitle: comic.subtitle,
+      tags: comic.tags,
+      directory: comic.directory,
+      chapters: comic.chapters,
+      cover: comic.cover,
+      comicType: comic.comicType,
+      downloadedChapters: validDownloaded,
+      createdAt: comic.createdAt,
+    );
+  }
+
+  void repairAllDownloadedState() {
+    var changed = false;
+    for (var comic in getComics(LocalSortType.timeDesc)) {
+      if (comic.chapters == null) {
+        continue;
+      }
+      var validDownloaded = comic.downloadedChapters
+          .where((chapterId) => _chapterDirectoryHasImages(comic, chapterId))
+          .toList();
+      if (validDownloaded.length == comic.downloadedChapters.length) {
+        continue;
+      }
+      changed = true;
+      if (validDownloaded.isEmpty) {
+        _db.execute(
+          'DELETE FROM comics WHERE id = ? AND comic_type = ?;',
+          [comic.id, comic.comicType.value],
+        );
+      } else {
+        _db.execute(
+          'UPDATE comics SET downloadedChapters = ? WHERE id = ? AND comic_type = ?;',
+          [
+            jsonEncode(validDownloaded),
+            comic.id,
+            comic.comicType.value,
+          ],
+        );
+      }
+    }
+    if (changed) {
+      notifyListeners();
+    }
   }
 
   void deleteComic(LocalComic c, [bool removeFileOnDisk = true]) {
@@ -686,6 +837,25 @@ class LocalManager with ChangeNotifier {
       }
     }
     return builder.toString();
+  }
+
+  static bool _chapterDirectoryHasImages(LocalComic comic, String chapterId) {
+    var dir = Directory(
+      FilePath.join(comic.baseDir, getChapterDirectoryName(chapterId)),
+    );
+    if (!dir.existsSync()) {
+      return false;
+    }
+    for (var entity in dir.listSync()) {
+      if (entity is! File) {
+        continue;
+      }
+      if (entity.name.startsWith('cover.') || entity.name.startsWith('.')) {
+        continue;
+      }
+      return true;
+    }
+    return false;
   }
 }
 

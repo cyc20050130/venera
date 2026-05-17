@@ -39,7 +39,7 @@ class _ReaderImagesState extends State<_ReaderImages> {
     if (inProgress) return;
     inProgress = true;
     if (reader.type == ComicType.local ||
-        (LocalManager().isDownloaded(
+        (LocalManager().isChapterReadable(
           reader.cid,
           reader.type,
           reader.chapter,
