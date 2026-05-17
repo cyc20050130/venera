@@ -1,6 +1,7 @@
 import 'dart:async' show Future;
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:venera/foundation/comic_source/comic_source.dart';
 import 'package:venera/foundation/local.dart';
 import 'package:venera/network/images.dart';
 import '../history.dart';
@@ -25,7 +26,8 @@ class HistoryImageProvider
         return localComic.coverFile.readAsBytes();
       }
       var comicSource =
-          history.type.comicSource ?? (throw "Comic source not found.");
+          ComicSource.find(history.sourceKey) ??
+          (throw "Comic source not found.");
       var comic = await comicSource.loadComicInfo!(history.id);
       checkStop();
       url = comic.data.cover;
@@ -34,14 +36,16 @@ class HistoryImageProvider
     }
     await for (var progress in ImageDownloader.loadThumbnail(
       url,
-      history.type.sourceKey,
+      history.sourceKey,
       history.id,
     )) {
       checkStop();
-      chunkEvents.add(ImageChunkEvent(
-        cumulativeBytesLoaded: progress.currentBytes,
-        expectedTotalBytes: progress.totalBytes,
-      ));
+      chunkEvents.add(
+        ImageChunkEvent(
+          cumulativeBytesLoaded: progress.currentBytes,
+          expectedTotalBytes: progress.totalBytes,
+        ),
+      );
       if (progress.imageBytes != null) {
         return progress.imageBytes!;
       }
@@ -55,5 +59,5 @@ class HistoryImageProvider
   }
 
   @override
-  String get key => "history${history.id}${history.type.value}";
+  String get key => "history${history.id}${history.sourceKey}";
 }

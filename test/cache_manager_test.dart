@@ -1,4 +1,3 @@
-import 'dart:ffi';
 import 'dart:io';
 
 import 'package:flutter_test/flutter_test.dart';
@@ -7,18 +6,14 @@ import 'package:sqlite3/sqlite3.dart';
 import 'package:venera/foundation/app.dart';
 import 'package:venera/foundation/cache_manager.dart';
 
-DynamicLibrary _openTestSqlite() {
-  return DynamicLibrary.open(
-    'D:/code/projects/venera/build/test-sqlite3/sqlite3.dll',
-  );
-}
+import 'test_native_paths.dart';
 
 void main() {
   late Directory tempDir;
   late Directory tempCacheDir;
 
   setUpAll(() {
-    open.overrideFor(OperatingSystem.windows, _openTestSqlite);
+    open.overrideFor(OperatingSystem.windows, openTestSqlite);
   });
 
   setUp(() async {

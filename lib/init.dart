@@ -38,14 +38,15 @@ Future<void> init() async {
   await App.init().wait();
   await SingleInstanceCookieJar.createInstance();
   try {
+    await JsEngine().init().wait();
+    await ComicSourceManager().init().wait();
+
     var futures = [
       Rhttp.init(),
       App.initComponents(),
       SAFTaskWorker().init().wait(),
       AppTranslation.init().wait(),
       TagsTranslation.readData().wait(),
-      JsEngine().init().wait(),
-      ComicSourceManager().init().wait(),
       OpenCC.init(),
     ];
     await Future.wait(futures);
@@ -59,7 +60,7 @@ Future<void> init() async {
     handleTextShare();
     try {
       await FlutterDisplayMode.setHighRefreshRate();
-    } catch(e) {
+    } catch (e) {
       Log.error("Display Mode", "Failed to set high refresh rate: $e");
     }
   }
@@ -96,9 +97,12 @@ void _checkOldConfigs() {
     appdata.writeImplicitData();
   }
 
-  if (appdata.settings['comicSourceListUrl'].toString().contains("git.nyne.dev")) {
+  if (appdata.settings['comicSourceListUrl'].toString().contains(
+    "git.nyne.dev",
+  )) {
     // migrate to jsdelivr cdn
-    appdata.settings['comicSourceListUrl'] = "https://cdn.jsdelivr.net/gh/venera-app/venera-configs@main/index.json";
+    appdata.settings['comicSourceListUrl'] =
+        "https://cdn.jsdelivr.net/gh/venera-app/venera-configs@main/index.json";
     appdata.saveData();
   }
 }

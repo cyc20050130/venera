@@ -215,14 +215,8 @@ class HistoryManager with ChangeNotifier {
 
   bool isInitialized = false;
 
-  Future<void> init() async {
-    if (isInitialized) {
-      return;
-    }
-    _db = sqlite3.open("${App.dataPath}/history.db");
-
-    _db.execute("""
-        create table if not exists history  (
+  static const _createHistoryTableSql = """
+        create table history (
           id text not null,
           source_key text not null,
           title text,
@@ -237,7 +231,15 @@ class HistoryManager with ChangeNotifier {
           chapter_group int,
           primary key (id, source_key)
         );
-      """);
+      """;
+
+  Future<void> init() async {
+    if (isInitialized) {
+      return;
+    }
+    _db = sqlite3.open("${App.dataPath}/history.db");
+
+    _createHistoryTableIfNeeded();
 
     _upgradeHistorySchemaIfNeeded();
 
@@ -246,7 +248,30 @@ class HistoryManager with ChangeNotifier {
     isInitialized = true;
   }
 
+  void _createHistoryTableIfNeeded() {
+    _db.execute(
+      _createHistoryTableSql.replaceFirst(
+        "create table history",
+        "create table if not exists history",
+      ),
+    );
+  }
+
+  bool _tableExists(String tableName) {
+    final rows = _db.select(
+      '''
+        SELECT 1
+        FROM sqlite_master
+        WHERE type = 'table' AND name = ?
+        LIMIT 1;
+      ''',
+      [tableName],
+    );
+    return rows.isNotEmpty;
+  }
+
   void _upgradeHistorySchemaIfNeeded() {
+    final hasLegacyTable = _tableExists("history_legacy");
     final columns = _db.select("PRAGMA table_info(history);");
     final hasSourceKey = columns.any(
       (element) => element["name"] == "source_key",
@@ -255,50 +280,48 @@ class HistoryManager with ChangeNotifier {
       (element) => element["name"] == "chapter_group",
     );
 
-    if (hasSourceKey && hasChapterGroup) {
+    if (!hasLegacyTable && hasSourceKey && hasChapterGroup) {
       return;
     }
 
-    _db.execute("ALTER TABLE history RENAME TO history_legacy;");
-    _db.execute("""
-      create table history (
-        id text not null,
-        source_key text not null,
-        title text,
-        subtitle text,
-        cover text,
-        time int,
-        type int,
-        ep int,
-        page int,
-        readEpisode text,
-        max_page int,
-        chapter_group int,
-        primary key (id, source_key)
+    _db.execute("BEGIN TRANSACTION;");
+    try {
+      if (!hasLegacyTable) {
+        _db.execute("ALTER TABLE history RENAME TO history_legacy;");
+      }
+      _createHistoryTableIfNeeded();
+
+      final legacyColumns = _db.select("PRAGMA table_info(history_legacy);");
+      final legacyHasChapterGroup = legacyColumns.any(
+        (element) => element["name"] == "chapter_group",
       );
-    """);
 
-    final legacyRows = _db.select("SELECT * FROM history_legacy;");
-    for (final row in legacyRows) {
-      final typeValue = row["type"] as int;
-      final sourceKey = sourceKeyFromType(ComicType(typeValue));
-      _db.execute(_insertHistorySql, [
-        row["id"],
-        sourceKey,
-        row["title"],
-        row["subtitle"],
-        row["cover"],
-        row["time"],
-        typeValue,
-        row["ep"],
-        row["page"],
-        row["readEpisode"],
-        row["max_page"],
-        hasChapterGroup ? row["chapter_group"] : null,
-      ]);
+      final legacyRows = _db.select("SELECT * FROM history_legacy;");
+      for (final row in legacyRows) {
+        final typeValue = row["type"] as int;
+        final sourceKey = sourceKeyFromType(ComicType(typeValue));
+        _db.execute(_insertHistorySql, [
+          row["id"],
+          sourceKey,
+          row["title"],
+          row["subtitle"],
+          row["cover"],
+          row["time"],
+          typeValue,
+          row["ep"],
+          row["page"],
+          row["readEpisode"],
+          row["max_page"],
+          legacyHasChapterGroup ? row["chapter_group"] : null,
+        ]);
+      }
+
+      _db.execute("DROP TABLE history_legacy;");
+      _db.execute("COMMIT;");
+    } catch (e) {
+      _db.execute("ROLLBACK;");
+      rethrow;
     }
-
-    _db.execute("DROP TABLE history_legacy;");
   }
 
   static const _insertHistorySql = """

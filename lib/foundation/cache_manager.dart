@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:isolate';
 
 import 'package:crypto/crypto.dart';
+import 'package:path/path.dart' as p;
 import 'package:sqlite3/sqlite3.dart';
 import 'package:venera/foundation/log.dart';
 import 'package:venera/utils/io.dart';
@@ -96,7 +97,7 @@ class CacheManager {
         }
         try {
           totalSize += await entity.length();
-          filePaths.add(entity.path);
+          filePaths.add(p.normalize(entity.path));
         } catch (_) {
           // Ignore files disappearing during scan.
         }
@@ -109,9 +110,8 @@ class CacheManager {
     final scannedFiles = filePaths.toSet();
     for (final filePath in filePaths) {
       final file = File(filePath);
-      final segments = file.uri.pathSegments;
-      final name = segments.last;
-      final dir = segments.elementAtOrNull(segments.length - 2) ?? "*";
+      final name = p.basename(filePath);
+      final dir = p.basename(p.dirname(filePath));
       final res = _db.select(
         '''
         SELECT 1 FROM cache
@@ -128,7 +128,9 @@ class CacheManager {
 
     final rows = _db.select('SELECT key, dir, name FROM cache;');
     for (final row in rows) {
-      final dbFilePath = File('$cachePath/${row["dir"]}/${row["name"]}').path;
+      final dbFilePath = p.normalize(
+        p.join(cachePath, row["dir"] as String, row["name"] as String),
+      );
       if (!scannedFiles.contains(dbFilePath)) {
         _db.execute('DELETE FROM cache WHERE key = ?;', [row["key"]]);
       }

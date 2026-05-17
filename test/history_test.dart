@@ -1,5 +1,4 @@
 import 'dart:convert';
-import 'dart:ffi';
 import 'dart:io';
 import 'dart:isolate';
 
@@ -12,14 +11,7 @@ import 'package:venera/foundation/history.dart';
 import 'package:venera/utils/data.dart';
 import 'package:zip_flutter/zip_flutter.dart';
 
-DynamicLibrary _openTestSqlite() {
-  return DynamicLibrary.open(
-    'D:/code/projects/venera/build/test-sqlite3/sqlite3.dll',
-  );
-}
-
-const _zipDllSource =
-    'D:/code/projects/venera/build/test-zip/shared/zip_flutter.dll';
+import 'test_native_paths.dart';
 
 void main() {
   late Directory tempDir;
@@ -28,11 +20,11 @@ void main() {
   late String originalCurrentDir;
 
   setUpAll(() async {
-    open.overrideFor(OperatingSystem.windows, _openTestSqlite);
-    final source = File(_zipDllSource);
+    open.overrideFor(OperatingSystem.windows, openTestSqlite);
+    final source = File(zipDllSourcePath);
     if (!source.existsSync()) {
       throw StateError(
-        'Missing test zip dll at $_zipDllSource. Build it before running history tests.',
+        'Missing test zip dll at $zipDllSourcePath. Build it before running history tests.',
       );
     }
     originalCurrentDir = Directory.current.path;
@@ -143,6 +135,87 @@ void main() {
     await history.init();
     expect(history.find('comic-2', ComicType('picacg'.hashCode)), isNotNull);
   });
+
+  test(
+    'reinitializing history recovers an interrupted schema migration',
+    () async {
+      final history = HistoryManager();
+      history.close();
+      final dbPath = File('${tempDir.path}/history.db');
+      if (await dbPath.exists()) {
+        await dbPath.delete();
+      }
+
+      final db = sqlite3.open(dbPath.path);
+      db.execute('''
+      create table history (
+        id text not null,
+        source_key text not null,
+        title text,
+        subtitle text,
+        cover text,
+        time int,
+        type int,
+        ep int,
+        page int,
+        readEpisode text,
+        max_page int,
+        chapter_group int,
+        primary key (id, source_key)
+      );
+    ''');
+      db.execute('''
+      create table history_legacy (
+        id text primary key,
+        title text,
+        subtitle text,
+        cover text,
+        time int,
+        type int,
+        ep int,
+        page int,
+        readEpisode text,
+        max_page int,
+        chapter_group int
+      );
+    ''');
+      db.execute(
+        'insert into history_legacy values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);',
+        [
+          'comic-legacy',
+          'Legacy Title',
+          '',
+          '',
+          DateTime(2024).millisecondsSinceEpoch,
+          'picacg'.hashCode,
+          4,
+          6,
+          '4',
+          20,
+          2,
+        ],
+      );
+      db.dispose();
+
+      await history.init();
+
+      final recoveredDb = sqlite3.open(dbPath.path);
+      final legacyTables = recoveredDb.select(
+        "select name from sqlite_master where type = 'table' and name = 'history_legacy';",
+      );
+      final rows = recoveredDb.select(
+        'select id, ep, page, chapter_group from history where id = ?;',
+        ['comic-legacy'],
+      );
+      recoveredDb.dispose();
+
+      expect(legacyTables, isEmpty);
+      expect(rows, isNotEmpty);
+      expect(rows.first['ep'], 4);
+      expect(rows.first['page'], 6);
+      expect(rows.first['chapter_group'], 2);
+    },
+  );
 
   test('exportAppData packages the latest reading progress', () async {
     await File('${tempDir.path}/appdata.json').writeAsString(
