@@ -117,8 +117,7 @@ class ImagesDownloadTask extends DownloadTask with _TransferSpeedMixin {
           }
           try {
             await Directory(path!).delete(recursive: true);
-          }
-          catch(e) {
+          } catch (e) {
             Log.error("Download", "Failed to delete directory: $e");
           }
         });
@@ -161,6 +160,7 @@ class ImagesDownloadTask extends DownloadTask with _TransferSpeedMixin {
     }
     stopRecorder();
     notifyListeners();
+    unawaited(LocalManager().saveCurrentDownloadingTasksNow());
   }
 
   @override
@@ -215,12 +215,14 @@ class ImagesDownloadTask extends DownloadTask with _TransferSpeedMixin {
       }
       Directory saveTo;
       if (comic!.chapters != null) {
-        saveTo = Directory(FilePath.join(
-          path!,
-          LocalManager.getChapterDirectoryName(
-            _images!.keys.elementAt(_chapter),
+        saveTo = Directory(
+          FilePath.join(
+            path!,
+            LocalManager.getChapterDirectoryName(
+              _images!.keys.elementAt(_chapter),
+            ),
           ),
-        ));
+        );
         if (!saveTo.existsSync()) {
           saveTo.createSync(recursive: true);
         }
@@ -293,15 +295,17 @@ class ImagesDownloadTask extends DownloadTask with _TransferSpeedMixin {
       }
     }
 
-    await LocalManager().saveCurrentDownloadingTasks();
+    await LocalManager().saveCurrentDownloadingTasksNow();
 
     if (_cover == null) {
       _message = "Downloading cover...";
       notifyListeners();
       var res = await _runWithRetry(() async {
         Uint8List? data;
-        await for (var progress
-            in ImageDownloader.loadThumbnail(comic!.cover, source.key)) {
+        await for (var progress in ImageDownloader.loadThumbnail(
+          comic!.cover,
+          source.key,
+        )) {
           if (progress.imageBytes != null) {
             data = progress.imageBytes;
           }
@@ -322,8 +326,10 @@ class ImagesDownloadTask extends DownloadTask with _TransferSpeedMixin {
         _cover = res.data;
         notifyListeners();
       }
-      await LocalManager().upsertPartialComic(_buildLocalComic(_completedChapters));
-      await LocalManager().saveCurrentDownloadingTasks();
+      await LocalManager().upsertPartialComic(
+        _buildLocalComic(_completedChapters),
+      );
+      await LocalManager().saveCurrentDownloadingTasksNow();
     }
 
     if (_images == null) {
@@ -390,7 +396,7 @@ class ImagesDownloadTask extends DownloadTask with _TransferSpeedMixin {
       }
       _message = "$_downloadedCount/$_totalCount";
       notifyListeners();
-      await LocalManager().saveCurrentDownloadingTasks();
+      await LocalManager().saveCurrentDownloadingTasksNow();
     }
 
     while (_chapter < _images!.length) {
@@ -413,7 +419,7 @@ class ImagesDownloadTask extends DownloadTask with _TransferSpeedMixin {
         _index++;
         _downloadedCount++;
         _message = "$_downloadedCount/$_totalCount";
-        await LocalManager().saveCurrentDownloadingTasks();
+        await LocalManager().scheduleSaveCurrentDownloadingTasks();
       }
       _index = 0;
       if (!chapterFailed) {
@@ -486,12 +492,13 @@ class ImagesDownloadTask extends DownloadTask with _TransferSpeedMixin {
     }
 
     return ImagesDownloadTask(
-      source: ComicSource.find(json["source"])!,
-      comicId: json["comicId"],
-      comic:
-          json["comic"] == null ? null : ComicDetails.fromJson(json["comic"]),
-      chapters: ListOrNull.from(json["chapters"]),
-    )
+        source: ComicSource.find(json["source"])!,
+        comicId: json["comicId"],
+        comic: json["comic"] == null
+            ? null
+            : ComicDetails.fromJson(json["comic"]),
+        chapters: ListOrNull.from(json["chapters"]),
+      )
       ..path = json["path"]
       .._cover = json["cover"]
       .._images = images
@@ -499,7 +506,9 @@ class ImagesDownloadTask extends DownloadTask with _TransferSpeedMixin {
       .._totalCount = json["totalCount"]
       .._index = json["index"]
       .._chapter = json["chapter"]
-      .._completedChapters.addAll(ListOrNull.from(json["completedChapters"]) ?? [])
+      .._completedChapters.addAll(
+        ListOrNull.from(json["completedChapters"]) ?? [],
+      )
       .._failedChapters.addAll(ListOrNull.from(json["failedChapters"]) ?? []);
   }
 
@@ -564,7 +573,7 @@ class ImagesDownloadTask extends DownloadTask with _TransferSpeedMixin {
     await dir.deleteIgnoreError(recursive: true);
     _message = "Skipped ${comic!.chapters![chapterId] ?? chapterId}";
     notifyListeners();
-    await LocalManager().saveCurrentDownloadingTasks();
+    await LocalManager().saveCurrentDownloadingTasksNow();
   }
 
   @override
@@ -579,8 +588,10 @@ class ImagesDownloadTask extends DownloadTask with _TransferSpeedMixin {
   int get hashCode => Object.hash(comicId, source.key);
 }
 
-Future<Res<T>> _runWithRetry<T>(Future<T> Function() task,
-    {int retry = 3}) async {
+Future<Res<T>> _runWithRetry<T>(
+  Future<T> Function() task, {
+  int retry = 3,
+}) async {
   for (var i = 0; i < retry; i++) {
     try {
       return Res(await task());
@@ -632,8 +643,12 @@ class _ImageDownloadWrapper {
   void start() async {
     int lastBytes = 0;
     try {
-      await for (var p in ImageDownloader.loadComicImageUnwrapped(
-          image, task.source.key, task.comicId, chapter)) {
+      await for (var p in ImageDownloader.loadComicImageNoCache(
+        image,
+        task.source.key,
+        task.comicId,
+        chapter,
+      )) {
         if (isCancelled) {
           return;
         }
@@ -745,6 +760,7 @@ class ArchiveDownloadTask extends DownloadTask {
     _message = message;
     notifyListeners();
     Log.error("Download", message);
+    unawaited(LocalManager().saveCurrentDownloadingTasksNow());
   }
 
   @override
@@ -788,6 +804,7 @@ class ArchiveDownloadTask extends DownloadTask {
     _message = "Paused";
     _downloader?.stop();
     notifyListeners();
+    unawaited(LocalManager().saveCurrentDownloadingTasksNow());
   }
 
   @override
@@ -821,8 +838,9 @@ class ArchiveDownloadTask extends DownloadTask {
       path = dir.path;
     }
 
-    var archiveFile =
-        File(FilePath.join(App.dataPath, "archive_downloading.zip"));
+    var archiveFile = File(
+      FilePath.join(App.dataPath, "archive_downloading.zip"),
+    );
 
     Log.info("Download", "Downloading $archiveUrl");
 

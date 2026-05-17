@@ -382,7 +382,8 @@ class _GalleryModeState extends State<_GalleryMode>
         },
         onPageChanged: (i) {
           if (i == 0) {
-            if (reader.isFirstChapterOfGroup || !reader.toPrevChapter(toLastPage: true)) {
+            if (reader.isFirstChapterOfGroup ||
+                !reader.toPrevChapter(toLastPage: true)) {
               controller.jumpToPage(1);
             }
           } else if (i == totalPages + 1) {
@@ -391,6 +392,8 @@ class _GalleryModeState extends State<_GalleryMode>
             }
           } else {
             reader.setPage(i);
+            context.readerScaffold._gestureDetectorState
+                ?.registerNavigationInteraction();
             context.readerScaffold.update();
             // Auto close toolbar when entering chapter comments page
             if (isChapterCommentsPage(i) && context.readerScaffold.isOpen) {
@@ -686,12 +689,19 @@ class _ContinuousModeState extends State<_ContinuousMode>
   /// To handle the tap event, we need to know if the user was scrolling before the delay.
   bool delayedIsScrolling = false;
 
+  Timer? delayedSetIsScrollingTimer;
+
   var imageStates = <State<ComicImage>>{};
 
   void delayedSetIsScrolling(bool value) {
-    Future.delayed(
-      const Duration(milliseconds: 300),
-      () => delayedIsScrolling = value,
+    delayedSetIsScrollingTimer?.cancel();
+    if (value) {
+      delayedIsScrolling = true;
+      return;
+    }
+    delayedSetIsScrollingTimer = Timer(
+      kReaderToolbarTapSuppressAfterScrollEnd,
+      () => delayedIsScrolling = false,
     );
   }
 
@@ -719,6 +729,7 @@ class _ContinuousModeState extends State<_ContinuousMode>
   @override
   void dispose() {
     itemPositionsListener.itemPositions.removeListener(onPositionChanged);
+    delayedSetIsScrollingTimer?.cancel();
     super.dispose();
   }
 
@@ -730,6 +741,8 @@ class _ContinuousModeState extends State<_ContinuousMode>
     page = page.clamp(1, reader.maxPage);
     if (page != reader.page) {
       reader.setPage(page);
+      context.readerScaffold._gestureDetectorState
+          ?.registerNavigationInteraction();
       context.readerScaffold.update();
     }
     cacheImages(page);
@@ -973,8 +986,14 @@ class _ContinuousModeState extends State<_ContinuousMode>
     widget = NotificationListener<ScrollNotification>(
       onNotification: (notification) {
         if (notification is ScrollStartNotification) {
+          context.readerScaffold._gestureDetectorState
+              ?.registerRecentInteraction();
           delayedSetIsScrolling(true);
         } else if (notification is ScrollEndNotification) {
+          context.readerScaffold._gestureDetectorState
+              ?.registerRecentInteraction(
+                kReaderToolbarTapSuppressAfterScrollEnd,
+              );
           delayedSetIsScrolling(false);
         }
 
@@ -1225,7 +1244,9 @@ ImageProvider _createImageProviderFromKey(
     reader.cid,
     reader.eid,
     reader.page,
-    enableResize: reader.mode.isContinuous, // For continuous mode, we need to resize the image to improve performance
+    enableResize: reader
+        .mode
+        .isContinuous, // For continuous mode, we need to resize the image to improve performance
   );
 }
 

@@ -11,8 +11,10 @@ import 'app_dio.dart';
 
 abstract class ImageDownloader {
   static Stream<ImageDownloadProgress> loadThumbnail(
-      String url, String? sourceKey,
-      [String? cid]) async* {
+    String url,
+    String? sourceKey, [
+    String? cid,
+  ]) async* {
     final cacheKey = "$url@$sourceKey${cid != null ? '@$cid' : ''}";
     final cache = await CacheManager().findCache(cacheKey);
 
@@ -39,25 +41,29 @@ abstract class ImageDownloader {
     if (((configs['url'] as String?) ?? url).startsWith('cover.') &&
         sourceKey != null) {
       var comicSource = ComicSource.find(sourceKey);
-      if(comicSource != null) {
+      if (comicSource != null) {
         var comicInfo = await comicSource.loadComicInfo!(cid!);
         yield* loadThumbnail(comicInfo.data.cover, sourceKey);
         return;
       }
     }
 
-    var dio = AppDio(BaseOptions(
-      headers: Map<String, dynamic>.from(configs['headers']),
-      method: configs['method'] ?? 'GET',
-      responseType: ResponseType.stream,
-    ));
+    var dio = AppDio(
+      BaseOptions(
+        headers: Map<String, dynamic>.from(configs['headers']),
+        method: configs['method'] ?? 'GET',
+        responseType: ResponseType.stream,
+      ),
+    );
 
     String requestUrl = configs['url'] ?? url;
     if (requestUrl.startsWith('//')) {
       requestUrl = 'https:$requestUrl';
     }
-    var req = await dio.request<ResponseBody>(requestUrl,
-        data: configs['data']);
+    var req = await dio.request<ResponseBody>(
+      requestUrl,
+      data: configs['data'],
+    );
     var stream = req.data?.stream ?? (throw "Error: Empty response body.");
     int? expectedBytes = req.data!.contentLength;
     if (expectedBytes == -1) {
@@ -88,7 +94,8 @@ abstract class ImageDownloader {
     );
   }
 
-  static final _loadingImages = <String, _StreamWrapper<ImageDownloadProgress>>{};
+  static final _loadingImages =
+      <String, _StreamWrapper<ImageDownloadProgress>>{};
 
   /// Cancel all loading images.
   static void cancelAllLoadingImages() {
@@ -101,7 +108,11 @@ abstract class ImageDownloader {
   /// Load a comic image from the network or cache.
   /// The function will prevent multiple requests for the same image.
   static Stream<ImageDownloadProgress> loadComicImage(
-      String imageKey, String? sourceKey, String cid, String eid) {
+    String imageKey,
+    String? sourceKey,
+    String cid,
+    String eid,
+  ) {
     final cacheKey = "$imageKey@$sourceKey@$cid@$eid";
     if (_loadingImages.containsKey(cacheKey)) {
       return _loadingImages[cacheKey]!.stream;
@@ -117,22 +128,45 @@ abstract class ImageDownloader {
   }
 
   static Stream<ImageDownloadProgress> loadComicImageUnwrapped(
-      String imageKey, String? sourceKey, String cid, String eid) {
+    String imageKey,
+    String? sourceKey,
+    String cid,
+    String eid,
+  ) {
     return _loadComicImage(imageKey, sourceKey, cid, eid);
   }
 
-  static Stream<ImageDownloadProgress> _loadComicImage(
-      String imageKey, String? sourceKey, String cid, String eid) async* {
-    final cacheKey = "$imageKey@$sourceKey@$cid@$eid";
-    final cache = await CacheManager().findCache(cacheKey);
+  /// Download a comic image without reading from or writing to runtime cache.
+  ///
+  /// Used by offline download tasks so background downloads do not contend with
+  /// reader cache maintenance or duplicate writes.
+  static Stream<ImageDownloadProgress> loadComicImageNoCache(
+    String imageKey,
+    String? sourceKey,
+    String cid,
+    String eid,
+  ) {
+    return _loadComicImage(imageKey, sourceKey, cid, eid, useCache: false);
+  }
 
-    if (cache != null) {
-      var data = await cache.readAsBytes();
-      yield ImageDownloadProgress(
-        currentBytes: data.length,
-        totalBytes: data.length,
-        imageBytes: data,
-      );
+  static Stream<ImageDownloadProgress> _loadComicImage(
+    String imageKey,
+    String? sourceKey,
+    String cid,
+    String eid, {
+    bool useCache = true,
+  }) async* {
+    final cacheKey = "$imageKey@$sourceKey@$cid@$eid";
+    if (useCache) {
+      final cache = await CacheManager().findCache(cacheKey);
+      if (cache != null) {
+        var data = await cache.readAsBytes();
+        yield ImageDownloadProgress(
+          currentBytes: data.length,
+          totalBytes: data.length,
+          imageBytes: data,
+        );
+      }
     }
 
     Future<Map<String, dynamic>?> Function()? onLoadFailed;
@@ -140,16 +174,18 @@ abstract class ImageDownloader {
     var configs = <String, dynamic>{};
     if (sourceKey != null) {
       var comicSource = ComicSource.find(sourceKey);
-      configs = (await comicSource!.getImageLoadingConfig
-              ?.call(imageKey, cid, eid)) ??
+      configs =
+          (await comicSource!.getImageLoadingConfig?.call(
+            imageKey,
+            cid,
+            eid,
+          )) ??
           {};
     }
     var retryLimit = 5;
     while (true) {
       try {
-        configs['headers'] ??= {
-          'user-agent': webUA,
-        };
+        configs['headers'] ??= {'user-agent': webUA};
 
         if (configs['onLoadFailed'] is JSInvokable) {
           onLoadFailed = () async {
@@ -162,14 +198,18 @@ abstract class ImageDownloader {
           };
         }
 
-        var dio = AppDio(BaseOptions(
-          headers: configs['headers'],
-          method: configs['method'] ?? 'GET',
-          responseType: ResponseType.stream,
-        ));
+        var dio = AppDio(
+          BaseOptions(
+            headers: configs['headers'],
+            method: configs['method'] ?? 'GET',
+            responseType: ResponseType.stream,
+          ),
+        );
 
-        var req = await dio.request<ResponseBody>(configs['url'] ?? imageKey,
-            data: configs['data']);
+        var req = await dio.request<ResponseBody>(
+          configs['url'] ?? imageKey,
+          data: configs['data'],
+        );
         var stream = req.data?.stream ?? (throw "Error: Empty response body.");
         int? expectedBytes = req.data!.contentLength;
         if (expectedBytes == -1) {
@@ -185,7 +225,9 @@ abstract class ImageDownloader {
         }
 
         if (configs['onResponse'] is JSInvokable) {
-          dynamic result = (configs['onResponse'] as JSInvokable)([Uint8List.fromList(buffer)]);
+          dynamic result = (configs['onResponse'] as JSInvokable)([
+            Uint8List.fromList(buffer),
+          ]);
           if (result is Future) {
             result = await result;
           }
@@ -213,7 +255,9 @@ abstract class ImageDownloader {
           data = newData;
         }
 
-        await CacheManager().writeCache(cacheKey, data);
+        if (useCache) {
+          await CacheManager().writeCache(cacheKey, data);
+        }
         yield ImageDownloadProgress(
           currentBytes: data.length,
           totalBytes: data.length,
@@ -268,15 +312,13 @@ class _StreamWrapper<T> {
           }
         }
       }
-    }
-    catch (e) {
+    } catch (e) {
       for (var controller in controllers) {
         if (!controller.isClosed) {
           controller.addError(e);
         }
       }
-    }
-    finally {
+    } finally {
       for (var controller in controllers) {
         if (!controller.isClosed) {
           controller.close();

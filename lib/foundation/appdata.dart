@@ -369,4 +369,4 @@ async function processImage(image, cid, eid, page, sourceKey) {
 ''';
 
 const _defaultSourceListUrl =
-    "https://cdn.jsdelivr.net/gh/venera-app/venera-configs@main/index.json";
+    "https://cdn.jsdelivr.net/gh/cyc20050130/venera-configs@main/index.json";
