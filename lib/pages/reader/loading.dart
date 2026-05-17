@@ -42,10 +42,7 @@ class _ReaderWithLoadingState
   @override
   Future<Res<ReaderProps>> loadData() async {
     var comicSource = ComicSource.find(widget.sourceKey);
-    var history = HistoryManager().find(
-      widget.id,
-      ComicType.fromKey(widget.sourceKey),
-    );
+    var history = HistoryManager().findBySourceKey(widget.id, widget.sourceKey);
     if (comicSource == null) {
       var localComic = LocalManager().find(
         widget.id,
@@ -60,12 +57,8 @@ class _ReaderWithLoadingState
           cid: widget.id,
           name: localComic.title,
           chapters: localComic.chapters,
-          history: history ??
-              History.fromModel(
-                model: localComic,
-                ep: 0,
-                page: 0,
-              ),
+          history:
+              history ?? History.fromModel(model: localComic, ep: 0, page: 0),
           author: localComic.subtitle,
           tags: localComic.tags,
         ),
@@ -81,12 +74,8 @@ class _ReaderWithLoadingState
           cid: widget.id,
           name: comic.data.title,
           chapters: comic.data.chapters,
-          history: history ??
-              History.fromModel(
-                model: comic.data,
-                ep: 0,
-                page: 0,
-              ),
+          history:
+              history ?? History.fromModel(model: comic.data, ep: 0, page: 0),
           author: comic.data.findAuthor() ?? "",
           tags: comic.data.plainTags,
         ),

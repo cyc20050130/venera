@@ -157,6 +157,7 @@ class ComicDetails with HistoryMixin {
 
   final List<Comic>? recommend;
 
+  @override
   final String sourceKey;
 
   final String comicId;
