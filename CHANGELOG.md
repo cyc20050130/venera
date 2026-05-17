@@ -2,11 +2,12 @@
 
 ## 1.6.5 - 2026-05-17
 
-Release tag: `v8a`
+- Release tag: `v1.6.5`
+- APK 架构：`arm64-v8a`
 
-- Fixed cache cleanup stability and cache database self-recovery.
-- Fixed reading history indexing to use stable `sourceKey`, preventing cross-source collisions.
-- Restored continue-reading progress across export and import on the repaired package format.
-- Fixed history schema migration recovery when an upgrade is interrupted.
-- Updated in-app update links to `cyc20050130/venera` and removed the Telegram entry.
-- Merged offline cache improvements, including comic details caching and related offline reading updates.
+- 修复缓存清理稳定性问题，并在 `cache.db` 损坏时自动重建。
+- 修复阅读历史索引，改用稳定 `sourceKey`，避免不同漫画源相同 `id` 互相覆盖。
+- 修复导出/导入后的继续阅读恢复，保证修复后导出的数据包可携带阅读进度。
+- 修复历史库升级中断后的恢复逻辑，避免旧历史卡在 `history_legacy`。
+- 应用内检查更新、GitHub 与 Releases 入口切换到 `cyc20050130/venera`，并移除 Telegram 入口。
+- 合并离线缓存增强，包括漫画详情缓存与相关离线阅读改进。
