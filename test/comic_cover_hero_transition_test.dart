@@ -117,6 +117,21 @@ void main() {
 
     expect(route.allowSnapshotting, isFalse);
   });
+
+  test(
+    'Hero-only ComicPage transition does not animate the previous route',
+    () {
+      final previousRoute = AppPageRoute<void>(
+        builder: (_) => const SizedBox(),
+      );
+      final route = AppPageRoute<void>(
+        builder: (_) => const SizedBox(),
+        transitionStyle: AppPageTransitionStyle.heroOnly,
+      );
+
+      expect(route.canTransitionFrom(previousRoute), isFalse);
+    },
+  );
 }
 
 const _kTransparentImageBase64 =
