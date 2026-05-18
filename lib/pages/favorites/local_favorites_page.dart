@@ -711,6 +711,7 @@ class _LocalFavoritesPageState extends State<_LocalFavoritesPage> {
                     title: c.title,
                     heroTag: heroTag,
                   ),
+                  allowSnapshotting: false,
                 );
               } else {
                 App.mainNavigatorKey?.currentContext?.to(

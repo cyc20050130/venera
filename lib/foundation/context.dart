@@ -5,7 +5,7 @@ import 'app_page_route.dart';
 
 extension Navigation on BuildContext {
   void pop<T>([T? result]) {
-    if(mounted) {
+    if (mounted) {
       Navigator.of(this).pop(result);
     }
   }
@@ -14,14 +14,25 @@ extension Navigation on BuildContext {
     return Navigator.of(this).canPop();
   }
 
-  Future<T?> to<T>(Widget Function() builder,) {
-    return Navigator.of(this).push<T>(AppPageRoute(
-        builder: (context) => builder()));
+  Future<T?> to<T>(Widget Function() builder, {bool allowSnapshotting = true}) {
+    return Navigator.of(this).push<T>(
+      AppPageRoute(
+        builder: (context) => builder(),
+        allowSnapshotting: allowSnapshotting,
+      ),
+    );
   }
 
-  Future<void> toReplacement<T>(Widget Function() builder) {
-    return Navigator.of(this).pushReplacement(AppPageRoute(
-        builder: (context) => builder()));
+  Future<void> toReplacement<T>(
+    Widget Function() builder, {
+    bool allowSnapshotting = true,
+  }) {
+    return Navigator.of(this).pushReplacement(
+      AppPageRoute(
+        builder: (context) => builder(),
+        allowSnapshotting: allowSnapshotting,
+      ),
+    );
   }
 
   double get width => MediaQuery.of(this).size.width;

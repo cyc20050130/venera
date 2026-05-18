@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:venera/components/components.dart';
+import 'package:venera/foundation/app_page_route.dart';
 import 'package:venera/pages/comic_details_page/comic_page.dart';
 
 void main() {
@@ -106,6 +107,15 @@ void main() {
     );
 
     expect(find.byType(AnimatedSwitcher), findsOneWidget);
+  });
+
+  test('AppPageRoute can disable snapshotting for hero-heavy transitions', () {
+    final route = AppPageRoute<void>(
+      builder: (_) => const SizedBox(),
+      allowSnapshotting: false,
+    );
+
+    expect(route.allowSnapshotting, isFalse);
   });
 }
 

@@ -318,6 +318,7 @@ class _HistoryState extends State<_History> {
                               title: history[index].title,
                               heroTag: heroTag,
                             ),
+                            allowSnapshotting: false,
                           );
                         },
                       ).paddingHorizontal(8).paddingVertical(2);
@@ -431,6 +432,7 @@ class _LocalState extends State<_Local> {
                               title: local[index].title,
                               heroTag: heroTag,
                             ),
+                            allowSnapshotting: false,
                           );
                         },
                       ).paddingHorizontal(8).paddingVertical(2);

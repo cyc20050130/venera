@@ -62,6 +62,7 @@ class ComicTile extends StatelessWidget {
         title: comic.title,
         heroTag: heroTag,
       ),
+      allowSnapshotting: heroTag == null,
     );
   }
 
@@ -1672,6 +1673,7 @@ class SimpleComicTile extends StatelessWidget {
                 title: comic.title,
                 heroTag: heroTag,
               ),
+              allowSnapshotting: heroTag == null,
             );
           },
       child: child,
