@@ -32,7 +32,7 @@ class ComicTile extends StatelessWidget {
     this.menuOptions,
     this.onTap,
     this.onLongPressed,
-    this.heroID,
+    this.heroTag,
   });
 
   final Comic comic;
@@ -47,7 +47,7 @@ class ComicTile extends StatelessWidget {
 
   final VoidCallback? onLongPressed;
 
-  final int? heroID;
+  final String? heroTag;
 
   void _onTap() {
     if (onTap != null) {
@@ -60,7 +60,7 @@ class ComicTile extends StatelessWidget {
         sourceKey: comic.sourceKey,
         cover: comic.cover,
         title: comic.title,
-        heroID: heroID,
+        heroTag: heroTag,
       ),
     );
   }
@@ -205,7 +205,7 @@ class ComicTile extends StatelessWidget {
       fit: BoxFit.cover,
       width: double.infinity,
       height: double.infinity,
-      animateOnFirstFrame: heroID == null,
+      animateOnFirstFrame: heroTag == null,
     );
   }
 
@@ -232,8 +232,8 @@ class ComicTile extends StatelessWidget {
           child: buildImage(context),
         );
 
-        if (heroID != null) {
-          image = Hero(tag: "cover$heroID", child: image);
+        if (heroTag != null) {
+          image = buildComicCoverHero(heroTag: heroTag!, child: image);
         }
 
         return InkWell(
@@ -292,8 +292,8 @@ class ComicTile extends StatelessWidget {
           child: buildImage(context),
         );
 
-        if (heroID != null) {
-          image = Hero(tag: "cover$heroID", child: image);
+        if (heroTag != null) {
+          image = buildComicCoverHero(heroTag: heroTag!, child: image);
         }
 
         return InkWell(
@@ -749,9 +749,9 @@ class SliverGridComics extends StatefulWidget {
 
   final List<MenuEntry> Function(Comic)? menuBuilder;
 
-  final void Function(Comic, int heroID)? onTap;
+  final void Function(Comic, String heroTag)? onTap;
 
-  final void Function(Comic, int heroID)? onLongPressed;
+  final void Function(Comic, String heroTag)? onLongPressed;
 
   @override
   State<SliverGridComics> createState() => _SliverGridComicsState();
@@ -759,14 +759,21 @@ class SliverGridComics extends StatefulWidget {
 
 class _SliverGridComicsState extends State<SliverGridComics> {
   List<Comic> comics = [];
-  List<int> heroIDs = [];
+  List<String> heroTags = [];
 
-  static int _nextHeroID = 0;
+  static int _nextHeroTagId = 0;
 
-  void generateHeroID() {
-    heroIDs.clear();
+  void generateHeroTags() {
+    heroTags.clear();
     for (var i = 0; i < comics.length; i++) {
-      heroIDs.add(_nextHeroID++);
+      heroTags.add(
+        buildComicCoverHeroTag(
+          scope: 'grid',
+          sourceKey: comics[i].sourceKey,
+          comicId: comics[i].id,
+          index: _nextHeroTagId++,
+        ),
+      );
     }
   }
 
@@ -779,7 +786,7 @@ class _SliverGridComicsState extends State<SliverGridComics> {
           comics.add(comic);
         }
       }
-      generateHeroID();
+      generateHeroTags();
     }
     super.didUpdateWidget(oldWidget);
   }
@@ -791,7 +798,7 @@ class _SliverGridComicsState extends State<SliverGridComics> {
         comics.add(comic);
       }
     }
-    generateHeroID();
+    generateHeroTags();
     HistoryManager().addListener(update);
     super.initState();
   }
@@ -817,7 +824,7 @@ class _SliverGridComicsState extends State<SliverGridComics> {
   Widget build(BuildContext context) {
     return _SliverGridComics(
       comics: comics,
-      heroIDs: heroIDs,
+      heroTags: heroTags,
       selection: widget.selections,
       onLastItemBuild: widget.onLastItemBuild,
       badgeBuilder: widget.badgeBuilder,
@@ -831,7 +838,7 @@ class _SliverGridComicsState extends State<SliverGridComics> {
 class _SliverGridComics extends StatelessWidget {
   const _SliverGridComics({
     required this.comics,
-    required this.heroIDs,
+    required this.heroTags,
     this.onLastItemBuild,
     this.badgeBuilder,
     this.menuBuilder,
@@ -842,7 +849,7 @@ class _SliverGridComics extends StatelessWidget {
 
   final List<Comic> comics;
 
-  final List<int> heroIDs;
+  final List<String> heroTags;
 
   final Map<Comic, bool>? selection;
 
@@ -852,9 +859,9 @@ class _SliverGridComics extends StatelessWidget {
 
   final List<MenuEntry> Function(Comic)? menuBuilder;
 
-  final void Function(Comic, int heroID)? onTap;
+  final void Function(Comic, String heroTag)? onTap;
 
-  final void Function(Comic, int heroID)? onLongPressed;
+  final void Function(Comic, String heroTag)? onLongPressed;
 
   @override
   Widget build(BuildContext context) {
@@ -872,12 +879,12 @@ class _SliverGridComics extends StatelessWidget {
           badge: badge,
           menuOptions: menuBuilder?.call(comics[index]),
           onTap: onTap != null
-              ? () => onTap!(comics[index], heroIDs[index])
+              ? () => onTap!(comics[index], heroTags[index])
               : null,
           onLongPressed: onLongPressed != null
-              ? () => onLongPressed!(comics[index], heroIDs[index])
+              ? () => onLongPressed!(comics[index], heroTags[index])
               : null,
-          heroID: heroIDs[index],
+          heroTag: heroTags[index],
         );
         if (selection == null) {
           return comic;
@@ -1611,7 +1618,7 @@ class SimpleComicTile extends StatelessWidget {
     required this.comic,
     this.onTap,
     this.withTitle = false,
-    this.heroID,
+    this.heroTag,
   });
 
   final Comic comic;
@@ -1620,7 +1627,7 @@ class SimpleComicTile extends StatelessWidget {
 
   final bool withTitle;
 
-  final int? heroID;
+  final String? heroTag;
 
   @override
   Widget build(BuildContext context) {
@@ -1634,7 +1641,7 @@ class SimpleComicTile extends StatelessWidget {
             height: double.infinity,
             fit: BoxFit.cover,
             filterQuality: FilterQuality.medium,
-            animateOnFirstFrame: heroID == null,
+            animateOnFirstFrame: heroTag == null,
           );
 
     child = Container(
@@ -1648,8 +1655,8 @@ class SimpleComicTile extends StatelessWidget {
       child: child,
     );
 
-    if (heroID != null) {
-      child = Hero(tag: "cover$heroID", child: child);
+    if (heroTag != null) {
+      child = buildComicCoverHero(heroTag: heroTag!, child: child);
     }
 
     child = AnimatedTapRegion(
@@ -1663,7 +1670,7 @@ class SimpleComicTile extends StatelessWidget {
                 sourceKey: comic.sourceKey,
                 cover: comic.cover,
                 title: comic.title,
-                heroID: heroID,
+                heroTag: heroTag,
               ),
             );
           },

@@ -7,11 +7,33 @@ import 'package:venera/pages/comic_details_page/comic_page.dart';
 
 void main() {
   test(
-    'resolveComicPageCoverUrl prefers transition cover before hero settles',
+    'buildComicCoverHeroTag distinguishes home sections for the same comic',
     () {
       expect(
-        resolveComicPageCoverUrl(
-          isHeroTransitionSettled: false,
+        buildComicCoverHeroTag(
+          scope: 'home-history',
+          sourceKey: 'test-source',
+          comicId: 'same-id',
+          index: 0,
+        ),
+        isNot(
+          buildComicCoverHeroTag(
+            scope: 'home-local',
+            sourceKey: 'test-source',
+            comicId: 'same-id',
+            index: 0,
+          ),
+        ),
+      );
+    },
+  );
+
+  test(
+    'resolveDisplayedComicPageCoverUrl keeps transition cover until detail cover can replace it',
+    () {
+      expect(
+        resolveDisplayedComicPageCoverUrl(
+          canPromoteToDetailCover: false,
           transitionCover: 'entry-cover',
           detailCover: 'detail-cover',
         ),
@@ -19,8 +41,8 @@ void main() {
       );
 
       expect(
-        resolveComicPageCoverUrl(
-          isHeroTransitionSettled: true,
+        resolveDisplayedComicPageCoverUrl(
+          canPromoteToDetailCover: true,
           transitionCover: 'entry-cover',
           detailCover: 'detail-cover',
         ),
@@ -28,12 +50,22 @@ void main() {
       );
 
       expect(
-        resolveComicPageCoverUrl(
-          isHeroTransitionSettled: false,
+        resolveDisplayedComicPageCoverUrl(
+          canPromoteToDetailCover: false,
           transitionCover: null,
           detailCover: 'detail-cover',
         ),
         'detail-cover',
+      );
+
+      expect(
+        resolveDisplayedComicPageCoverUrl(
+          canPromoteToDetailCover: false,
+          transitionCover: null,
+          detailCover: null,
+          currentCover: 'current-cover',
+        ),
+        'current-cover',
       );
     },
   );

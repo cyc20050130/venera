@@ -68,23 +68,61 @@ void refreshComicFavoriteStatusInBackground({
   }());
 }
 
-String? resolveComicPageCoverUrl({
-  required bool isHeroTransitionSettled,
+String buildComicCoverHeroTag({
+  required String scope,
+  required String sourceKey,
+  required String comicId,
+  int? index,
+}) {
+  final suffix = index == null ? '' : ':$index';
+  return 'cover:$scope:$sourceKey:$comicId$suffix';
+}
+
+String? resolveDisplayedComicPageCoverUrl({
+  required bool canPromoteToDetailCover,
   required String? transitionCover,
   required String? detailCover,
+  String? currentCover,
 }) {
-  if (!isHeroTransitionSettled &&
-      transitionCover != null &&
-      transitionCover.isNotEmpty) {
-    return transitionCover;
-  }
-  if (detailCover != null && detailCover.isNotEmpty) {
+  if (canPromoteToDetailCover &&
+      detailCover != null &&
+      detailCover.isNotEmpty) {
     return detailCover;
   }
   if (transitionCover != null && transitionCover.isNotEmpty) {
     return transitionCover;
   }
+  if (detailCover != null && detailCover.isNotEmpty) {
+    return detailCover;
+  }
+  if (currentCover != null && currentCover.isNotEmpty) {
+    return currentCover;
+  }
   return null;
+}
+
+Widget buildComicCoverHero({required String heroTag, required Widget child}) {
+  return Hero(
+    tag: heroTag,
+    placeholderBuilder: (context, size, child) {
+      return Opacity(opacity: 0, child: child);
+    },
+    flightShuttleBuilder:
+        (
+          flightContext,
+          animation,
+          flightDirection,
+          fromHeroContext,
+          toHeroContext,
+        ) {
+          final fromHero = fromHeroContext.widget as Hero;
+          return Material(
+            type: MaterialType.transparency,
+            child: fromHero.child,
+          );
+        },
+    child: child,
+  );
 }
 
 Widget buildComicPageCoverCard(
@@ -92,9 +130,11 @@ Widget buildComicPageCoverCard(
   required String? cover,
   required String sourceKey,
   required String cid,
-  required int? heroID,
+  required String? heroTag,
   VoidCallback? onTap,
   VoidCallback? onLongPress,
+  bool animateOnFirstFrame = true,
+  bool gaplessPlayback = false,
 }) {
   Widget child;
   if (cover != null) {
@@ -103,7 +143,8 @@ Widget buildComicPageCoverCard(
       width: double.infinity,
       height: double.infinity,
       fit: BoxFit.cover,
-      animateOnFirstFrame: heroID == null,
+      animateOnFirstFrame: animateOnFirstFrame,
+      gaplessPlayback: gaplessPlayback,
     );
   } else {
     child = const SizedBox();
@@ -127,8 +168,8 @@ Widget buildComicPageCoverCard(
     child: child,
   );
 
-  if (heroID != null) {
-    result = Hero(tag: "cover$heroID", child: result);
+  if (heroTag != null) {
+    result = buildComicCoverHero(heroTag: heroTag, child: result);
   }
 
   if (onTap != null || onLongPress != null) {
@@ -149,7 +190,7 @@ class ComicPage extends StatefulWidget {
     required this.sourceKey,
     this.cover,
     this.title,
-    this.heroID,
+    this.heroTag,
   });
 
   final String id;
@@ -160,7 +201,7 @@ class ComicPage extends StatefulWidget {
 
   final String? title;
 
-  final int? heroID;
+  final String? heroTag;
 
   @override
   State<ComicPage> createState() => _ComicPageState();
@@ -171,7 +212,8 @@ class _ComicPageState extends LoadingState<ComicPage, ComicDetails>
   bool _forceRefresh = false;
   int _favoriteStatusRequestId = 0;
   Animation<double>? _routeAnimation;
-  bool _isHeroTransitionSettled = true;
+  bool _canPromoteToDetailCover = true;
+  String? _displayedCoverUrl;
 
   @override
   void invalidateFavoriteStatusRefresh() {
@@ -202,7 +244,7 @@ class _ComicPageState extends LoadingState<ComicPage, ComicDetails>
       title: widget.title,
       sourceKey: widget.sourceKey,
       cid: widget.id,
-      heroID: widget.heroID,
+      heroTag: widget.heroTag,
     );
   }
 
@@ -240,7 +282,8 @@ class _ComicPageState extends LoadingState<ComicPage, ComicDetails>
 
   @override
   void initState() {
-    _isHeroTransitionSettled = widget.heroID == null;
+    _displayedCoverUrl = widget.cover;
+    _canPromoteToDetailCover = widget.heroTag == null;
     scrollController.addListener(onScroll);
     super.initState();
   }
@@ -254,7 +297,7 @@ class _ComicPageState extends LoadingState<ComicPage, ComicDetails>
       _routeAnimation = animation;
       _routeAnimation?.addStatusListener(_handleRouteAnimationStatusChanged);
     }
-    _syncHeroTransitionSettled();
+    _syncDisplayedCoverUrl();
   }
 
   @override
@@ -272,35 +315,38 @@ class _ComicPageState extends LoadingState<ComicPage, ComicDetails>
   @override
   ComicDetails get comic => data!;
 
-  String? get _currentCoverUrl => resolveComicPageCoverUrl(
-    isHeroTransitionSettled: _isHeroTransitionSettled,
-    transitionCover: widget.cover,
-    detailCover: data?.cover ?? widget.cover,
-  );
-
-  bool _computeIsHeroTransitionSettled() {
+  bool _computeCanPromoteToDetailCover() {
     final animation = _routeAnimation;
-    return widget.heroID == null ||
+    return widget.heroTag == null ||
         animation == null ||
         animation.status == AnimationStatus.completed;
   }
 
-  void _syncHeroTransitionSettled({bool notify = false}) {
-    final nextValue = _computeIsHeroTransitionSettled();
-    if (nextValue == _isHeroTransitionSettled) {
+  void _syncDisplayedCoverUrl({bool notify = false}) {
+    final nextCanPromote = _computeCanPromoteToDetailCover();
+    final nextCover = resolveDisplayedComicPageCoverUrl(
+      canPromoteToDetailCover: nextCanPromote,
+      transitionCover: widget.cover,
+      detailCover: data?.cover,
+      currentCover: _displayedCoverUrl,
+    );
+    if (nextCanPromote == _canPromoteToDetailCover &&
+        nextCover == _displayedCoverUrl) {
       return;
     }
     if (notify && mounted) {
       setState(() {
-        _isHeroTransitionSettled = nextValue;
+        _canPromoteToDetailCover = nextCanPromote;
+        _displayedCoverUrl = nextCover;
       });
     } else {
-      _isHeroTransitionSettled = nextValue;
+      _canPromoteToDetailCover = nextCanPromote;
+      _displayedCoverUrl = nextCover;
     }
   }
 
   void _handleRouteAnimationStatusChanged(AnimationStatus status) {
-    _syncHeroTransitionSettled(notify: true);
+    _syncDisplayedCoverUrl(notify: true);
   }
 
   void onScroll() {
@@ -434,6 +480,7 @@ class _ComicPageState extends LoadingState<ComicPage, ComicDetails>
     if (comic.chapters == null) {
       isDownloaded = LocalManager().isDownloaded(comic.id, comic.comicType, 0);
     }
+    _syncDisplayedCoverUrl(notify: mounted);
     _refreshFavoriteStatusInBackground();
   }
 
@@ -479,12 +526,14 @@ class _ComicPageState extends LoadingState<ComicPage, ComicDetails>
           const SizedBox(width: 16),
           buildComicPageCoverCard(
             context,
-            cover: _currentCoverUrl,
+            cover: _displayedCoverUrl ?? comic.cover,
             sourceKey: comic.sourceKey,
             cid: comic.id,
-            heroID: widget.heroID,
+            heroTag: widget.heroTag,
             onTap: () => _viewCover(context),
             onLongPress: () => _saveCover(context),
+            animateOnFirstFrame: widget.heroTag == null,
+            gaplessPlayback: true,
           ),
           const SizedBox(width: 16),
           Expanded(
@@ -887,7 +936,7 @@ class _ComicPageState extends LoadingState<ComicPage, ComicDetails>
   }
 
   void _viewCover(BuildContext context) {
-    final cover = _currentCoverUrl ?? comic.cover;
+    final cover = _displayedCoverUrl ?? comic.cover;
     final imageProvider = CachedImageProvider(
       cover,
       sourceKey: comic.sourceKey,
@@ -898,14 +947,20 @@ class _ComicPageState extends LoadingState<ComicPage, ComicDetails>
       () => _CoverViewer(
         imageProvider: imageProvider,
         title: comic.title,
-        heroTag: "cover${widget.heroID}",
+        heroTag:
+            widget.heroTag ??
+            buildComicCoverHeroTag(
+              scope: 'detail-viewer',
+              sourceKey: comic.sourceKey,
+              comicId: comic.id,
+            ),
       ),
     );
   }
 
   void _saveCover(BuildContext context) async {
     try {
-      final cover = _currentCoverUrl ?? comic.cover;
+      final cover = _displayedCoverUrl ?? comic.cover;
       final imageProvider = CachedImageProvider(
         cover,
         sourceKey: comic.sourceKey,
@@ -1109,7 +1164,7 @@ class _ComicPageLoadingPlaceHolder extends StatelessWidget {
     this.title,
     required this.sourceKey,
     required this.cid,
-    this.heroID,
+    this.heroTag,
   });
 
   final String? cover;
@@ -1120,7 +1175,7 @@ class _ComicPageLoadingPlaceHolder extends StatelessWidget {
 
   final String cid;
 
-  final int? heroID;
+  final String? heroTag;
 
   @override
   Widget build(BuildContext context) {
@@ -1197,7 +1252,9 @@ class _ComicPageLoadingPlaceHolder extends StatelessWidget {
       cover: cover,
       sourceKey: sourceKey,
       cid: cid,
-      heroID: heroID,
+      heroTag: heroTag,
+      animateOnFirstFrame: heroTag == null,
+      gaplessPlayback: true,
     );
   }
 }

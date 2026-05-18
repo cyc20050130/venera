@@ -300,10 +300,15 @@ class _HistoryState extends State<_History> {
                     scrollDirection: Axis.horizontal,
                     itemCount: history.length,
                     itemBuilder: (context, index) {
-                      final heroID = history[index].id.hashCode;
+                      final heroTag = buildComicCoverHeroTag(
+                        scope: 'home-history',
+                        sourceKey: history[index].sourceKey,
+                        comicId: history[index].id,
+                        index: index,
+                      );
                       return SimpleComicTile(
                         comic: history[index],
-                        heroID: heroID,
+                        heroTag: heroTag,
                         onTap: () {
                           context.to(
                             () => ComicPage(
@@ -311,7 +316,7 @@ class _HistoryState extends State<_History> {
                               sourceKey: history[index].sourceKey,
                               cover: history[index].cover,
                               title: history[index].title,
-                              heroID: heroID,
+                              heroTag: heroTag,
                             ),
                           );
                         },
@@ -408,10 +413,15 @@ class _LocalState extends State<_Local> {
                     scrollDirection: Axis.horizontal,
                     itemCount: local.length,
                     itemBuilder: (context, index) {
-                      final heroID = local[index].id.hashCode;
+                      final heroTag = buildComicCoverHeroTag(
+                        scope: 'home-local',
+                        sourceKey: local[index].sourceKey,
+                        comicId: local[index].id,
+                        index: index,
+                      );
                       return SimpleComicTile(
                         comic: local[index],
-                        heroID: heroID,
+                        heroTag: heroTag,
                         onTap: () {
                           context.to(
                             () => ComicPage(
@@ -419,7 +429,7 @@ class _LocalState extends State<_Local> {
                               sourceKey: local[index].sourceKey,
                               cover: local[index].cover,
                               title: local[index].title,
-                              heroID: heroID,
+                              heroTag: heroTag,
                             ),
                           );
                         },
