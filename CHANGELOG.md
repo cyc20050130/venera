@@ -1,11 +1,17 @@
 # Changelog
 
+## 1.6.14 - 2026-05-18
+
+- Release tag: `v1.6.14`
+- APK 架构：`arm64-v8a`
+
+- 回退 `ComicPage` 的 cover-only transition，恢复默认页面转场行为。
+- 不再对带封面 Hero 的 `ComicPage` 入口显式关闭 `snapshotting`。
+
 ## 1.6.13 - 2026-05-18
 
 - Release tag: `v1.6.13`
 - APK 架构：`arm64-v8a`
-
-- 进一步将带封面 Hero 的 `ComicPage` 路由切为仅封面平移，不再让列表页退出或详情页整页滑入，减轻刚启动应用后首次进入详情页的转场卡顿。
 
 ## 1.6.12 - 2026-05-18
 

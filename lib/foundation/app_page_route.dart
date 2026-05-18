@@ -10,8 +10,6 @@ const int _kMaxDroppedSwipePageForwardAnimationTime = 800;
 const int _kMaxPageBackAnimationTime = 300;
 const double _kMinFlingVelocity = 1.0;
 
-enum AppPageTransitionStyle { platform, heroOnly }
-
 class AppPageRoute<T> extends PageRoute<T> with _AppRouteTransitionMixin {
   /// Construct a MaterialPageRoute whose contents are defined by [builder].
   AppPageRoute({
@@ -23,7 +21,6 @@ class AppPageRoute<T> extends PageRoute<T> with _AppRouteTransitionMixin {
     super.barrierDismissible = false,
     this.enableIOSGesture = true,
     this.preventRebuild = true,
-    this.transitionStyle = AppPageTransitionStyle.platform,
   }) {
     assert(opaque);
   }
@@ -54,8 +51,6 @@ class AppPageRoute<T> extends PageRoute<T> with _AppRouteTransitionMixin {
 
   @override
   final bool preventRebuild;
-
-  final AppPageTransitionStyle transitionStyle;
 }
 
 mixin _AppRouteTransitionMixin<T> on PageRoute<T> {
@@ -76,15 +71,6 @@ mixin _AppRouteTransitionMixin<T> on PageRoute<T> {
   bool canTransitionTo(TransitionRoute<dynamic> nextRoute) {
     // Don't perform outgoing animation if the next route is a fullscreen dialog.
     return nextRoute is PageRoute && !nextRoute.fullscreenDialog;
-  }
-
-  @override
-  bool canTransitionFrom(TransitionRoute<dynamic> previousRoute) {
-    final route = this as AppPageRoute<T>;
-    if (route.transitionStyle == AppPageTransitionStyle.heroOnly) {
-      return false;
-    }
-    return super.canTransitionFrom(previousRoute);
   }
 
   bool get enableIOSGesture;
@@ -136,18 +122,6 @@ mixin _AppRouteTransitionMixin<T> on PageRoute<T> {
     Animation<double> secondaryAnimation,
     Widget child,
   ) {
-    final route = this as AppPageRoute<T>;
-    if (route.transitionStyle == AppPageTransitionStyle.heroOnly) {
-      return enableIOSGesture && App.isIOS
-          ? IOSBackGestureDetector(
-              gestureWidth: _kBackGestureWidth,
-              enabledCallback: () => _isPopGestureEnabled<T>(this),
-              onStartPopGesture: () => _startPopGesture(this),
-              child: child,
-            )
-          : child;
-    }
-
     PageTransitionsBuilder builder;
     if (App.isAndroid) {
       builder = PredictiveBackPageTransitionsBuilder();

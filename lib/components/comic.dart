@@ -62,9 +62,6 @@ class ComicTile extends StatelessWidget {
         title: comic.title,
         heroTag: heroTag,
       ),
-      transitionStyle: heroTag == null
-          ? AppPageTransitionStyle.platform
-          : AppPageTransitionStyle.heroOnly,
     );
   }
 
@@ -1675,9 +1672,6 @@ class SimpleComicTile extends StatelessWidget {
                 title: comic.title,
                 heroTag: heroTag,
               ),
-              transitionStyle: heroTag == null
-                  ? AppPageTransitionStyle.platform
-                  : AppPageTransitionStyle.heroOnly,
             );
           },
       child: child,

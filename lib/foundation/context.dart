@@ -14,34 +14,23 @@ extension Navigation on BuildContext {
     return Navigator.of(this).canPop();
   }
 
-  Future<T?> to<T>(
-    Widget Function() builder, {
-    bool? allowSnapshotting,
-    AppPageTransitionStyle transitionStyle = AppPageTransitionStyle.platform,
-  }) {
+  Future<T?> to<T>(Widget Function() builder, {bool allowSnapshotting = true}) {
     return Navigator.of(this).push<T>(
       AppPageRoute(
         builder: (context) => builder(),
-        allowSnapshotting:
-            allowSnapshotting ??
-            transitionStyle != AppPageTransitionStyle.heroOnly,
-        transitionStyle: transitionStyle,
+        allowSnapshotting: allowSnapshotting,
       ),
     );
   }
 
   Future<void> toReplacement<T>(
     Widget Function() builder, {
-    bool? allowSnapshotting,
-    AppPageTransitionStyle transitionStyle = AppPageTransitionStyle.platform,
+    bool allowSnapshotting = true,
   }) {
     return Navigator.of(this).pushReplacement(
       AppPageRoute(
         builder: (context) => builder(),
-        allowSnapshotting:
-            allowSnapshotting ??
-            transitionStyle != AppPageTransitionStyle.heroOnly,
-        transitionStyle: transitionStyle,
+        allowSnapshotting: allowSnapshotting,
       ),
     );
   }

@@ -3,7 +3,6 @@ import 'package:sliver_tools/sliver_tools.dart';
 import 'package:url_launcher/url_launcher_string.dart';
 import 'package:venera/components/components.dart';
 import 'package:venera/foundation/app.dart';
-import 'package:venera/foundation/app_page_route.dart';
 import 'package:venera/foundation/comic_source/comic_source.dart';
 import 'package:venera/foundation/consts.dart';
 import 'package:venera/foundation/favorites.dart';
@@ -319,7 +318,6 @@ class _HistoryState extends State<_History> {
                               title: history[index].title,
                               heroTag: heroTag,
                             ),
-                            transitionStyle: AppPageTransitionStyle.heroOnly,
                           );
                         },
                       ).paddingHorizontal(8).paddingVertical(2);
@@ -433,7 +431,6 @@ class _LocalState extends State<_Local> {
                               title: local[index].title,
                               heroTag: heroTag,
                             ),
-                            transitionStyle: AppPageTransitionStyle.heroOnly,
                           );
                         },
                       ).paddingHorizontal(8).paddingVertical(2);

@@ -711,7 +711,6 @@ class _LocalFavoritesPageState extends State<_LocalFavoritesPage> {
                     title: c.title,
                     heroTag: heroTag,
                   ),
-                  transitionStyle: AppPageTransitionStyle.heroOnly,
                 );
               } else {
                 App.mainNavigatorKey?.currentContext?.to(
