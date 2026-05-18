@@ -115,10 +115,10 @@ Widget buildComicCoverHero({required String heroTag, required Widget child}) {
           fromHeroContext,
           toHeroContext,
         ) {
-          final fromHero = fromHeroContext.widget as Hero;
+          final toHero = toHeroContext.widget as Hero;
           return Material(
             type: MaterialType.transparency,
-            child: fromHero.child,
+            child: toHero.child,
           );
         },
     child: child,
