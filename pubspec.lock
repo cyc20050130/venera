@@ -454,7 +454,7 @@ packages:
     source: hosted
     version: "5.6.0"
   flutter_rust_bridge:
-    dependency: transitive
+    dependency: "direct overridden"
     description:
       name: flutter_rust_bridge
       sha256: e87d6b9ee934dcd24a128ccb2bd91905d2d5fe5c06245d6a8f5477d4907a437a
@@ -887,10 +887,10 @@ packages:
     dependency: "direct main"
     description:
       name: rhttp
-      sha256: b111638045b730f825a85cb045017b5bd3dfb47b38e98eb293b0519ee6050f2e
+      sha256: "32482042b007474f287f843c298d46a5589aaf8db9603ff78527b5e0bcbee40a"
       url: "https://pub.flutter-io.cn"
     source: hosted
-    version: "0.15.1"
+    version: "0.16.0"
   screen_retriever:
     dependency: transitive
     description:

@@ -2,7 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 
 import 'package:dio/dio.dart';
-import 'package:flutter/services.dart';
+import 'package:flutter/foundation.dart';
 import 'package:rhttp/rhttp.dart' as rhttp;
 import 'package:venera/foundation/appdata.dart';
 import 'package:venera/foundation/log.dart';
@@ -18,32 +18,42 @@ export 'package:dio/dio.dart';
 class MyLogInterceptor implements Interceptor {
   @override
   void onError(DioException err, ErrorInterceptorHandler handler) {
-    Log.error("Network",
-        "${err.requestOptions.method} ${err.requestOptions.path}\n$err\n${err.response?.data.toString()}");
+    Log.error(
+      "Network",
+      "${err.requestOptions.method} ${err.requestOptions.path}\n$err\n${err.response?.data.toString()}",
+    );
     switch (err.type) {
       case DioExceptionType.badResponse:
         var statusCode = err.response?.statusCode;
         if (statusCode != null) {
           err = err.copyWith(
-              message: "Invalid Status Code: $statusCode. "
-                  "${_getStatusCodeInfo(statusCode)}");
+            message:
+                "Invalid Status Code: $statusCode. "
+                "${_getStatusCodeInfo(statusCode)}",
+          );
         }
       case DioExceptionType.connectionTimeout:
         err = err.copyWith(message: "Connection Timeout");
       case DioExceptionType.receiveTimeout:
         err = err.copyWith(
-            message: "Receive Timeout: "
-                "This indicates that the server is too busy to respond");
+          message:
+              "Receive Timeout: "
+              "This indicates that the server is too busy to respond",
+        );
       case DioExceptionType.unknown:
         if (err.toString().contains("Connection terminated during handshake")) {
           err = err.copyWith(
-              message: "Connection terminated during handshake: "
-                  "This may be caused by the firewall blocking the connection "
-                  "or your requests are too frequent.");
+            message:
+                "Connection terminated during handshake: "
+                "This may be caused by the firewall blocking the connection "
+                "or your requests are too frequent.",
+          );
         } else if (err.toString().contains("Connection reset by peer")) {
           err = err.copyWith(
-              message: "Connection reset by peer: "
-                  "The error is unrelated to app, please check your network.");
+            message:
+                "Connection reset by peer: "
+                "The error is unrelated to app, please check your network.",
+          );
         }
       default:
         {}
@@ -70,9 +80,15 @@ class MyLogInterceptor implements Interceptor {
 
   @override
   void onResponse(
-      Response<dynamic> response, ResponseInterceptorHandler handler) {
-    var headers = response.headers.map.map((key, value) => MapEntry(
-        key.toLowerCase(), value.length == 1 ? value.first : value.toString()));
+    Response<dynamic> response,
+    ResponseInterceptorHandler handler,
+  ) {
+    var headers = response.headers.map.map(
+      (key, value) => MapEntry(
+        key.toLowerCase(),
+        value.length == 1 ? value.first : value.toString(),
+      ),
+    );
     headers.remove("cookie");
     String content;
     if (response.data is List<int>) {
@@ -85,12 +101,13 @@ class MyLogInterceptor implements Interceptor {
       content = response.data.toString();
     }
     Log.addLog(
-        (response.statusCode != null && response.statusCode! < 400)
-            ? LogLevel.info
-            : LogLevel.error,
-        "Network",
-        "Response ${response.realUri.toString()} ${response.statusCode}\n"
-            "headers:\n$headers\n$content");
+      (response.statusCode != null && response.statusCode! < 400)
+          ? LogLevel.info
+          : LogLevel.error,
+      "Network",
+      "Response ${response.realUri.toString()} ${response.statusCode}\n"
+          "headers:\n$headers\n$content",
+    );
     handler.next(response);
   }
 
@@ -99,24 +116,10 @@ class MyLogInterceptor implements Interceptor {
     const String headerMask = "********";
     const String dataMask = "****** DATA_PROTECTED ******";
     Log.info(
-        "Network",
-        "${options.method} ${options.uri}\n"
-            "headers:\n${
-              options.extra.containsKey("maskHeadersInLog")
-                ? options.headers.map((key, value) =>
-                  MapEntry(
-                    key,
-                    options.extra["maskHeadersInLog"].contains(key)
-                      ? headerMask
-                      : value
-                  ))
-                : options.headers
-            }\n"
-            "data:\n${
-              options.extra["maskDataInLog"] == true
-                ? dataMask
-                : options.data
-            }"
+      "Network",
+      "${options.method} ${options.uri}\n"
+          "headers:\n${options.extra.containsKey("maskHeadersInLog") ? options.headers.map((key, value) => MapEntry(key, options.extra["maskHeadersInLog"].contains(key) ? headerMask : value)) : options.headers}\n"
+          "data:\n${options.extra["maskDataInLog"] == true ? dataMask : options.data}",
     );
     options.connectTimeout = const Duration(seconds: 15);
     options.receiveTimeout = const Duration(seconds: 15);
@@ -126,6 +129,79 @@ class MyLogInterceptor implements Interceptor {
 }
 
 class AppDio with DioMixin {
+  static bool _networkReady = false;
+  static Object? _networkInitError;
+  static Future<void>? _networkInitFuture;
+  static Future<void> Function()? _networkInitializerForTest;
+
+  static bool get isNetworkReady => _networkReady;
+
+  static String? get networkUnavailableReason {
+    final error = _networkInitError;
+    return error?.toString();
+  }
+
+  static void markNetworkInitialized() {
+    _networkReady = true;
+    _networkInitError = null;
+    _networkInitFuture = Future.value();
+  }
+
+  static void markNetworkInitializationFailed(Object error) {
+    _networkReady = false;
+    _networkInitError = error;
+    _networkInitFuture = null;
+  }
+
+  @visibleForTesting
+  static void debugResetNetworkState() {
+    _networkReady = false;
+    _networkInitError = null;
+    _networkInitFuture = null;
+    _networkInitializerForTest = null;
+  }
+
+  @visibleForTesting
+  static void debugSetNetworkInitializer(Future<void> Function()? initializer) {
+    _networkInitializerForTest = initializer;
+    _networkInitFuture = null;
+    _networkInitError = null;
+    _networkReady = false;
+  }
+
+  static Future<void> ensureNetworkReady() async {
+    if (_networkReady) {
+      return;
+    }
+
+    if (_networkInitError != null && _networkInitFuture == null) {
+      throw StateError(networkUnavailableReason ?? "Rhttp is not initialized.");
+    }
+
+    final future = _networkInitFuture ??= _initializeNetwork();
+    try {
+      await future;
+    } catch (_) {
+      // Normalize all initialization failures to a stable StateError below.
+    }
+
+    if (!_networkReady) {
+      throw StateError(networkUnavailableReason ?? "Rhttp is not initialized.");
+    }
+  }
+
+  static Future<void> _initializeNetwork() async {
+    try {
+      final initializer = _networkInitializerForTest ?? rhttp.Rhttp.init;
+      await initializer();
+      markNetworkInitialized();
+    } catch (e) {
+      _networkReady = false;
+      _networkInitError = e;
+      rethrow;
+    }
+  }
+
   AppDio([BaseOptions? options]) {
     this.options = options ?? BaseOptions();
     httpClientAdapter = RHttpAdapter();
@@ -222,6 +298,19 @@ class RHttpAdapter implements HttpClientAdapter {
     Stream<Uint8List>? requestStream,
     Future<void>? cancelFuture,
   ) async {
+    try {
+      await AppDio.ensureNetworkReady();
+    } catch (e) {
+      final reason = e.toString();
+      throw DioException(
+        requestOptions: options,
+        type: DioExceptionType.unknown,
+        error: e,
+        message:
+            "Network is unavailable because the HTTP runtime failed to initialize. $reason",
+      );
+    }
+
     if (options.headers['User-Agent'] == null &&
         options.headers['user-agent'] == null) {
       options.headers['User-Agent'] = "venera/v${App.version}";
