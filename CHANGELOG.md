@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.6.7 - 2026-05-18
+
+- Release tag: `v1.6.7`
+- APK 架构：`arm64-v8a`
+
+- 修复 `rhttp` 与 `flutter_rust_bridge` 版本不一致导致启动后网络层未初始化的问题。
+- 统一锁定 `rhttp 0.16.0` 与 `flutter_rust_bridge 2.12.0`，避免依赖重新解析后再次出现启动即炸。
+- 调整 `Rhttp` 初始化逻辑，支持主线程与 worker isolate 按需初始化，并在网络不可用时跳过自动更新检查。
+- 新增网络初始化回归测试，覆盖失败兜底、单 isolate 懒初始化与 worker isolate 初始化路径。
+
 ## 1.6.6 - 2026-05-17
 
 - Release tag: `v1.6.6`
