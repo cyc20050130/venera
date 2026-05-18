@@ -68,6 +68,80 @@ void refreshComicFavoriteStatusInBackground({
   }());
 }
 
+String? resolveComicPageCoverUrl({
+  required bool isHeroTransitionSettled,
+  required String? transitionCover,
+  required String? detailCover,
+}) {
+  if (!isHeroTransitionSettled &&
+      transitionCover != null &&
+      transitionCover.isNotEmpty) {
+    return transitionCover;
+  }
+  if (detailCover != null && detailCover.isNotEmpty) {
+    return detailCover;
+  }
+  if (transitionCover != null && transitionCover.isNotEmpty) {
+    return transitionCover;
+  }
+  return null;
+}
+
+Widget buildComicPageCoverCard(
+  BuildContext context, {
+  required String? cover,
+  required String sourceKey,
+  required String cid,
+  required int? heroID,
+  VoidCallback? onTap,
+  VoidCallback? onLongPress,
+}) {
+  Widget child;
+  if (cover != null) {
+    child = AnimatedImage(
+      image: CachedImageProvider(cover, sourceKey: sourceKey, cid: cid),
+      width: double.infinity,
+      height: double.infinity,
+      fit: BoxFit.cover,
+      animateOnFirstFrame: heroID == null,
+    );
+  } else {
+    child = const SizedBox();
+  }
+
+  Widget result = Container(
+    decoration: BoxDecoration(
+      color: context.colorScheme.primaryContainer,
+      borderRadius: BorderRadius.circular(8),
+      boxShadow: [
+        BoxShadow(
+          color: context.colorScheme.outlineVariant,
+          blurRadius: 1,
+          offset: const Offset(0, 1),
+        ),
+      ],
+    ),
+    height: 144,
+    width: 144 * 0.72,
+    clipBehavior: Clip.antiAlias,
+    child: child,
+  );
+
+  if (heroID != null) {
+    result = Hero(tag: "cover$heroID", child: result);
+  }
+
+  if (onTap != null || onLongPress != null) {
+    result = GestureDetector(
+      onTap: onTap,
+      onLongPress: onLongPress,
+      child: result,
+    );
+  }
+
+  return result;
+}
+
 class ComicPage extends StatefulWidget {
   const ComicPage({
     super.key,
@@ -96,6 +170,8 @@ class _ComicPageState extends LoadingState<ComicPage, ComicDetails>
     with _ComicPageActions {
   bool _forceRefresh = false;
   int _favoriteStatusRequestId = 0;
+  Animation<double>? _routeAnimation;
+  bool _isHeroTransitionSettled = true;
 
   @override
   void invalidateFavoriteStatusRefresh() {
@@ -164,12 +240,26 @@ class _ComicPageState extends LoadingState<ComicPage, ComicDetails>
 
   @override
   void initState() {
+    _isHeroTransitionSettled = widget.heroID == null;
     scrollController.addListener(onScroll);
     super.initState();
   }
 
   @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    final animation = ModalRoute.of(context)?.animation;
+    if (animation != _routeAnimation) {
+      _routeAnimation?.removeStatusListener(_handleRouteAnimationStatusChanged);
+      _routeAnimation = animation;
+      _routeAnimation?.addStatusListener(_handleRouteAnimationStatusChanged);
+    }
+    _syncHeroTransitionSettled();
+  }
+
+  @override
   void dispose() {
+    _routeAnimation?.removeStatusListener(_handleRouteAnimationStatusChanged);
     scrollController.removeListener(onScroll);
     super.dispose();
   }
@@ -181,6 +271,37 @@ class _ComicPageState extends LoadingState<ComicPage, ComicDetails>
 
   @override
   ComicDetails get comic => data!;
+
+  String? get _currentCoverUrl => resolveComicPageCoverUrl(
+    isHeroTransitionSettled: _isHeroTransitionSettled,
+    transitionCover: widget.cover,
+    detailCover: data?.cover ?? widget.cover,
+  );
+
+  bool _computeIsHeroTransitionSettled() {
+    final animation = _routeAnimation;
+    return widget.heroID == null ||
+        animation == null ||
+        animation.status == AnimationStatus.completed;
+  }
+
+  void _syncHeroTransitionSettled({bool notify = false}) {
+    final nextValue = _computeIsHeroTransitionSettled();
+    if (nextValue == _isHeroTransitionSettled) {
+      return;
+    }
+    if (notify && mounted) {
+      setState(() {
+        _isHeroTransitionSettled = nextValue;
+      });
+    } else {
+      _isHeroTransitionSettled = nextValue;
+    }
+  }
+
+  void _handleRouteAnimationStatusChanged(AnimationStatus status) {
+    _syncHeroTransitionSettled(notify: true);
+  }
 
   void onScroll() {
     var offset =
@@ -356,37 +477,14 @@ class _ComicPageState extends LoadingState<ComicPage, ComicDetails>
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           const SizedBox(width: 16),
-          GestureDetector(
+          buildComicPageCoverCard(
+            context,
+            cover: _currentCoverUrl,
+            sourceKey: comic.sourceKey,
+            cid: comic.id,
+            heroID: widget.heroID,
             onTap: () => _viewCover(context),
             onLongPress: () => _saveCover(context),
-            child: Hero(
-              tag: "cover${widget.heroID}",
-              child: Container(
-                decoration: BoxDecoration(
-                  color: context.colorScheme.primaryContainer,
-                  borderRadius: BorderRadius.circular(8),
-                  boxShadow: [
-                    BoxShadow(
-                      color: context.colorScheme.outlineVariant,
-                      blurRadius: 1,
-                      offset: const Offset(0, 1),
-                    ),
-                  ],
-                ),
-                height: 144,
-                width: 144 * 0.72,
-                clipBehavior: Clip.antiAlias,
-                child: AnimatedImage(
-                  image: CachedImageProvider(
-                    widget.cover ?? comic.cover,
-                    sourceKey: comic.sourceKey,
-                    cid: comic.id,
-                  ),
-                  width: double.infinity,
-                  height: double.infinity,
-                ),
-              ),
-            ),
           ),
           const SizedBox(width: 16),
           Expanded(
@@ -789,8 +887,9 @@ class _ComicPageState extends LoadingState<ComicPage, ComicDetails>
   }
 
   void _viewCover(BuildContext context) {
+    final cover = _currentCoverUrl ?? comic.cover;
     final imageProvider = CachedImageProvider(
-      widget.cover ?? comic.cover,
+      cover,
       sourceKey: comic.sourceKey,
       cid: comic.id,
     );
@@ -806,8 +905,9 @@ class _ComicPageState extends LoadingState<ComicPage, ComicDetails>
 
   void _saveCover(BuildContext context) async {
     try {
+      final cover = _currentCoverUrl ?? comic.cover;
       final imageProvider = CachedImageProvider(
-        widget.cover ?? comic.cover,
+        cover,
         sourceKey: comic.sourceKey,
         cid: comic.id,
       );
@@ -1040,19 +1140,19 @@ class _ComicPageLoadingPlaceHolder extends StatelessWidget {
       );
     }
 
-    return Shimmer(
-      color: context.isDarkMode ? Colors.grey.shade700 : Colors.white,
-      child: Column(
-        children: [
-          Appbar(title: Text(""), backgroundColor: context.colorScheme.surface),
-          const SizedBox(height: 8),
-          Row(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              const SizedBox(width: 16),
-              buildImage(context),
-              const SizedBox(width: 16),
-              Expanded(
+    return Column(
+      children: [
+        Appbar(title: Text(""), backgroundColor: context.colorScheme.surface),
+        const SizedBox(height: 8),
+        Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const SizedBox(width: 16),
+            buildImage(context),
+            const SizedBox(width: 16),
+            Expanded(
+              child: Shimmer(
+                color: context.isDarkMode ? Colors.grey.shade700 : Colors.white,
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
@@ -1065,61 +1165,39 @@ class _ComicPageLoadingPlaceHolder extends StatelessWidget {
                   ],
                 ),
               ),
-            ],
-          ),
-          const SizedBox(height: 8),
-          if (context.width < changePoint)
-            Row(
+            ),
+          ],
+        ),
+        const SizedBox(height: 8),
+        if (context.width < changePoint)
+          Shimmer(
+            color: context.isDarkMode ? Colors.grey.shade700 : Colors.white,
+            child: Row(
               children: [
                 Expanded(child: buildContainer(null, 36, radius: 18)),
                 const SizedBox(width: 16),
                 Expanded(child: buildContainer(null, 36, radius: 18)),
               ],
             ).paddingHorizontal(16),
-          const Divider(),
-          const SizedBox(height: 8),
-          Center(
-            child: CircularProgressIndicator(
-              strokeWidth: 2.4,
-            ).fixHeight(24).fixWidth(24),
           ),
-        ],
-      ),
+        const Divider(),
+        const SizedBox(height: 8),
+        Center(
+          child: CircularProgressIndicator(
+            strokeWidth: 2.4,
+          ).fixHeight(24).fixWidth(24),
+        ),
+      ],
     );
   }
 
   Widget buildImage(BuildContext context) {
-    Widget child;
-    if (cover != null) {
-      child = AnimatedImage(
-        image: CachedImageProvider(cover!, sourceKey: sourceKey, cid: cid),
-        width: double.infinity,
-        height: double.infinity,
-        fit: BoxFit.cover,
-      );
-    } else {
-      child = const SizedBox();
-    }
-
-    return Hero(
-      tag: "cover$heroID",
-      child: Container(
-        decoration: BoxDecoration(
-          color: context.colorScheme.primaryContainer,
-          borderRadius: BorderRadius.circular(8),
-          boxShadow: [
-            BoxShadow(
-              color: context.colorScheme.outlineVariant,
-              blurRadius: 1,
-              offset: const Offset(0, 1),
-            ),
-          ],
-        ),
-        height: 144,
-        width: 144 * 0.72,
-        clipBehavior: Clip.antiAlias,
-        child: child,
-      ),
+    return buildComicPageCoverCard(
+      context,
+      cover: cover,
+      sourceKey: sourceKey,
+      cid: cid,
+      heroID: heroID,
     );
   }
 }

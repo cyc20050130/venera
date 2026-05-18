@@ -205,6 +205,7 @@ class ComicTile extends StatelessWidget {
       fit: BoxFit.cover,
       width: double.infinity,
       height: double.infinity,
+      animateOnFirstFrame: heroID == null,
     );
   }
 
@@ -1633,6 +1634,7 @@ class SimpleComicTile extends StatelessWidget {
             height: double.infinity,
             fit: BoxFit.cover,
             filterQuality: FilterQuality.medium,
+            animateOnFirstFrame: heroID == null,
           );
 
     child = Container(
