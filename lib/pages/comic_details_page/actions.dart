@@ -3,6 +3,8 @@ part of 'comic_page.dart';
 abstract mixin class _ComicPageActions {
   void update();
 
+  void invalidateFavoriteStatusRefresh();
+
   ComicDetails get comic;
 
   ComicSource get comicSource => ComicSource.find(comic.sourceKey)!;
@@ -57,6 +59,7 @@ abstract mixin class _ComicPageActions {
         isFavorite: isFavorite,
         onFavorite: (local, network) {
           if (network != null) {
+            invalidateFavoriteStatusRefresh();
             isFavorite = network;
           }
           if (local != null) {

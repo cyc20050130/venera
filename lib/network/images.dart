@@ -1,6 +1,6 @@
 import 'dart:async';
-import 'dart:typed_data';
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter_qjs/flutter_qjs.dart';
 import 'package:venera/foundation/cache_manager.dart';
 import 'package:venera/foundation/comic_source/comic_source.dart';
@@ -10,6 +10,26 @@ import 'package:venera/utils/image.dart';
 import 'app_dio.dart';
 
 abstract class ImageDownloader {
+  static const _kReaderPrefetchPollInterval = Duration(milliseconds: 50);
+  static const _kMaxConcurrentReaderPrefetches = 1;
+
+  static final _readerImagePriorities = <String, _ReaderImageLoadPriority>{};
+  static final _pendingReaderPrefetchRequests = <String>{};
+  static final _activeReaderImageKinds = <String, _ReaderImageLoadPriority>{};
+
+  static int _activeReaderForegroundLoads = 0;
+  static int _activeReaderPrefetchLoads = 0;
+
+  @visibleForTesting
+  static Stream<ImageDownloadProgress> Function(
+    String imageKey,
+    String? sourceKey,
+    String cid,
+    String eid, {
+    bool useCache,
+  })?
+  debugReaderImageLoader;
+
   static Stream<ImageDownloadProgress> loadThumbnail(
     String url,
     String? sourceKey, [
@@ -103,6 +123,7 @@ abstract class ImageDownloader {
       wrapper.cancel();
     }
     _loadingImages.clear();
+    _resetReaderImageSchedulingState();
   }
 
   /// Load a comic image from the network or cache.
@@ -114,17 +135,55 @@ abstract class ImageDownloader {
     String eid,
   ) {
     final cacheKey = "$imageKey@$sourceKey@$cid@$eid";
+    final requestedPriority = _pendingReaderPrefetchRequests.remove(cacheKey)
+        ? _ReaderImageLoadPriority.prefetch
+        : _ReaderImageLoadPriority.foreground;
+    if (requestedPriority == _ReaderImageLoadPriority.foreground ||
+        !_readerImagePriorities.containsKey(cacheKey)) {
+      _readerImagePriorities[cacheKey] = requestedPriority;
+    }
     if (_loadingImages.containsKey(cacheKey)) {
+      _readerImagePriorities[cacheKey] = _ReaderImageLoadPriority.foreground;
       return _loadingImages[cacheKey]!.stream;
     }
     final stream = _StreamWrapper<ImageDownloadProgress>(
-      _loadComicImage(imageKey, sourceKey, cid, eid),
+      _createReaderImageLoad(imageKey, sourceKey, cid, eid),
       (wrapper) {
         _loadingImages.remove(cacheKey);
+        _readerImagePriorities.remove(cacheKey);
+        _activeReaderImageKinds.remove(cacheKey);
       },
+      beforeListen: () => _waitForReaderImageTurn(cacheKey),
+      onListenStart: () => _markReaderImageStarted(cacheKey),
+      onListenFinish: () => _markReaderImageFinished(cacheKey),
     );
     _loadingImages[cacheKey] = stream;
     return stream.stream;
+  }
+
+  static void prefetchReaderImage(
+    String imageKey,
+    String? sourceKey,
+    String cid,
+    String eid,
+  ) {
+    final cacheKey = "$imageKey@$sourceKey@$cid@$eid";
+    markReaderImagePrefetch(imageKey, sourceKey, cid, eid);
+    if (_loadingImages.containsKey(cacheKey)) {
+      return;
+    }
+    final stream = _StreamWrapper<ImageDownloadProgress>(
+      _createReaderImageLoad(imageKey, sourceKey, cid, eid),
+      (wrapper) {
+        _loadingImages.remove(cacheKey);
+        _readerImagePriorities.remove(cacheKey);
+        _activeReaderImageKinds.remove(cacheKey);
+      },
+      beforeListen: () => _waitForReaderImageTurn(cacheKey),
+      onListenStart: () => _markReaderImageStarted(cacheKey),
+      onListenFinish: () => _markReaderImageFinished(cacheKey),
+    );
+    _loadingImages[cacheKey] = stream;
   }
 
   static Stream<ImageDownloadProgress> loadComicImageUnwrapped(
@@ -147,6 +206,88 @@ abstract class ImageDownloader {
     String eid,
   ) {
     return _loadComicImage(imageKey, sourceKey, cid, eid, useCache: false);
+  }
+
+  @visibleForTesting
+  static void debugResetReaderImageScheduling() {
+    _resetReaderImageSchedulingState(resetDebugLoader: true);
+  }
+
+  static void markReaderImagePrefetch(
+    String imageKey,
+    String? sourceKey,
+    String cid,
+    String eid,
+  ) {
+    final cacheKey = "$imageKey@$sourceKey@$cid@$eid";
+    _pendingReaderPrefetchRequests.add(cacheKey);
+    _readerImagePriorities.putIfAbsent(
+      cacheKey,
+      () => _ReaderImageLoadPriority.prefetch,
+    );
+  }
+
+  static Stream<ImageDownloadProgress> _createReaderImageLoad(
+    String imageKey,
+    String? sourceKey,
+    String cid,
+    String eid,
+  ) {
+    final loader = debugReaderImageLoader;
+    if (loader != null) {
+      return loader(imageKey, sourceKey, cid, eid, useCache: true);
+    }
+    return _loadComicImage(imageKey, sourceKey, cid, eid);
+  }
+
+  static Future<void> _waitForReaderImageTurn(String cacheKey) async {
+    while (true) {
+      final priority = _readerImagePriorities[cacheKey];
+      if (priority == null ||
+          priority == _ReaderImageLoadPriority.foreground ||
+          (_activeReaderForegroundLoads == 0 &&
+              _activeReaderPrefetchLoads < _kMaxConcurrentReaderPrefetches)) {
+        return;
+      }
+      await Future.delayed(_kReaderPrefetchPollInterval);
+    }
+  }
+
+  static void _markReaderImageStarted(String cacheKey) {
+    final priority =
+        _readerImagePriorities[cacheKey] ?? _ReaderImageLoadPriority.foreground;
+    _activeReaderImageKinds[cacheKey] = priority;
+    if (priority == _ReaderImageLoadPriority.foreground) {
+      _activeReaderForegroundLoads++;
+    } else {
+      _activeReaderPrefetchLoads++;
+    }
+  }
+
+  static void _markReaderImageFinished(String cacheKey) {
+    final priority = _activeReaderImageKinds.remove(cacheKey);
+    if (priority == _ReaderImageLoadPriority.foreground) {
+      _activeReaderForegroundLoads--;
+    } else if (priority == _ReaderImageLoadPriority.prefetch) {
+      _activeReaderPrefetchLoads--;
+    }
+    if (_activeReaderForegroundLoads < 0) {
+      _activeReaderForegroundLoads = 0;
+    }
+    if (_activeReaderPrefetchLoads < 0) {
+      _activeReaderPrefetchLoads = 0;
+    }
+  }
+
+  static void _resetReaderImageSchedulingState({bool resetDebugLoader = false}) {
+    _readerImagePriorities.clear();
+    _pendingReaderPrefetchRequests.clear();
+    _activeReaderImageKinds.clear();
+    _activeReaderForegroundLoads = 0;
+    _activeReaderPrefetchLoads = 0;
+    if (resetDebugLoader) {
+      debugReaderImageLoader = null;
+    }
   }
 
   static Stream<ImageDownloadProgress> _loadComicImage(
@@ -293,15 +434,29 @@ class _StreamWrapper<T> {
   final List<StreamController> controllers = [];
 
   final void Function(_StreamWrapper<T> wrapper) onClosed;
+  final Future<void> Function()? beforeListen;
+  final void Function()? onListenStart;
+  final void Function()? onListenFinish;
 
   bool isClosed = false;
 
-  _StreamWrapper(this._stream, this.onClosed) {
+  _StreamWrapper(
+    this._stream,
+    this.onClosed, {
+    this.beforeListen,
+    this.onListenStart,
+    this.onListenFinish,
+  }) {
     _listen();
   }
 
   void _listen() async {
     try {
+      await beforeListen?.call();
+      if (isClosed) {
+        return;
+      }
+      onListenStart?.call();
       await for (var data in _stream) {
         if (isClosed) {
           break;
@@ -319,6 +474,7 @@ class _StreamWrapper<T> {
         }
       }
     } finally {
+      onListenFinish?.call();
       for (var controller in controllers) {
         if (!controller.isClosed) {
           controller.close();
@@ -350,6 +506,8 @@ class _StreamWrapper<T> {
     isClosed = true;
   }
 }
+
+enum _ReaderImageLoadPriority { foreground, prefetch }
 
 class ImageDownloadProgress {
   final int currentBytes;

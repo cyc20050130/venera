@@ -43,6 +43,31 @@ part 'actions.dart';
 
 part 'cover_viewer.dart';
 
+void refreshComicFavoriteStatusInBackground({
+  required FavoriteData? favoriteData,
+  required bool isLogged,
+  required String comicId,
+  required int requestId,
+  required bool Function() isMounted,
+  required bool Function(int requestId) isCurrentRequest,
+  required void Function(bool isFavorite) onFavoriteLoaded,
+}) {
+  if (favoriteData?.loadFolders == null || !isLogged) {
+    return;
+  }
+  final favoriteLoader = favoriteData!.loadFolders!;
+  unawaited(() async {
+    final res = await favoriteLoader(comicId);
+    if (!isMounted() || !isCurrentRequest(requestId) || res.error) {
+      return;
+    }
+    if (res.subData is List) {
+      final list = List<String>.from(res.subData);
+      onFavoriteLoaded(list.isNotEmpty);
+    }
+  }());
+}
+
 class ComicPage extends StatefulWidget {
   const ComicPage({
     super.key,
@@ -70,6 +95,12 @@ class ComicPage extends StatefulWidget {
 class _ComicPageState extends LoadingState<ComicPage, ComicDetails>
     with _ComicPageActions {
   bool _forceRefresh = false;
+  int _favoriteStatusRequestId = 0;
+
+  @override
+  void invalidateFavoriteStatusRefresh() {
+    _favoriteStatusRequestId++;
+  }
 
   @override
   History? history;
@@ -279,21 +310,28 @@ class _ComicPageState extends LoadingState<ComicPage, ComicDetails>
   Future<void> onDataLoaded() async {
     isLiked = comic.isLiked ?? false;
     isFavorite = comic.isFavorite ?? false;
-    // For sources with multi-folder favorites, prefer querying folders to get accurate favorite status
-    // Some sources may not set isFavorite reliably when multi-folder is enabled
-    if (comicSource.favoriteData?.loadFolders != null && comicSource.isLogged) {
-      var res = await comicSource.favoriteData!.loadFolders!(comic.id);
-      if (!res.error) {
-        if (res.subData is List) {
-          var list = List<String>.from(res.subData);
-          isFavorite = list.isNotEmpty;
-          update();
-        }
-      }
-    }
     if (comic.chapters == null) {
       isDownloaded = LocalManager().isDownloaded(comic.id, comic.comicType, 0);
     }
+    _refreshFavoriteStatusInBackground();
+  }
+
+  void _refreshFavoriteStatusInBackground() {
+    final requestId = ++_favoriteStatusRequestId;
+    refreshComicFavoriteStatusInBackground(
+      favoriteData: comicSource.favoriteData,
+      isLogged: comicSource.isLogged,
+      comicId: comic.id,
+      requestId: requestId,
+      isMounted: () => mounted,
+      isCurrentRequest: (id) => id == _favoriteStatusRequestId,
+      onFavoriteLoaded: (nextIsFavorite) {
+        if (nextIsFavorite != isFavorite) {
+          isFavorite = nextIsFavorite;
+          update();
+        }
+      },
+    );
   }
 
   Iterable<Widget> buildTitle() sync* {

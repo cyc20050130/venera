@@ -247,6 +247,15 @@ class _GalleryModeState extends State<_GalleryMode>
   }
 
   void cache(int startPage) {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) {
+        return;
+      }
+      _scheduleCache(startPage);
+    });
+  }
+
+  void _scheduleCache(int startPage) {
     for (int i = startPage - 1; i <= startPage + preCacheCount; i++) {
       if (i == startPage ||
           i <= 0 ||
@@ -807,6 +816,15 @@ class _ContinuousModeState extends State<_ContinuousMode>
   }
 
   void cacheImages(int current) {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) {
+        return;
+      }
+      _scheduleCacheImages(current);
+    });
+  }
+
+  void _scheduleCacheImages(int current) {
     for (int i = current + 1; i <= current + preCacheCount; i++) {
       if (i <= reader.maxPage && !cached[i]) {
         _preDownloadImage(i, context);
@@ -1263,6 +1281,14 @@ void _precacheImage(int page, BuildContext context) {
   if (page <= 0 || page > context.reader.images!.length) {
     return;
   }
+  var reader = context.reader;
+  var imageKey = reader.images![page - 1];
+  if (!imageKey.startsWith("file://")) {
+    var cid = reader.cid;
+    var eid = reader.eid;
+    var sourceKey = reader.type.comicSource?.key;
+    ImageDownloader.markReaderImagePrefetch(imageKey, sourceKey, cid, eid);
+  }
   precacheImage(_createImageProvider(page, context), context);
 }
 
@@ -1280,7 +1306,7 @@ void _preDownloadImage(int page, BuildContext context) {
   var cid = reader.cid;
   var eid = reader.eid;
   var sourceKey = reader.type.comicSource?.key;
-  ImageDownloader.loadComicImage(imageKey, sourceKey, cid, eid);
+  ImageDownloader.prefetchReaderImage(imageKey, sourceKey, cid, eid);
 }
 
 class _SwipeChangeChapterProgress extends StatefulWidget {
