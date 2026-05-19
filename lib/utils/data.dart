@@ -122,14 +122,14 @@ Future<void> importAppData(File file, [bool checkVersion = false]) async {
       var content = await appdataFile.readAsString();
       var data = jsonDecode(content);
       appdata.syncData(data);
-      _sanitizeImportedSourceSettings();
+      await _sanitizeImportedSourceSettings();
     }
   } finally {
     cacheDir.deleteIgnoreError(recursive: true);
   }
 }
 
-void _sanitizeImportedSourceSettings() {
+Future<void> _sanitizeImportedSourceSettings() async {
   final sources = ComicSource.all();
   final sourceKeys = sources.map((e) => e.key).toSet();
   final favoriteKeys =
@@ -159,7 +159,7 @@ void _sanitizeImportedSourceSettings() {
       !sourceKeys.contains(appdata.settings['defaultSearchTarget'])) {
     appdata.settings['defaultSearchTarget'] = null;
   }
-  appdata.saveData(false);
+  await appdata.saveData(false);
 }
 
 Future<void> importPicaData(File file) async {

@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:ui';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:photo_view/photo_view.dart';
@@ -18,6 +19,7 @@ import 'package:venera/foundation/favorites.dart';
 import 'package:venera/foundation/history.dart';
 import 'package:venera/foundation/image_provider/cached_image.dart';
 import 'package:venera/foundation/local.dart';
+import 'package:venera/foundation/log.dart';
 import 'package:venera/foundation/res.dart';
 import 'package:venera/network/download.dart';
 import 'package:venera/network/cache.dart';
@@ -211,9 +213,15 @@ class _ComicPageState extends LoadingState<ComicPage, ComicDetails>
     with _ComicPageActions {
   bool _forceRefresh = false;
   int _favoriteStatusRequestId = 0;
+  final Stopwatch _pageStopwatch = Stopwatch();
   Animation<double>? _routeAnimation;
   bool _canPromoteToDetailCover = true;
   String? _displayedCoverUrl;
+  bool _showDeferredComments = false;
+  bool _showDeferredThumbnails = false;
+  bool _showDeferredRecommend = false;
+  bool _favoriteRefreshDeferred = true;
+  bool _hasLoggedFirstInteractiveFrame = false;
 
   @override
   void invalidateFavoriteStatusRefresh() {
@@ -282,6 +290,7 @@ class _ComicPageState extends LoadingState<ComicPage, ComicDetails>
 
   @override
   void initState() {
+    _pageStopwatch.start();
     _displayedCoverUrl = widget.cover;
     _canPromoteToDetailCover = widget.heroTag == null;
     scrollController.addListener(onScroll);
@@ -339,6 +348,7 @@ class _ComicPageState extends LoadingState<ComicPage, ComicDetails>
         _canPromoteToDetailCover = nextCanPromote;
         _displayedCoverUrl = nextCover;
       });
+      _logPerf('cover updated');
     } else {
       _canPromoteToDetailCover = nextCanPromote;
       _displayedCoverUrl = nextCover;
@@ -378,6 +388,13 @@ class _ComicPageState extends LoadingState<ComicPage, ComicDetails>
 
   @override
   Widget buildContent(BuildContext context, ComicDetails data) {
+    if (!_hasLoggedFirstInteractiveFrame) {
+      _hasLoggedFirstInteractiveFrame = true;
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        _logPerf('first interactive frame');
+        _scheduleDeferredSections();
+      });
+    }
     return Scaffold(
       floatingActionButton: showFAB
           ? FloatingActionButton(
@@ -399,9 +416,7 @@ class _ComicPageState extends LoadingState<ComicPage, ComicDetails>
           buildDescription(),
           buildInfo(),
           buildChapters(),
-          buildComments(),
-          buildThumbnails(),
-          buildRecommend(),
+          buildDeferredSections(),
           SliverPadding(
             padding: EdgeInsets.only(
               bottom: context.padding.bottom + 80,
@@ -414,6 +429,7 @@ class _ComicPageState extends LoadingState<ComicPage, ComicDetails>
 
   @override
   Future<Res<ComicDetails>> loadData() async {
+    _logPerf('loadData start');
     if (widget.sourceKey == 'local') {
       var localComic = LocalManager().find(widget.id, ComicType.local);
       if (localComic == null) {
@@ -464,6 +480,7 @@ class _ComicPageState extends LoadingState<ComicPage, ComicDetails>
         if (!mounted) {
           return;
         }
+        _logPerf('background update received');
         data = details;
         await onDataLoaded();
         if (mounted) {
@@ -481,10 +498,11 @@ class _ComicPageState extends LoadingState<ComicPage, ComicDetails>
       isDownloaded = LocalManager().isDownloaded(comic.id, comic.comicType, 0);
     }
     _syncDisplayedCoverUrl(notify: mounted);
-    _refreshFavoriteStatusInBackground();
+    _logPerf('onDataLoaded complete');
   }
 
   void _refreshFavoriteStatusInBackground() {
+    _logPerf('favorite refresh scheduled');
     final requestId = ++_favoriteStatusRequestId;
     refreshComicFavoriteStatusInBackground(
       favoriteData: comicSource.favoriteData,
@@ -496,6 +514,7 @@ class _ComicPageState extends LoadingState<ComicPage, ComicDetails>
       onFavoriteLoaded: (nextIsFavorite) {
         if (nextIsFavorite != isFavorite) {
           isFavorite = nextIsFavorite;
+          _logPerf('favorite refresh applied');
           update();
         }
       },
@@ -647,7 +666,7 @@ class _ComicPageState extends LoadingState<ComicPage, ComicDetails>
                 ),
               ],
             ).paddingHorizontal(16).paddingVertical(8),
-          if (history != null)
+          if (history != null && history!.page > 0)
             Container(
               margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
               padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
@@ -913,7 +932,7 @@ class _ComicPageState extends LoadingState<ComicPage, ComicDetails>
     if (comic.thumbnails == null && comicSource.loadComicThumbnail == null) {
       return const SliverPadding(padding: EdgeInsets.zero);
     }
-    return const _ComicThumbnails();
+    return const _ComicThumbnails(enabled: true);
   }
 
   Widget buildRecommend() {
@@ -933,6 +952,68 @@ class _ComicPageState extends LoadingState<ComicPage, ComicDetails>
       return const SliverPadding(padding: EdgeInsets.zero);
     }
     return _CommentsPart(comments: comic.comments!, showMore: showComments);
+  }
+
+  Widget buildDeferredSections() {
+    if (!_showDeferredComments &&
+        !_showDeferredThumbnails &&
+        !_showDeferredRecommend) {
+      return const SliverToBoxAdapter(child: SizedBox.shrink());
+    }
+    return MultiSliver(
+      children: [
+        if (_showDeferredComments) buildComments(),
+        if (_showDeferredThumbnails) buildThumbnails(),
+        if (_showDeferredRecommend) buildRecommend(),
+      ],
+    );
+  }
+
+  void _scheduleDeferredSections() {
+    if (!mounted) {
+      return;
+    }
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) {
+        return;
+      }
+      _logPerf('deferred comments enabled');
+      setState(() {
+        _showDeferredComments = true;
+      });
+      if (_favoriteRefreshDeferred) {
+        _favoriteRefreshDeferred = false;
+        _refreshFavoriteStatusInBackground();
+      }
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted) {
+          return;
+        }
+        _logPerf('deferred thumbnails enabled');
+        setState(() {
+          _showDeferredThumbnails = true;
+        });
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (!mounted) {
+            return;
+          }
+          _logPerf('deferred recommend enabled');
+          setState(() {
+            _showDeferredRecommend = true;
+          });
+        });
+      });
+    });
+  }
+
+  void _logPerf(String label) {
+    if (!kDebugMode) {
+      return;
+    }
+    Log.info(
+      'ComicPage',
+      '[perf] $label ${_pageStopwatch.elapsedMilliseconds}ms ${widget.sourceKey}@${widget.id}',
+    );
   }
 
   void _viewCover(BuildContext context) {

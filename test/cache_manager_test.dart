@@ -74,4 +74,41 @@ void main() {
     expect(await Directory(CacheManager.cachePath).exists(), isTrue);
     expect(manager.currentSize, 0);
   });
+
+  test('findCache stays available while initial maintenance runs', () async {
+    final cacheDir = Directory(CacheManager.cachePath);
+    await cacheDir.create(recursive: true);
+    final nestedDir = Directory('${cacheDir.path}/0');
+    await nestedDir.create(recursive: true);
+    final file = File('${nestedDir.path}/cached-file');
+    await file.writeAsBytes([1, 2, 3, 4]);
+
+    final db = sqlite3.open('${tempDir.path}/cache.db');
+    db.execute('''
+      CREATE TABLE cache (
+        key TEXT PRIMARY KEY NOT NULL,
+        dir TEXT NOT NULL,
+        name TEXT NOT NULL,
+        expires INTEGER NOT NULL,
+        type TEXT
+      )
+    ''');
+    db.execute(
+      'INSERT INTO cache (key, dir, name, expires, type) VALUES (?, ?, ?, ?, ?)',
+      [
+        'cover-key',
+        '0',
+        'cached-file',
+        DateTime.now().millisecondsSinceEpoch + 60 * 1000,
+        null,
+      ],
+    );
+    db.dispose();
+
+    final manager = CacheManager();
+    final cached = await manager.findCache('cover-key');
+
+    expect(cached, isNotNull);
+    expect(await cached!.readAsBytes(), [1, 2, 3, 4]);
+  });
 }

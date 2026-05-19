@@ -1,7 +1,9 @@
 part of 'comic_page.dart';
 
 class _ComicThumbnails extends StatefulWidget {
-  const _ComicThumbnails();
+  const _ComicThumbnails({this.enabled = true});
+
+  final bool enabled;
 
   @override
   State<_ComicThumbnails> createState() => _ComicThumbnailsState();
@@ -19,13 +21,22 @@ class _ComicThumbnailsState extends State<_ComicThumbnails> {
   String? error;
 
   bool isLoading = false;
+  bool hasRequestedInitialLoad = false;
 
   @override
   void didChangeDependencies() {
     state = context.findAncestorStateOfType<_ComicPageState>()!;
-    loadNext();
     thumbnails = List.from(state.comic.thumbnails ?? []);
     super.didChangeDependencies();
+    if (widget.enabled && !hasRequestedInitialLoad) {
+      hasRequestedInitialLoad = true;
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) {
+          state._logPerf('thumbnails initial load start');
+          loadNext();
+        }
+      });
+    }
   }
 
   void loadNext() async {
@@ -44,8 +55,10 @@ class _ComicThumbnailsState extends State<_ComicThumbnails> {
       thumbnails.addAll(res.data);
       next = res.subData;
       isInitialLoading = false;
+      state._logPerf('thumbnails load complete');
     } else {
       error = res.errorMessage;
+      state._logPerf('thumbnails load failed');
     }
     if (mounted) {
       setState(() {

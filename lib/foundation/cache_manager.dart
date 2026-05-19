@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:isolate';
 
 import 'package:crypto/crypto.dart';
+import 'package:flutter/foundation.dart';
 import 'package:path/path.dart' as p;
 import 'package:sqlite3/sqlite3.dart';
 import 'package:venera/foundation/log.dart';
@@ -29,16 +30,19 @@ class CacheManager {
   bool _isChecking = false;
   bool _checkPending = false;
   Completer<void>? _checkCompleter;
-  late final Future<void> _ready;
+  late final Future<void> _storeReady;
+  Future<void> _maintenanceQueue = Future.value();
+  final Set<String> _pendingManagedPaths = <String>{};
+  static const _yieldEvery = 24;
 
   CacheManager._create() {
     _currentSize = 0;
+    final initStopwatch = Stopwatch()..start();
     _initCacheStore();
-    _ready = _scanDir(cachePath).then((value) async {
-      _currentSize = value.$1;
-      await _cleanupUnmanagedFiles(value.$2);
-      await _runCheckCache();
-    });
+    initStopwatch.stop();
+    _logPerf('cache store ready', initStopwatch);
+    _storeReady = Future.value();
+    unawaited(_runInitialMaintenance());
   }
 
   /// Get the singleton instance of CacheManager.
@@ -88,6 +92,25 @@ class CacheManager {
     }
   }
 
+  Future<void> _runInitialMaintenance() async {
+    final stopwatch = Stopwatch()..start();
+    try {
+      await _enqueueMaintenance(() async {
+        final scanResult = await _scanDir(cachePath);
+        _currentSize = scanResult.$1;
+        await _cleanupUnmanagedFiles(scanResult.$2);
+        await _runCheckCache();
+      });
+    } finally {
+      stopwatch.stop();
+      _logPerf(
+        'initial maintenance complete',
+        stopwatch,
+        extra: 'currentSize=${_currentSize ?? -1}',
+      );
+    }
+  }
+
   static Future<(int, List<String>)> _scanDir(String dir) async {
     return Isolate.run(() async {
       int totalSize = 0;
@@ -109,7 +132,8 @@ class CacheManager {
 
   Future<void> _cleanupUnmanagedFiles(List<String> filePaths) async {
     final scannedFiles = filePaths.toSet();
-    for (final filePath in filePaths) {
+    for (var i = 0; i < filePaths.length; i++) {
+      final filePath = filePaths[i];
       final file = File(filePath);
       final name = p.basename(filePath);
       final dir = p.basename(p.dirname(filePath));
@@ -120,20 +144,28 @@ class CacheManager {
       ''',
         [dir, name],
       );
-      if (res.isEmpty) {
+      if (res.isEmpty && !_pendingManagedPaths.contains(filePath)) {
         if (await file.exists()) {
           await file.delete();
         }
       }
+      if ((i + 1) % _yieldEvery == 0) {
+        await Future<void>.delayed(Duration.zero);
+      }
     }
 
     final rows = _db.select('SELECT key, dir, name FROM cache;');
-    for (final row in rows) {
+    for (var i = 0; i < rows.length; i++) {
+      final row = rows[i];
       final dbFilePath = p.normalize(
         p.join(cachePath, row["dir"] as String, row["name"] as String),
       );
-      if (!scannedFiles.contains(dbFilePath)) {
+      if (!scannedFiles.contains(dbFilePath) &&
+          !_pendingManagedPaths.contains(dbFilePath)) {
         _db.execute('DELETE FROM cache WHERE key = ?;', [row["key"]]);
+      }
+      if ((i + 1) % _yieldEvery == 0) {
+        await Future<void>.delayed(Duration.zero);
       }
     }
     _currentSize = await _recalculateManagedSize();
@@ -162,15 +194,24 @@ class CacheManager {
     }
     _maintenanceScheduled = true;
     Future.delayed(delay, () async {
+      final stopwatch = Stopwatch()..start();
       try {
-        await _ready;
-        final scanResult = await _scanDir(cachePath);
-        _currentSize = scanResult.$1;
-        await _cleanupUnmanagedFiles(scanResult.$2);
-        await checkCache();
+        await _storeReady;
+        await _enqueueMaintenance(() async {
+          final scanResult = await _scanDir(cachePath);
+          _currentSize = scanResult.$1;
+          await _cleanupUnmanagedFiles(scanResult.$2);
+          await _runCheckCache();
+        });
       } catch (e, s) {
         Log.error("CacheManager", "Failed to maintain cache: $e", s);
       } finally {
+        stopwatch.stop();
+        _logPerf(
+          'scheduled maintenance complete',
+          stopwatch,
+          extra: 'currentSize=${_currentSize ?? -1}',
+        );
         _maintenanceScheduled = false;
       }
     });
@@ -182,23 +223,29 @@ class CacheManager {
     List<int> data, [
     int duration = 7 * 24 * 60 * 60 * 1000,
   ]) async {
-    await _ready;
-    await delete(key);
+    await _storeReady;
+    await _deleteInternal(key);
     dir = (dir + 1) % 100;
     final currentDir = dir;
     final name = md5.convert(key.codeUnits).toString();
-    final file = File('$cachePath/$currentDir/$name');
-    await file.create(recursive: true);
-    await file.writeAsBytes(data);
-    final expires = DateTime.now().millisecondsSinceEpoch + duration;
-    _db.execute(
-      '''
-      INSERT OR REPLACE INTO cache (key, dir, name, expires) VALUES (?, ?, ?, ?)
-    ''',
-      [key, currentDir.toString(), name, expires],
-    );
-    if (_currentSize != null) {
-      _currentSize = (_currentSize! + data.length).clamp(0, 1 << 62);
+    final filePath = p.normalize('$cachePath/$currentDir/$name');
+    _pendingManagedPaths.add(filePath);
+    try {
+      final file = File(filePath);
+      await file.create(recursive: true);
+      await file.writeAsBytes(data);
+      final expires = DateTime.now().millisecondsSinceEpoch + duration;
+      _db.execute(
+        '''
+        INSERT OR REPLACE INTO cache (key, dir, name, expires) VALUES (?, ?, ?, ?)
+      ''',
+        [key, currentDir.toString(), name, expires],
+      );
+      if (_currentSize != null) {
+        _currentSize = (_currentSize! + data.length).clamp(0, 1 << 62);
+      }
+    } finally {
+      _pendingManagedPaths.remove(filePath);
     }
     checkCacheIfRequired();
   }
@@ -208,7 +255,7 @@ class CacheManager {
   /// If cache is not found, it will return null.
   /// If cache is found, it will return the file, and update the expires time.
   Future<File?> findCache(String key) async {
-    await _ready;
+    await _storeReady;
     final res = _db.select(
       '''
       SELECT * FROM cache
@@ -262,26 +309,29 @@ class CacheManager {
   /// If current size is greater than limit size,
   /// delete cache until current size is less than limit size.
   Future<void> checkCache() async {
-    await _ready;
-    if (_isChecking) {
-      _checkPending = true;
-      return _checkCompleter?.future ?? Future.value();
-    }
-    _isChecking = true;
-    _checkCompleter = Completer<void>();
-    try {
-      do {
-        _checkPending = false;
-        await _runCheckCache();
-      } while (_checkPending);
-    } finally {
-      _isChecking = false;
-      _checkCompleter?.complete();
-      _checkCompleter = null;
-    }
+    await _storeReady;
+    await _enqueueMaintenance(() async {
+      if (_isChecking) {
+        _checkPending = true;
+        return _checkCompleter?.future ?? Future.value();
+      }
+      _isChecking = true;
+      _checkCompleter = Completer<void>();
+      try {
+        do {
+          _checkPending = false;
+          await _runCheckCache();
+        } while (_checkPending);
+      } finally {
+        _isChecking = false;
+        _checkCompleter?.complete();
+        _checkCompleter = null;
+      }
+    });
   }
 
   Future<void> _runCheckCache() async {
+    final stopwatch = Stopwatch()..start();
     _currentSize ??= await _recalculateManagedSize();
 
     final now = DateTime.now().millisecondsSinceEpoch;
@@ -290,10 +340,11 @@ class CacheManager {
       SELECT key, dir, name
       FROM cache
       WHERE expires < ?
-    ''',
+      ''',
       [now],
     );
-    for (final row in expired) {
+    for (var i = 0; i < expired.length; i++) {
+      final row = expired[i];
       final file = File('$cachePath/${row["dir"]}/${row["name"]}');
       if (await file.exists()) {
         final size = await file.length();
@@ -301,6 +352,9 @@ class CacheManager {
         _currentSize = (_currentSize! - size).clamp(0, 1 << 62);
       }
       _db.execute('DELETE FROM cache WHERE key = ?;', [row["key"]]);
+      if ((i + 1) % _yieldEvery == 0) {
+        await Future<void>.delayed(Duration.zero);
+      }
     }
 
     while (_currentSize != null && _currentSize! > _limitSize) {
@@ -314,7 +368,8 @@ class CacheManager {
         await _rebuildCacheDirectory();
         break;
       }
-      for (final row in res) {
+      for (var i = 0; i < res.length; i++) {
+        final row = res[i];
         final key = row["key"] as String;
         final file = File('$cachePath/${row["dir"]}/${row["name"]}');
         if (await file.exists()) {
@@ -326,8 +381,13 @@ class CacheManager {
         if (_currentSize! <= _limitSize) {
           break;
         }
+        if ((i + 1) % _yieldEvery == 0) {
+          await Future<void>.delayed(Duration.zero);
+        }
       }
     }
+    stopwatch.stop();
+    _logPerf('check cache', stopwatch, extra: 'currentSize=${_currentSize ?? -1}');
   }
 
   Future<void> _rebuildCacheDirectory() async {
@@ -339,7 +399,11 @@ class CacheManager {
 
   /// Delete cache by key.
   Future<void> delete(String key) async {
-    await _ready;
+    await _storeReady;
+    await _enqueueMaintenance(() => _deleteInternal(key));
+  }
+
+  Future<void> _deleteInternal(String key) async {
     final res = _db.select(
       '''
       SELECT * FROM cache
@@ -365,11 +429,13 @@ class CacheManager {
 
   /// Delete all cache.
   Future<void> clear() async {
-    await _ready;
-    await Directory(cachePath).deleteIfExists(recursive: true);
-    Directory(cachePath).createSync(recursive: true);
-    _db.execute('DELETE FROM cache;');
-    _currentSize = 0;
+    await _storeReady;
+    await _enqueueMaintenance(() async {
+      await Directory(cachePath).deleteIfExists(recursive: true);
+      Directory(cachePath).createSync(recursive: true);
+      _db.execute('DELETE FROM cache;');
+      _currentSize = 0;
+    });
   }
 
   void close() {
@@ -378,5 +444,29 @@ class CacheManager {
     _isChecking = false;
     _checkPending = false;
     instance = null;
+  }
+
+  void _logPerf(String label, Stopwatch stopwatch, {String? extra}) {
+    if (!kDebugMode) {
+      return;
+    }
+    final suffix = extra == null ? '' : ' $extra';
+    Log.info(
+      'CacheManager',
+      '[perf] $label ${stopwatch.elapsedMilliseconds}ms$suffix',
+    );
+  }
+
+  Future<T> _enqueueMaintenance<T>(Future<T> Function() action) {
+    final completer = Completer<T>();
+    _maintenanceQueue = _maintenanceQueue.then((_) async {
+      try {
+        completer.complete(await action());
+      } catch (e, s) {
+        completer.completeError(e, s);
+      }
+    });
+    _maintenanceQueue = _maintenanceQueue.catchError((_) {});
+    return completer.future;
   }
 }

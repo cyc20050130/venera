@@ -17,7 +17,7 @@ void main() {
   late Directory tempDir;
   late Directory tempCacheDir;
   late Directory zipDllDir;
-  late String originalCurrentDir;
+  String? originalCurrentDir;
 
   setUpAll(() async {
     open.overrideFor(OperatingSystem.windows, openTestSqlite);
@@ -34,7 +34,9 @@ void main() {
   });
 
   tearDownAll(() {
-    Directory.current = originalCurrentDir;
+    if (originalCurrentDir != null) {
+      Directory.current = originalCurrentDir!;
+    }
   });
 
   setUp(() async {

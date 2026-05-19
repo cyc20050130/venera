@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 
+import 'package:flutter/foundation.dart';
 import 'package:sqlite3/sqlite3.dart';
 import 'package:venera/foundation/app.dart';
 import 'package:venera/foundation/comic_source/comic_source.dart';
@@ -64,6 +65,7 @@ class ComicDetailsRepository {
     Duration staleFallback = staleFallbackDuration,
     FutureOr<void> Function(ComicDetails details)? onBackgroundUpdate,
   }) async {
+    final stopwatch = Stopwatch()..start();
     await init();
 
     final source = ComicSource.find(sourceKey);
@@ -77,6 +79,13 @@ class ComicDetailsRepository {
 
     if (!forceRefresh && cached != null) {
       if (cached.isFresh(now)) {
+        stopwatch.stop();
+        _logPerf(
+          'load hit fresh cache',
+          stopwatch,
+          sourceKey: sourceKey,
+          comicId: comicId,
+        );
         return Res(cached.details);
       }
 
@@ -87,6 +96,13 @@ class ComicDetailsRepository {
           comicId,
           freshFor,
           onBackgroundUpdate,
+        );
+        stopwatch.stop();
+        _logPerf(
+          'load hit stale cache',
+          stopwatch,
+          sourceKey: sourceKey,
+          comicId: comicId,
         );
         return Res(cached.details);
       }
@@ -99,13 +115,34 @@ class ComicDetailsRepository {
     );
 
     if (network.success) {
+      stopwatch.stop();
+      _logPerf(
+        'load fetched network',
+        stopwatch,
+        sourceKey: sourceKey,
+        comicId: comicId,
+      );
       return network;
     }
 
     if (cached != null && cached.canFallback(now, staleFallback)) {
+      stopwatch.stop();
+      _logPerf(
+        'load fallback stale cache',
+        stopwatch,
+        sourceKey: sourceKey,
+        comicId: comicId,
+      );
       return Res(cached.details);
     }
 
+    stopwatch.stop();
+    _logPerf(
+      'load failed',
+      stopwatch,
+      sourceKey: sourceKey,
+      comicId: comicId,
+    );
     return network;
   }
 
@@ -252,6 +289,21 @@ class ComicDetailsRepository {
   }
 
   String _buildKey(String sourceKey, String comicId) => '$sourceKey@$comicId';
+
+  void _logPerf(
+    String label,
+    Stopwatch stopwatch, {
+    required String sourceKey,
+    required String comicId,
+  }) {
+    if (!kDebugMode) {
+      return;
+    }
+    Log.info(
+      'ComicDetailsRepository',
+      '[perf] $label ${stopwatch.elapsedMilliseconds}ms $sourceKey@$comicId',
+    );
+  }
 }
 
 class _CachedComicDetails {

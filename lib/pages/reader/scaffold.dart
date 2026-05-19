@@ -255,6 +255,10 @@ class _ReaderScaffoldState extends State<_ReaderScaffold> {
 
   void addImageFavorite() async {
     try {
+      if (context.reader.images == null || context.reader.images!.isEmpty) {
+        showToast(message: "No pages available".tl, context: context);
+        return;
+      }
       if (context.reader.images![0].contains('file://')) {
         showToast(
           message: "Local comic collection is not supported at present".tl,
@@ -389,11 +393,15 @@ class _ReaderScaffoldState extends State<_ReaderScaffold> {
   }
 
   Widget buildBottom() {
+    final hasPages = context.reader.maxPage > 0;
+    final safeMaxPage = math.max(1, context.reader.maxPage);
     // Use maxPage for display (excluding chapter comments page)
-    final displayPage = context.reader.page.clamp(1, context.reader.maxPage);
-    var text = "E${context.reader.chapter} : P$displayPage";
+    final displayPage = context.reader.page.clamp(1, safeMaxPage);
+    var text = hasPages
+        ? "E${context.reader.chapter} : P$displayPage"
+        : "E${context.reader.chapter} : ${"No pages".tl}";
     if (context.reader.widget.chapters == null) {
-      text = "P$displayPage";
+      text = hasPages ? "P$displayPage" : "No pages".tl;
     }
 
     final buttons = [
@@ -401,7 +409,7 @@ class _ReaderScaffoldState extends State<_ReaderScaffold> {
         message: "Collect the image".tl,
         child: IconButton(
           icon: Icon(isLiked() ? Icons.favorite : Icons.favorite_border),
-          onPressed: addImageFavorite,
+          onPressed: hasPages ? addImageFavorite : null,
         ),
       ),
       if (App.isDesktop)
@@ -459,13 +467,15 @@ class _ReaderScaffoldState extends State<_ReaderScaffold> {
           icon: context.reader.autoPageTurningTimer != null
               ? const Icon(Icons.timer)
               : const Icon(Icons.timer_sharp),
-          onPressed: () {
-            context.reader.autoPageTurning(
-              context.reader.cid,
-              context.reader.type,
-            );
-            update();
-          },
+          onPressed: hasPages
+              ? () {
+                  context.reader.autoPageTurning(
+                    context.reader.cid,
+                    context.reader.type,
+                  );
+                  update();
+                }
+              : null,
         ),
       ),
       if (context.reader.widget.chapters != null)
@@ -480,12 +490,15 @@ class _ReaderScaffoldState extends State<_ReaderScaffold> {
         message: "Save Image".tl,
         child: IconButton(
           icon: const Icon(Icons.download),
-          onPressed: saveCurrentImage,
+          onPressed: hasPages ? saveCurrentImage : null,
         ),
       ),
       Tooltip(
         message: "Share".tl,
-        child: IconButton(icon: const Icon(Icons.share), onPressed: share),
+        child: IconButton(
+          icon: const Icon(Icons.share),
+          onPressed: hasPages ? share : null,
+        ),
       ),
     ];
 
@@ -504,15 +517,26 @@ class _ReaderScaffoldState extends State<_ReaderScaffold> {
                           : context.reader.toPage(1)
                     : context.reader.chapter < context.reader.maxChapter
                     ? context.reader.toNextChapter()
-                    : context.reader.toPage(context.reader.maxPage),
+                    : context.reader.toPage(safeMaxPage),
                 icon: const Icon(Icons.first_page),
               ),
-              Expanded(child: buildSlider()),
+              Expanded(
+                child: hasPages
+                    ? buildSlider()
+                    : Center(
+                        child: Text(
+                          "No pages available".tl,
+                          style: ts.s14.copyWith(
+                            color: context.colorScheme.outline,
+                          ),
+                        ),
+                      ),
+              ),
               IconButton.filledTonal(
                 onPressed: () => !isReversed
                     ? context.reader.chapter < context.reader.maxChapter
                           ? context.reader.toNextChapter()
-                          : context.reader.toPage(context.reader.maxPage)
+                          : context.reader.toPage(safeMaxPage)
                     : context.reader.chapter > 1
                     ? context.reader.toPrevChapter()
                     : context.reader.toPage(1),
@@ -580,17 +604,16 @@ class _ReaderScaffoldState extends State<_ReaderScaffold> {
   var sliderFocus = FocusNode();
 
   Widget buildSlider() {
+    final safeMaxPage = math.max(1, context.reader.maxPage);
     // Clamp page to maxPage (excluding chapter comments page)
-    final displayPage = context.reader.page.clamp(1, context.reader.maxPage);
+    final displayPage = context.reader.page.clamp(1, safeMaxPage);
     return CustomSlider(
       focusNode: sliderFocus,
       value: displayPage.toDouble(),
       min: 1,
-      max: context.reader.maxPage
-          .clamp(displayPage, 1 << 16)
-          .toDouble(),
+      max: safeMaxPage.clamp(displayPage, 1 << 16).toDouble(),
       reversed: isReversed,
-      divisions: (context.reader.maxPage - 1).clamp(2, 1 << 16),
+      divisions: (safeMaxPage - 1).clamp(2, 1 << 16),
       onChanged: (i) {
         context.reader.toPage(i.toInt());
       },
@@ -606,7 +629,9 @@ class _ReaderScaffoldState extends State<_ReaderScaffold> {
     if (epName.length > 8) {
       epName = "${epName.substring(0, 8)}...";
     }
-    var pageText = "${context.reader.page}/${context.reader.maxPage}";
+    var pageText = context.reader.maxPage > 0
+        ? "${context.reader.page}/${context.reader.maxPage}"
+        : "No pages".tl;
     var text = context.reader.widget.chapters != null
         ? "$epName : $pageText"
         : pageText;
@@ -660,6 +685,10 @@ class _ReaderScaffoldState extends State<_ReaderScaffold> {
   }
 
   void saveCurrentImage() async {
+    if (context.reader.images == null || context.reader.images!.isEmpty) {
+      showToast(message: "No pages available".tl, context: context);
+      return;
+    }
     var result = await selectImageToData();
     if (result == null) {
       return;
@@ -674,6 +703,10 @@ class _ReaderScaffoldState extends State<_ReaderScaffold> {
   }
 
   void share() async {
+    if (context.reader.images == null || context.reader.images!.isEmpty) {
+      showToast(message: "No pages available".tl, context: context);
+      return;
+    }
     var result = await selectImageToData();
     if (result == null) {
       return;

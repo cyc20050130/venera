@@ -30,7 +30,7 @@ class _ReaderImagesState extends State<_ReaderImages> {
   /// Handle jumping to last page when _jumpToLastPageOnLoad is true
   void _handleJumpToLastPage() {
     if (reader._jumpToLastPageOnLoad) {
-      reader._page = reader.maxPage;
+      reader._page = math.max(1, reader.maxPage);
       reader._jumpToLastPageOnLoad = false;
     }
   }
@@ -116,6 +116,29 @@ class _ReaderImagesState extends State<_ReaderImages> {
           ),
         ),
       );
+    } else if (reader.images == null || reader.images!.isEmpty) {
+      return GestureDetector(
+        onTap: () {
+          context.readerScaffold.openOrClose();
+        },
+        child: SizedBox.expand(
+          child: _ReaderEmptyState(
+            canGoPrev: reader.chapter > 1,
+            canGoNext: reader.chapter < reader.maxChapter,
+            onRetry: () {
+              setState(() {
+                reader.isLoading = true;
+              });
+            },
+            onPrevChapter: reader.chapter > 1
+                ? () => reader.toPrevChapter(toLastPage: true)
+                : null,
+            onNextChapter: reader.chapter < reader.maxChapter
+                ? reader.toNextChapter
+                : null,
+          ),
+        ),
+      );
     } else {
       if (reader.mode.isGallery) {
         var showComments =
@@ -141,6 +164,71 @@ class _ReaderImagesState extends State<_ReaderImages> {
         return _ContinuousMode(key: Key(reader.mode.key));
       }
     }
+  }
+}
+
+class _ReaderEmptyState extends StatelessWidget {
+  const _ReaderEmptyState({
+    required this.canGoPrev,
+    required this.canGoNext,
+    required this.onRetry,
+    this.onPrevChapter,
+    this.onNextChapter,
+  });
+
+  final bool canGoPrev;
+  final bool canGoNext;
+  final VoidCallback onRetry;
+  final VoidCallback? onPrevChapter;
+  final VoidCallback? onNextChapter;
+
+  @override
+  Widget build(BuildContext context) {
+    return Center(
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 24),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(
+              Icons.menu_book_outlined,
+              size: 40,
+              color: context.colorScheme.outline,
+            ),
+            const SizedBox(height: 12),
+            Text("No pages available".tl, style: ts.s18),
+            const SizedBox(height: 8),
+            Text(
+              "This chapter may be unavailable from the source right now.".tl,
+              textAlign: TextAlign.center,
+              style: ts.s14.copyWith(color: context.colorScheme.outline),
+            ),
+            const SizedBox(height: 16),
+            Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              alignment: WrapAlignment.center,
+              children: [
+                if (canGoPrev)
+                  FilledButton.tonal(
+                    onPressed: onPrevChapter,
+                    child: Text("Previous Chapter".tl),
+                  ),
+                FilledButton(
+                  onPressed: onRetry,
+                  child: Text("Retry".tl),
+                ),
+                if (canGoNext)
+                  FilledButton.tonal(
+                    onPressed: onNextChapter,
+                    child: Text("Next Chapter".tl),
+                  ),
+              ],
+            ),
+          ],
+        ),
+      ),
+    );
   }
 }
 

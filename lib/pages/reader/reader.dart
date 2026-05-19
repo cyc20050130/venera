@@ -68,6 +68,29 @@ extension _ReaderContext on BuildContext {
       findAncestorStateOfType<_ReaderScaffoldState>()!;
 }
 
+@visibleForTesting
+int? computeReaderHistoryPage({
+  required int page,
+  required int maxPage,
+  required int imageCount,
+  required int imagesPerPage,
+  required bool showSingleImageOnFirstPage,
+}) {
+  if (imageCount <= 0 || maxPage <= 0) {
+    return null;
+  }
+  if (page >= maxPage) {
+    return imageCount;
+  }
+  if (!showSingleImageOnFirstPage || imagesPerPage == 1) {
+    return (page - 1) * imagesPerPage + 1;
+  }
+  if (page == 1) {
+    return 1;
+  }
+  return (page - 2) * imagesPerPage + 2;
+}
+
 class Reader extends StatefulWidget {
   const Reader({
     super.key,
@@ -192,9 +215,13 @@ class _ReaderState extends State<Reader>
 
   @override
   void initState() {
-    page = widget.initialPage ?? 1;
-    if (page < 1) {
-      page = 1;
+    // mode = ReaderMode.fromKey(appdata.settings['readerMode']);
+    mode = ReaderMode.fromKey(
+      appdata.settings.getReaderSetting(cid, type.sourceKey, 'readerMode'),
+    );
+    _page = widget.initialPage ?? 1;
+    if (_page < 1) {
+      _page = 1;
     }
     chapter = widget.initialChapter ?? 1;
     if (chapter < 1) {
@@ -206,15 +233,11 @@ class _ReaderState extends State<Reader>
       }
     }
     if (widget.initialPage != null) {
-      page = widget.initialPage!;
-      if (page < 1) {
-        page = 1;
+      _page = widget.initialPage!;
+      if (_page < 1) {
+        _page = 1;
       }
     }
-    // mode = ReaderMode.fromKey(appdata.settings['readerMode']);
-    mode = ReaderMode.fromKey(
-      appdata.settings.getReaderSetting(cid, type.sourceKey, 'readerMode'),
-    );
     history = widget.history;
     if (!appdata.settings.getReaderSetting(
       cid,
@@ -371,46 +394,49 @@ class _ReaderState extends State<Reader>
   Timer? _updateHistoryTimer;
 
   void updateHistory() {
-    if (history != null) {
-      // page >= maxPage handles both last image page and chapter comments page
-      if (page >= maxPage) {
-        /// Record the last image of chapter
-        history!.page = images?.length ?? 1;
-        _completedDownloadedChapters.add(chapter);
-      } else {
-        /// Record the first image of the page
-        if (!showSingleImageOnFirstPage() || imagesPerPage == 1) {
-          history!.page = (page - 1) * imagesPerPage + 1;
-        } else {
-          if (page == 1) {
-            history!.page = 1;
-          } else {
-            history!.page = (page - 2) * imagesPerPage + 2;
-          }
-        }
-      }
-      history!.maxPage = images?.length ?? 1;
-      if (widget.chapters?.isGrouped ?? false) {
-        int g = 0;
-        int c = chapter;
-        while (c > widget.chapters!.getGroupByIndex(g).length) {
-          c -= widget.chapters!.getGroupByIndex(g).length;
-          g++;
-        }
-        history!.readEpisode.add('${g + 1}-$c');
-        history!.ep = c;
-        history!.group = g + 1;
-      } else {
-        history!.readEpisode.add(chapter.toString());
-        history!.ep = chapter;
-      }
-      history!.time = DateTime.now();
-      _updateHistoryTimer?.cancel();
-      _updateHistoryTimer = Timer(const Duration(seconds: 1), () {
-        HistoryManager().addHistoryAsync(history!);
-        _updateHistoryTimer = null;
-      });
+    if (history == null) {
+      return;
     }
+    final imageCount = images?.length ?? 0;
+    if (imageCount <= 0 || maxPage <= 0) {
+      return;
+    }
+    final historyPage = computeReaderHistoryPage(
+      page: page,
+      maxPage: maxPage,
+      imageCount: imageCount,
+      imagesPerPage: imagesPerPage,
+      showSingleImageOnFirstPage: showSingleImageOnFirstPage(),
+    );
+    if (historyPage == null) {
+      return;
+    }
+    history!.page = historyPage;
+    // page >= maxPage handles both last image page and chapter comments page
+    if (page >= maxPage) {
+      _completedDownloadedChapters.add(chapter);
+    }
+    history!.maxPage = imageCount;
+    if (widget.chapters?.isGrouped ?? false) {
+      int g = 0;
+      int c = chapter;
+      while (c > widget.chapters!.getGroupByIndex(g).length) {
+        c -= widget.chapters!.getGroupByIndex(g).length;
+        g++;
+      }
+      history!.readEpisode.add('${g + 1}-$c');
+      history!.ep = c;
+      history!.group = g + 1;
+    } else {
+      history!.readEpisode.add(chapter.toString());
+      history!.ep = chapter;
+    }
+    history!.time = DateTime.now();
+    _updateHistoryTimer?.cancel();
+    _updateHistoryTimer = Timer(const Duration(seconds: 1), () {
+      HistoryManager().addHistoryAsync(history!);
+      _updateHistoryTimer = null;
+    });
   }
 
   bool get isFirstChapterOfGroup {
