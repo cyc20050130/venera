@@ -126,6 +126,25 @@ abstract class ImageDownloader {
     _resetReaderImageSchedulingState();
   }
 
+  static void cancelReaderPrefetches() {
+    final prefetchKeys = <String>[];
+    for (final entry in _loadingImages.entries) {
+      final priority =
+          _activeReaderImageKinds[entry.key] ??
+          _readerImagePriorities[entry.key];
+      if (priority == _ReaderImageLoadPriority.prefetch) {
+        entry.value.cancel();
+        prefetchKeys.add(entry.key);
+      }
+    }
+    for (final key in prefetchKeys) {
+      _loadingImages.remove(key);
+      _readerImagePriorities.remove(key);
+      _activeReaderImageKinds.remove(key);
+      _pendingReaderPrefetchRequests.remove(key);
+    }
+  }
+
   /// Load a comic image from the network or cache.
   /// The function will prevent multiple requests for the same image.
   static Stream<ImageDownloadProgress> loadComicImage(
@@ -146,8 +165,15 @@ abstract class ImageDownloader {
       _readerImagePriorities[cacheKey] = _ReaderImageLoadPriority.foreground;
       return _loadingImages[cacheKey]!.stream;
     }
+    final cancelToken = CancelToken();
     final stream = _StreamWrapper<ImageDownloadProgress>(
-      _createReaderImageLoad(imageKey, sourceKey, cid, eid),
+      _createReaderImageLoad(
+        imageKey,
+        sourceKey,
+        cid,
+        eid,
+        cancelToken: cancelToken,
+      ),
       (wrapper) {
         _loadingImages.remove(cacheKey);
         _readerImagePriorities.remove(cacheKey);
@@ -156,6 +182,7 @@ abstract class ImageDownloader {
       beforeListen: () => _waitForReaderImageTurn(cacheKey),
       onListenStart: () => _markReaderImageStarted(cacheKey),
       onListenFinish: () => _markReaderImageFinished(cacheKey),
+      onCancel: () => cancelToken.cancel('reader image request cancelled'),
     );
     _loadingImages[cacheKey] = stream;
     return stream.stream;
@@ -172,8 +199,15 @@ abstract class ImageDownloader {
     if (_loadingImages.containsKey(cacheKey)) {
       return;
     }
+    final cancelToken = CancelToken();
     final stream = _StreamWrapper<ImageDownloadProgress>(
-      _createReaderImageLoad(imageKey, sourceKey, cid, eid),
+      _createReaderImageLoad(
+        imageKey,
+        sourceKey,
+        cid,
+        eid,
+        cancelToken: cancelToken,
+      ),
       (wrapper) {
         _loadingImages.remove(cacheKey);
         _readerImagePriorities.remove(cacheKey);
@@ -182,6 +216,7 @@ abstract class ImageDownloader {
       beforeListen: () => _waitForReaderImageTurn(cacheKey),
       onListenStart: () => _markReaderImageStarted(cacheKey),
       onListenFinish: () => _markReaderImageFinished(cacheKey),
+      onCancel: () => cancelToken.cancel('reader image request cancelled'),
     );
     _loadingImages[cacheKey] = stream;
   }
@@ -231,13 +266,20 @@ abstract class ImageDownloader {
     String imageKey,
     String? sourceKey,
     String cid,
-    String eid,
-  ) {
+    String eid, {
+    CancelToken? cancelToken,
+  }) {
     final loader = debugReaderImageLoader;
     if (loader != null) {
       return loader(imageKey, sourceKey, cid, eid, useCache: true);
     }
-    return _loadComicImage(imageKey, sourceKey, cid, eid);
+    return _loadComicImage(
+      imageKey,
+      sourceKey,
+      cid,
+      eid,
+      cancelToken: cancelToken,
+    );
   }
 
   static Future<void> _waitForReaderImageTurn(String cacheKey) async {
@@ -279,7 +321,9 @@ abstract class ImageDownloader {
     }
   }
 
-  static void _resetReaderImageSchedulingState({bool resetDebugLoader = false}) {
+  static void _resetReaderImageSchedulingState({
+    bool resetDebugLoader = false,
+  }) {
     _readerImagePriorities.clear();
     _pendingReaderPrefetchRequests.clear();
     _activeReaderImageKinds.clear();
@@ -296,6 +340,7 @@ abstract class ImageDownloader {
     String cid,
     String eid, {
     bool useCache = true,
+    CancelToken? cancelToken,
   }) async* {
     final cacheKey = "$imageKey@$sourceKey@$cid@$eid";
     if (useCache) {
@@ -350,6 +395,7 @@ abstract class ImageDownloader {
         var req = await dio.request<ResponseBody>(
           configs['url'] ?? imageKey,
           data: configs['data'],
+          cancelToken: cancelToken,
         );
         var stream = req.data?.stream ?? (throw "Error: Empty response body.");
         int? expectedBytes = req.data!.contentLength;
@@ -437,6 +483,9 @@ class _StreamWrapper<T> {
   final Future<void> Function()? beforeListen;
   final void Function()? onListenStart;
   final void Function()? onListenFinish;
+  final void Function()? onCancel;
+
+  StreamIterator<T>? _iterator;
 
   bool isClosed = false;
 
@@ -446,6 +495,7 @@ class _StreamWrapper<T> {
     this.beforeListen,
     this.onListenStart,
     this.onListenFinish,
+    this.onCancel,
   }) {
     _listen();
   }
@@ -457,7 +507,9 @@ class _StreamWrapper<T> {
         return;
       }
       onListenStart?.call();
-      await for (var data in _stream) {
+      _iterator = StreamIterator(_stream);
+      while (!isClosed && await _iterator!.moveNext()) {
+        final data = _iterator!.current;
         if (isClosed) {
           break;
         }
@@ -474,6 +526,8 @@ class _StreamWrapper<T> {
         }
       }
     } finally {
+      await _iterator?.cancel();
+      _iterator = null;
       onListenFinish?.call();
       for (var controller in controllers) {
         if (!controller.isClosed) {
@@ -499,11 +553,16 @@ class _StreamWrapper<T> {
   }
 
   void cancel() {
+    if (isClosed) {
+      return;
+    }
+    onCancel?.call();
     for (var controller in controllers) {
       controller.close();
     }
     controllers.clear();
     isClosed = true;
+    unawaited(_iterator?.cancel() ?? Future.value());
   }
 }
 

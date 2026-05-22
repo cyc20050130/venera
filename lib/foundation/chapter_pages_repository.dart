@@ -9,13 +9,13 @@ import 'package:venera/foundation/log.dart';
 import 'package:venera/foundation/res.dart';
 import 'package:venera/utils/io.dart';
 
-class ComicDetailsRepository {
-  ComicDetailsRepository._create();
+class ChapterPagesRepository {
+  ChapterPagesRepository._create();
 
-  static ComicDetailsRepository? _instance;
+  static ChapterPagesRepository? _instance;
 
-  factory ComicDetailsRepository() {
-    return _instance ??= ComicDetailsRepository._create();
+  factory ChapterPagesRepository() {
+    return _instance ??= ChapterPagesRepository._create();
   }
 
   static const freshCacheDuration = Duration(minutes: 10);
@@ -38,13 +38,14 @@ class ComicDetailsRepository {
     _initFuture = Future(() async {
       final db = sqlite3.open(FilePath.join(App.dataPath, 'comic_details.db'));
       db.execute('''
-        CREATE TABLE IF NOT EXISTS comic_details_cache (
+        CREATE TABLE IF NOT EXISTS chapter_pages_cache (
           source_key TEXT NOT NULL,
           comic_id TEXT NOT NULL,
+          chapter_id TEXT NOT NULL,
           payload TEXT NOT NULL,
           updated_at INTEGER NOT NULL,
           fresh_until INTEGER NOT NULL,
-          PRIMARY KEY (source_key, comic_id)
+          PRIMARY KEY (source_key, comic_id, chapter_id)
         );
       ''');
       _db = db;
@@ -56,26 +57,30 @@ class ComicDetailsRepository {
     }
   }
 
-  Future<Res<ComicDetails>> load(
+  Future<Res<List<String>>> load(
     String sourceKey,
-    String comicId, {
+    String comicId,
+    String? chapterId, {
     bool forceRefresh = false,
     bool refreshIfStale = true,
     Duration freshFor = freshCacheDuration,
     Duration staleFallback = staleFallbackDuration,
-    FutureOr<void> Function(ComicDetails details)? onBackgroundUpdate,
+    FutureOr<void> Function(List<String> pages)? onBackgroundUpdate,
   }) async {
     final stopwatch = Stopwatch()..start();
     await init();
 
     final source = ComicSource.find(sourceKey);
-    if (source == null || source.loadComicInfo == null) {
+    if (source == null || source.loadComicPages == null) {
       return const Res.error('Comic source not found');
     }
 
-    final key = _buildKey(sourceKey, comicId);
+    final normalizedChapterId = chapterId ?? '0';
+    final key = _buildKey(sourceKey, comicId, normalizedChapterId);
     final now = DateTime.now();
-    final cached = forceRefresh ? null : _findCache(sourceKey, comicId);
+    final cached = forceRefresh
+        ? null
+        : _findCache(sourceKey, comicId, normalizedChapterId);
 
     if (!forceRefresh && cached != null) {
       if (cached.isFresh(now)) {
@@ -85,8 +90,9 @@ class ComicDetailsRepository {
           stopwatch,
           sourceKey: sourceKey,
           comicId: comicId,
+          chapterId: normalizedChapterId,
         );
-        return Res(cached.details);
+        return Res(cached.pages);
       }
 
       if (refreshIfStale) {
@@ -94,6 +100,7 @@ class ComicDetailsRepository {
           key,
           source,
           comicId,
+          chapterId,
           freshFor,
           cached.payload,
           onBackgroundUpdate,
@@ -104,12 +111,13 @@ class ComicDetailsRepository {
           stopwatch,
           sourceKey: sourceKey,
           comicId: comicId,
+          chapterId: normalizedChapterId,
         );
-        return Res(cached.details);
+        return Res(cached.pages);
       }
     }
 
-    final network = await _fetchAndStore(source, comicId, freshFor);
+    final network = await _fetchAndStore(source, comicId, chapterId, freshFor);
 
     if (network.result.success) {
       stopwatch.stop();
@@ -118,6 +126,7 @@ class ComicDetailsRepository {
         stopwatch,
         sourceKey: sourceKey,
         comicId: comicId,
+        chapterId: normalizedChapterId,
       );
       return network.result;
     }
@@ -129,102 +138,159 @@ class ComicDetailsRepository {
         stopwatch,
         sourceKey: sourceKey,
         comicId: comicId,
+        chapterId: normalizedChapterId,
       );
-      return Res(cached.details);
+      return Res(cached.pages);
     }
 
     stopwatch.stop();
-    _logPerf('load failed', stopwatch, sourceKey: sourceKey, comicId: comicId);
+    _logPerf(
+      'load failed',
+      stopwatch,
+      sourceKey: sourceKey,
+      comicId: comicId,
+      chapterId: normalizedChapterId,
+    );
     return network.result;
   }
 
-  Future<void> refresh(
+  Future<void> prefetch(
     String sourceKey,
-    String comicId, {
+    String comicId,
+    String? chapterId, {
     Duration freshFor = freshCacheDuration,
   }) async {
     await init();
     final source = ComicSource.find(sourceKey);
-    if (source == null || source.loadComicInfo == null) {
+    if (source == null || source.loadComicPages == null) {
       return;
     }
-    await _fetchAndStore(source, comicId, freshFor);
+    final normalizedChapterId = chapterId ?? '0';
+    final cached = _findCache(sourceKey, comicId, normalizedChapterId);
+    final now = DateTime.now();
+    if (cached != null && cached.isFresh(now)) {
+      return;
+    }
+    if (cached != null) {
+      _scheduleBackgroundRefresh(
+        _buildKey(sourceKey, comicId, normalizedChapterId),
+        source,
+        comicId,
+        chapterId,
+        freshFor,
+        cached.payload,
+        null,
+      );
+      return;
+    }
+    await _fetchAndStore(source, comicId, chapterId, freshFor);
   }
 
-  Future<void> save(
-    ComicDetails details, {
-    Duration freshFor = freshCacheDuration,
-  }) async {
-    await init();
-    _saveCache(details, freshFor, payload: _encodeDetails(details));
+  Future<_StoredFetchResult<List<String>>> _fetchAndStore(
+    ComicSource source,
+    String comicId,
+    String? chapterId,
+    Duration freshFor,
+  ) async {
+    try {
+      final result = await source.loadComicPages!(comicId, chapterId);
+      if (result.error) {
+        return _StoredFetchResult(Res.fromErrorRes(result), false);
+      }
+      final normalizedChapterId = chapterId ?? '0';
+      final payload = jsonEncode(result.data);
+      final previousPayload = _readPayload(
+        source.key,
+        comicId,
+        normalizedChapterId,
+      );
+      final changed = previousPayload != payload;
+      _saveCache(
+        source.key,
+        comicId,
+        normalizedChapterId,
+        result.data,
+        freshFor,
+        payload: payload,
+      );
+      return _StoredFetchResult(Res(result.data), changed);
+    } catch (e, s) {
+      Log.error(
+        'ChapterPagesRepository',
+        'Failed to fetch pages for ${source.key}@$comicId#${chapterId ?? '0'}: $e',
+        s,
+      );
+      return _StoredFetchResult(Res.error(e.toString()), false);
+    }
   }
 
-  Future<void> delete(String sourceKey, String comicId) async {
-    await init();
-    _db!.execute(
-      '''
-      DELETE FROM comic_details_cache
-      WHERE source_key = ? AND comic_id = ?;
-      ''',
-      [sourceKey, comicId],
-    );
-  }
-
-  _CachedComicDetails? _findCache(String sourceKey, String comicId) {
+  _CachedChapterPages? _findCache(
+    String sourceKey,
+    String comicId,
+    String chapterId,
+  ) {
     final result = _db!.select(
       '''
       SELECT payload, updated_at, fresh_until
-      FROM comic_details_cache
-      WHERE source_key = ? AND comic_id = ?;
+      FROM chapter_pages_cache
+      WHERE source_key = ? AND comic_id = ? AND chapter_id = ?;
       ''',
-      [sourceKey, comicId],
+      [sourceKey, comicId, chapterId],
     );
     if (result.isEmpty) {
       return null;
     }
     try {
       final row = result.first;
-      return _CachedComicDetails(
-        ComicDetails.fromJson(
-          Map<String, dynamic>.from(jsonDecode(row['payload'] as String)),
-        ),
+      final pages = List<String>.from(jsonDecode(row['payload'] as String));
+      return _CachedChapterPages(
+        pages,
         DateTime.fromMillisecondsSinceEpoch(row['updated_at'] as int),
         DateTime.fromMillisecondsSinceEpoch(row['fresh_until'] as int),
         row['payload'] as String,
       );
     } catch (e, s) {
       Log.error(
-        'ComicDetailsRepository',
-        'Failed to parse cached details for $sourceKey@$comicId: $e',
+        'ChapterPagesRepository',
+        'Failed to parse cached pages for $sourceKey@$comicId#$chapterId: $e',
         s,
       );
       _db!.execute(
         '''
-        DELETE FROM comic_details_cache
-        WHERE source_key = ? AND comic_id = ?;
+        DELETE FROM chapter_pages_cache
+        WHERE source_key = ? AND comic_id = ? AND chapter_id = ?;
         ''',
-        [sourceKey, comicId],
+        [sourceKey, comicId, chapterId],
       );
       return null;
     }
   }
 
-  void _saveCache(ComicDetails details, Duration freshFor, {String? payload}) {
+  void _saveCache(
+    String sourceKey,
+    String comicId,
+    String chapterId,
+    List<String> pages,
+    Duration freshFor, {
+    String? payload,
+  }) {
     final now = DateTime.now();
-    payload ??= _encodeDetails(details);
+    payload ??= jsonEncode(pages);
     _db!.execute(
       '''
-      INSERT OR REPLACE INTO comic_details_cache (
+      INSERT OR REPLACE INTO chapter_pages_cache (
         source_key,
         comic_id,
+        chapter_id,
         payload,
         updated_at,
         fresh_until
-      ) VALUES (?, ?, ?, ?, ?);
+      ) VALUES (?, ?, ?, ?, ?, ?);
       ''',
       [
-        details.sourceKey,
-        details.id,
+        sourceKey,
+        comicId,
+        chapterId,
         payload,
         now.millisecondsSinceEpoch,
         now.add(freshFor).millisecondsSinceEpoch,
@@ -232,66 +298,65 @@ class ComicDetailsRepository {
     );
   }
 
-  Future<_StoredFetchResult<ComicDetails>> _fetchAndStore(
-    ComicSource source,
-    String comicId,
-    Duration freshFor,
-  ) async {
-    try {
-      final result = await source.loadComicInfo!(comicId);
-      if (result.error) {
-        return _StoredFetchResult(Res.fromErrorRes(result), false);
-      }
-      final payload = _encodeDetails(result.data);
-      final previousPayload = _readPayload(source.key, comicId);
-      final changed = previousPayload != payload;
-      _saveCache(result.data, freshFor, payload: payload);
-      return _StoredFetchResult(Res(result.data), changed);
-    } catch (e, s) {
-      Log.error(
-        'ComicDetailsRepository',
-        'Failed to fetch details for ${source.key}@$comicId: $e',
-        s,
-      );
-      return _StoredFetchResult(Res.error(e.toString()), false);
+  String? _readPayload(String sourceKey, String comicId, String chapterId) {
+    final result = _db!.select(
+      '''
+      SELECT payload
+      FROM chapter_pages_cache
+      WHERE source_key = ? AND comic_id = ? AND chapter_id = ?;
+      ''',
+      [sourceKey, comicId, chapterId],
+    );
+    if (result.isEmpty) {
+      return null;
     }
+    return result.first['payload'] as String;
   }
 
   void _scheduleBackgroundRefresh(
     String key,
     ComicSource source,
     String comicId,
+    String? chapterId,
     Duration freshFor,
     String cachedPayload,
-    FutureOr<void> Function(ComicDetails details)? onBackgroundUpdate,
+    FutureOr<void> Function(List<String> pages)? onBackgroundUpdate,
   ) {
     if (_backgroundRefreshTasks.containsKey(key)) {
       return;
     }
     _backgroundRefreshTasks[key] = Future(() async {
       try {
-        final result = await _fetchAndStore(source, comicId, freshFor);
+        final result = await _fetchAndStore(
+          source,
+          comicId,
+          chapterId,
+          freshFor,
+        );
         if (result.result.success) {
+          final normalizedChapterId = chapterId ?? '0';
           if (result.changed) {
             _logBackgroundRefresh(
-              'details background refresh changed',
+              'chapter pages background refresh changed',
               source.key,
               comicId,
+              normalizedChapterId,
             );
             if (onBackgroundUpdate != null) {
               await onBackgroundUpdate(result.result.data);
             }
           } else if (cachedPayload.isNotEmpty) {
             _logBackgroundRefresh(
-              'details background refresh skipped',
+              'chapter pages background refresh skipped',
               source.key,
               comicId,
+              normalizedChapterId,
             );
           }
         }
       } catch (e, s) {
         Log.error(
-          'ComicDetailsRepository',
+          'ChapterPagesRepository',
           'Background refresh failed for $key: $e',
           s,
         );
@@ -301,45 +366,38 @@ class ComicDetailsRepository {
     });
   }
 
-  String _buildKey(String sourceKey, String comicId) => '$sourceKey@$comicId';
-
-  String _encodeDetails(ComicDetails details) => jsonEncode(details.toJson());
-
-  String? _readPayload(String sourceKey, String comicId) {
-    final result = _db!.select(
-      '''
-      SELECT payload
-      FROM comic_details_cache
-      WHERE source_key = ? AND comic_id = ?;
-      ''',
-      [sourceKey, comicId],
-    );
-    if (result.isEmpty) {
-      return null;
-    }
-    return result.first['payload'] as String;
-  }
+  String _buildKey(String sourceKey, String comicId, String chapterId) =>
+      '$sourceKey@$comicId#$chapterId';
 
   void _logPerf(
     String label,
     Stopwatch stopwatch, {
     required String sourceKey,
     required String comicId,
+    required String chapterId,
   }) {
     if (!kDebugMode) {
       return;
     }
     Log.info(
-      'ComicDetailsRepository',
-      '[perf] $label ${stopwatch.elapsedMilliseconds}ms $sourceKey@$comicId',
+      'ChapterPagesRepository',
+      '[perf] $label ${stopwatch.elapsedMilliseconds}ms $sourceKey@$comicId#$chapterId',
     );
   }
 
-  void _logBackgroundRefresh(String label, String sourceKey, String comicId) {
+  void _logBackgroundRefresh(
+    String label,
+    String sourceKey,
+    String comicId,
+    String chapterId,
+  ) {
     if (!kDebugMode) {
       return;
     }
-    Log.info('ComicDetailsRepository', '[perf] $label $sourceKey@$comicId');
+    Log.info(
+      'ChapterPagesRepository',
+      '[perf] $label $sourceKey@$comicId#$chapterId',
+    );
   }
 
   @visibleForTesting
@@ -351,20 +409,17 @@ class ComicDetailsRepository {
   }
 }
 
-class _CachedComicDetails {
-  const _CachedComicDetails(
-    this.details,
+class _CachedChapterPages {
+  const _CachedChapterPages(
+    this.pages,
     this.updatedAt,
     this.freshUntil,
     this.payload,
   );
 
-  final ComicDetails details;
-
+  final List<String> pages;
   final DateTime updatedAt;
-
   final DateTime freshUntil;
-
   final String payload;
 
   bool isFresh(DateTime now) => !freshUntil.isBefore(now);

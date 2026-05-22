@@ -387,58 +387,29 @@ class _LocalComicsPageState extends State<LocalComicsPage> {
     await showDialog(
       context: App.rootContext,
       builder: (context) {
-        bool removeComicFile = true;
-        bool removeFavoriteAndHistory = true;
-        return StatefulBuilder(
-          builder: (context, state) {
-            return ContentDialog(
-              title: "Delete".tl,
-              content: Column(
-                children: [
-                  CheckboxListTile(
-                    title: Text("Remove local favorite and history".tl),
-                    value: removeFavoriteAndHistory,
-                    onChanged: (v) {
-                      state(() {
-                        removeFavoriteAndHistory = !removeFavoriteAndHistory;
-                      });
-                    },
-                  ),
-                  CheckboxListTile(
-                    title: Text("Also remove files on disk".tl),
-                    value: removeComicFile,
-                    onChanged: (v) {
-                      state(() {
-                        removeComicFile = !removeComicFile;
-                      });
-                    },
-                  ),
-                ],
+        return ContentDialog(
+          title: "Delete".tl,
+          content: const Text("将删除本地漫画条目和磁盘文件，保留本地收藏与历史记录。"),
+          actions: [
+            if (comics.length == 1 && comics.first.hasChapters)
+              TextButton(
+                child: Text("Delete Chapters".tl),
+                onPressed: () {
+                  context.pop();
+                  showDeleteChaptersPopWindow(context, comics.first);
+                },
               ),
-              actions: [
-                if (comics.length == 1 && comics.first.hasChapters)
-                  TextButton(
-                    child: Text("Delete Chapters".tl),
-                    onPressed: () {
-                      context.pop();
-                      showDeleteChaptersPopWindow(context, comics.first);
-                    },
-                  ),
-                FilledButton(
-                  onPressed: () {
-                    context.pop();
-                    LocalManager().batchDeleteComics(
-                      comics,
-                      removeComicFile,
-                      removeFavoriteAndHistory,
-                    );
-                    isDeleted = true;
-                  },
-                  child: Text("Confirm".tl),
-                ),
-              ],
-            );
-          },
+            FilledButton(
+                onPressed: () {
+                  context.pop();
+                  LocalManager().batchDeleteComicsKeepFavoritesAndHistory(
+                    comics,
+                  );
+                  isDeleted = true;
+                },
+              child: Text("Confirm".tl),
+            ),
+          ],
         );
       },
     );

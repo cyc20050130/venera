@@ -38,6 +38,10 @@ class _ReaderImagesState extends State<_ReaderImages> {
   void load() async {
     if (inProgress) return;
     inProgress = true;
+    final requestChapter = reader.chapter;
+    final requestChapterId = reader.widget.chapters?.ids.elementAtOrNull(
+      requestChapter - 1,
+    );
     if (reader.type == ComicType.local ||
         (LocalManager().isChapterReadable(
           reader.cid,
@@ -51,6 +55,10 @@ class _ReaderImagesState extends State<_ReaderImages> {
           reader.type,
           reader.chapter,
         );
+        if (!mounted || reader.chapter != requestChapter) {
+          inProgress = false;
+          return;
+        }
         setState(() {
           reader.images = images;
           reader.isLoading = false;
@@ -60,7 +68,12 @@ class _ReaderImagesState extends State<_ReaderImages> {
             reader.updateHistory();
           });
         });
+        reader.onChapterImagesResolved();
       } catch (e) {
+        if (!mounted || reader.chapter != requestChapter) {
+          inProgress = false;
+          return;
+        }
         setState(() {
           error = e.toString();
           reader.isLoading = false;
@@ -68,18 +81,37 @@ class _ReaderImagesState extends State<_ReaderImages> {
         });
       }
     } else {
-      var cp = reader.widget.chapters?.ids.elementAtOrNull(reader.chapter - 1);
-      var res = await reader.type.comicSource!.loadComicPages!(
+      var res = await ChapterPagesRepository().load(
+        reader.type.sourceKey,
         reader.widget.cid,
-        cp,
+        requestChapterId,
+        onBackgroundUpdate: (updatedImages) async {
+          if (!mounted ||
+              reader.chapter != requestChapter ||
+              requestChapterId !=
+                  reader.widget.chapters?.ids.elementAtOrNull(
+                    reader.chapter - 1,
+                  )) {
+            return;
+          }
+          _applyUpdatedImages(updatedImages);
+        },
       );
       if (res.error) {
+        if (!mounted || reader.chapter != requestChapter) {
+          inProgress = false;
+          return;
+        }
         setState(() {
           error = res.errorMessage;
           reader.isLoading = false;
           inProgress = false;
         });
       } else {
+        if (!mounted || reader.chapter != requestChapter) {
+          inProgress = false;
+          return;
+        }
         setState(() {
           reader.images = res.data;
           reader.isLoading = false;
@@ -89,8 +121,52 @@ class _ReaderImagesState extends State<_ReaderImages> {
             reader.updateHistory();
           });
         });
+        reader.onChapterImagesResolved();
       }
     }
+    context.readerScaffold.update();
+  }
+
+  void _applyUpdatedImages(List<String> updatedImages) {
+    final currentImages = reader.images;
+    final currentStartIndex = currentImages == null
+        ? null
+        : computeReaderImageStartIndexForDisplayPage(
+            page: reader.page,
+            imageCount: currentImages.length,
+            imagesPerPage: reader.imagesPerPage,
+            showSingleImageOnFirstPage: reader.showSingleImageOnFirstPage(),
+          );
+    String? anchorImageKey;
+    if (currentImages != null &&
+        currentStartIndex != null &&
+        currentStartIndex >= 0 &&
+        currentStartIndex < currentImages.length) {
+      anchorImageKey = currentImages[currentStartIndex];
+    }
+    setState(() {
+      reader.images = updatedImages;
+      final anchorIndex = anchorImageKey == null
+          ? -1
+          : updatedImages.indexOf(anchorImageKey);
+      if (anchorIndex >= 0) {
+        final nextPage = computeReaderDisplayPageForImageIndex(
+          imageIndex: anchorIndex,
+          imageCount: updatedImages.length,
+          imagesPerPage: reader.imagesPerPage,
+          showSingleImageOnFirstPage: reader.showSingleImageOnFirstPage(),
+        );
+        if (nextPage != null) {
+          reader._page = nextPage.clamp(1, math.max(1, reader.maxPage));
+        }
+      } else {
+        reader._page = reader.page.clamp(1, math.max(1, reader.maxPage));
+      }
+    });
+    Future.microtask(() {
+      reader.updateHistory();
+    });
+    reader.onChapterImagesResolved();
     context.readerScaffold.update();
   }
 
@@ -214,10 +290,7 @@ class _ReaderEmptyState extends StatelessWidget {
                     onPressed: onPrevChapter,
                     child: Text("Previous Chapter".tl),
                   ),
-                FilledButton(
-                  onPressed: onRetry,
-                  child: Text("Retry".tl),
-                ),
+                FilledButton(onPressed: onRetry, child: Text("Retry".tl)),
                 if (canGoNext)
                   FilledButton.tonal(
                     onPressed: onNextChapter,

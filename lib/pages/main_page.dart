@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:venera/foundation/appdata.dart';
+import 'package:venera/foundation/bootstrap.dart';
 import 'package:venera/pages/categories_page.dart';
 import 'package:venera/pages/search_page.dart';
 import 'package:venera/pages/settings/settings_page.dart';
@@ -41,6 +42,9 @@ class _MainPageState extends State<MainPage> {
     _navigatorKey = GlobalKey();
     App.mainNavigatorKey = _navigatorKey;
     index = int.tryParse(appdata.settings['initialPage'].toString()) ?? 0;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      logBootstrapEvent('main page visible');
+    });
     super.initState();
   }
 

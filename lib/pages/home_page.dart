@@ -3,6 +3,7 @@ import 'package:sliver_tools/sliver_tools.dart';
 import 'package:url_launcher/url_launcher_string.dart';
 import 'package:venera/components/components.dart';
 import 'package:venera/foundation/app.dart';
+import 'package:venera/foundation/bootstrap.dart';
 import 'package:venera/foundation/comic_source/comic_source.dart';
 import 'package:venera/foundation/consts.dart';
 import 'package:venera/foundation/favorites.dart';
@@ -23,8 +24,41 @@ import 'package:venera/utils/translations.dart';
 
 import 'local_comics_page.dart';
 
-class HomePage extends StatelessWidget {
+class HomePage extends StatefulWidget {
   const HomePage({super.key});
+
+  @override
+  State<HomePage> createState() => _HomePageState();
+}
+
+class _HomePageState extends State<HomePage> {
+  bool _hasLoggedHomeSectionsReady = false;
+
+  @override
+  void initState() {
+    super.initState();
+    bootstrapController.addListener(_onBootstrapChanged);
+  }
+
+  @override
+  void dispose() {
+    bootstrapController.removeListener(_onBootstrapChanged);
+    super.dispose();
+  }
+
+  void _onBootstrapChanged() {
+    if (!_hasLoggedHomeSectionsReady &&
+        bootstrapController.phaseBReady &&
+        bootstrapController.comicSourceReady) {
+      _hasLoggedHomeSectionsReady = true;
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        logBootstrapEvent('home sections ready');
+      });
+    }
+    if (mounted) {
+      setState(() {});
+    }
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -35,9 +69,15 @@ class HomePage extends StatelessWidget {
         const _SyncDataWidget(),
         const _History(),
         const _Local(),
-        const FollowUpdatesWidget(),
+        const _DeferredHomeSection(
+          readyWhenPhaseB: true,
+          child: FollowUpdatesWidget(),
+        ),
         const _ComicSourceWidget(),
-        const ImageFavorites(),
+        const _DeferredHomeSection(
+          readyWhenPhaseB: true,
+          child: ImageFavorites(),
+        ),
         SliverPadding(padding: EdgeInsets.only(top: context.padding.bottom)),
       ],
     );
@@ -225,34 +265,52 @@ class _History extends StatefulWidget {
 }
 
 class _HistoryState extends State<_History> {
-  late List<History> history;
-  late int count;
+  List<History> history = const [];
+  int count = 0;
+
+  void _refreshIfReady() {
+    if (!bootstrapController.phaseBReady) {
+      return;
+    }
+    history = HistoryManager().getRecent();
+    count = HistoryManager().count();
+  }
 
   void onHistoryChange() {
     if (mounted) {
       setState(() {
-        history = HistoryManager().getRecent();
-        count = HistoryManager().count();
+        _refreshIfReady();
       });
     }
   }
 
+  void _onBootstrapChanged() {
+    if (!mounted || !bootstrapController.phaseBReady) {
+      return;
+    }
+    setState(_refreshIfReady);
+  }
+
   @override
   void initState() {
-    history = HistoryManager().getRecent();
-    count = HistoryManager().count();
+    _refreshIfReady();
     HistoryManager().addListener(onHistoryChange);
+    bootstrapController.addListener(_onBootstrapChanged);
     super.initState();
   }
 
   @override
   void dispose() {
     HistoryManager().removeListener(onHistoryChange);
+    bootstrapController.removeListener(_onBootstrapChanged);
     super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
+    if (!bootstrapController.phaseBReady) {
+      return const _HomeCardPlaceholder(title: 'History');
+    }
     return SliverToBoxAdapter(
       child: Container(
         margin: const EdgeInsets.symmetric(horizontal: 8, vertical: 8),
@@ -340,32 +398,48 @@ class _Local extends StatefulWidget {
 }
 
 class _LocalState extends State<_Local> {
-  late List<LocalComic> local;
-  late int count;
+  List<LocalComic> local = const [];
+  int count = 0;
+
+  void _refreshIfReady() {
+    if (!bootstrapController.phaseBReady) {
+      return;
+    }
+    local = LocalManager().getRecent();
+    count = LocalManager().count;
+  }
 
   void onLocalComicsChange() {
-    setState(() {
-      local = LocalManager().getRecent();
-      count = LocalManager().count;
-    });
+    setState(_refreshIfReady);
+  }
+
+  void _onBootstrapChanged() {
+    if (!mounted || !bootstrapController.phaseBReady) {
+      return;
+    }
+    setState(_refreshIfReady);
   }
 
   @override
   void initState() {
-    local = LocalManager().getRecent();
-    count = LocalManager().count;
+    _refreshIfReady();
     LocalManager().addListener(onLocalComicsChange);
+    bootstrapController.addListener(_onBootstrapChanged);
     super.initState();
   }
 
   @override
   void dispose() {
     LocalManager().removeListener(onLocalComicsChange);
+    bootstrapController.removeListener(_onBootstrapChanged);
     super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
+    if (!bootstrapController.phaseBReady) {
+      return const _HomeCardPlaceholder(title: 'Local');
+    }
     return SliverToBoxAdapter(
       child: Container(
         margin: const EdgeInsets.symmetric(horizontal: 8, vertical: 8),
@@ -659,24 +733,40 @@ class _ComicSourceWidget extends StatefulWidget {
 }
 
 class _ComicSourceWidgetState extends State<_ComicSourceWidget> {
-  late List<String> comicSources;
+  List<String> comicSources = const [];
+
+  void _refreshIfReady() {
+    if (!bootstrapController.comicSourceReady) {
+      return;
+    }
+    comicSources = ComicSource.all().map((e) => e.name).toList();
+  }
 
   void onComicSourceChange() {
     setState(() {
-      comicSources = ComicSource.all().map((e) => e.name).toList();
+      _refreshIfReady();
     });
+  }
+
+  void _onBootstrapChanged() {
+    if (!mounted || !bootstrapController.comicSourceReady) {
+      return;
+    }
+    setState(_refreshIfReady);
   }
 
   @override
   void initState() {
-    comicSources = ComicSource.all().map((e) => e.name).toList();
+    _refreshIfReady();
     ComicSourceManager().addListener(onComicSourceChange);
+    bootstrapController.addListener(_onBootstrapChanged);
     super.initState();
   }
 
   @override
   void dispose() {
     ComicSourceManager().removeListener(onComicSourceChange);
+    bootstrapController.removeListener(_onBootstrapChanged);
     super.dispose();
   }
 
@@ -695,6 +785,9 @@ class _ComicSourceWidgetState extends State<_ComicSourceWidget> {
 
   @override
   Widget build(BuildContext context) {
+    if (!bootstrapController.comicSourceReady) {
+      return const _HomeCardPlaceholder(title: 'Comic Source');
+    }
     return SliverToBoxAdapter(
       child: Container(
         margin: const EdgeInsets.symmetric(horizontal: 8, vertical: 8),
@@ -795,6 +888,87 @@ class _ComicSourceWidgetState extends State<_ComicSourceWidget> {
                     .paddingBottom(8),
             ],
           ),
+        ),
+      ),
+    );
+  }
+}
+
+class _DeferredHomeSection extends StatelessWidget {
+  const _DeferredHomeSection({
+    required this.child,
+    this.readyWhenPhaseB = false,
+  });
+
+  final Widget child;
+  final bool readyWhenPhaseB;
+
+  @override
+  Widget build(BuildContext context) {
+    final ready = !readyWhenPhaseB || bootstrapController.phaseBReady;
+    if (ready) {
+      return child;
+    }
+    return const _HomeCardPlaceholder();
+  }
+}
+
+class _HomeCardPlaceholder extends StatelessWidget {
+  const _HomeCardPlaceholder({this.title});
+
+  final String? title;
+
+  @override
+  Widget build(BuildContext context) {
+    final colorScheme = Theme.of(context).colorScheme;
+    return SliverToBoxAdapter(
+      child: Container(
+        height: 188,
+        margin: const EdgeInsets.symmetric(horizontal: 8, vertical: 8),
+        padding: const EdgeInsets.all(16),
+        decoration: BoxDecoration(
+          border: Border.all(
+            color: colorScheme.outlineVariant,
+            width: 0.6,
+          ),
+          borderRadius: BorderRadius.circular(8),
+        ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Container(
+              width: 140,
+              height: 20,
+              decoration: BoxDecoration(
+                color: colorScheme.surfaceContainerHighest,
+                borderRadius: BorderRadius.circular(999),
+              ),
+              alignment: Alignment.centerLeft,
+              padding: const EdgeInsets.symmetric(horizontal: 10),
+              child: title == null
+                  ? null
+                  : Text(
+                      title!.tl,
+                      style: ts.s12.copyWith(color: colorScheme.outline),
+                    ),
+            ),
+            const SizedBox(height: 16),
+            Expanded(
+              child: Row(
+                children: List.generate(3, (index) {
+                  return Expanded(
+                    child: Container(
+                      margin: EdgeInsets.only(right: index == 2 ? 0 : 12),
+                      decoration: BoxDecoration(
+                        color: colorScheme.surfaceContainerHighest,
+                        borderRadius: BorderRadius.circular(8),
+                      ),
+                    ),
+                  );
+                }),
+              ),
+            ),
+          ],
         ),
       ),
     );

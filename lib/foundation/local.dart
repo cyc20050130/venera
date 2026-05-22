@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:isolate';
 
+import 'package:flutter/foundation.dart' show visibleForTesting;
 import 'package:flutter/widgets.dart' show ChangeNotifier;
 import 'package:flutter_saf/flutter_saf.dart';
 import 'package:path_provider/path_provider.dart';
@@ -175,6 +176,11 @@ class LocalManager with ChangeNotifier {
     return _instance ??= LocalManager._();
   }
 
+  @visibleForTesting
+  static void debugResetInstance() {
+    _instance = null;
+  }
+
   late Database _db;
 
   /// path to the directory where all the comics are stored
@@ -289,8 +295,47 @@ class LocalManager with ChangeNotifier {
     }
     _checkPathValidation();
     _checkNoMedia();
-    await ComicSourceManager().ensureInit();
-    restoreDownloadingTasks();
+    if (await _restoreDownloadingTasksOnInit()) {
+      notifyListeners();
+    }
+  }
+
+  Future<bool> _restoreDownloadingTasksOnInit() async {
+    final file = File(FilePath.join(App.dataPath, 'downloading_tasks.json'));
+    if (!file.existsSync()) {
+      return false;
+    }
+    try {
+      final decoded = jsonDecode(file.readAsStringSync());
+      if (decoded is! List) {
+        file.deleteIgnoreError();
+        Log.error(
+          "LocalManager",
+          "Failed to restore downloading tasks: invalid snapshot format",
+        );
+        return false;
+      }
+      final tasks = decoded
+          .whereType<Map>()
+          .cast<Map<String, dynamic>>()
+          .toList();
+      final shouldEnsureSources = tasks.any((task) {
+        if (task['type'] != 'ImagesDownloadTask') {
+          return false;
+        }
+        final sourceKey = task['source'];
+        return sourceKey is String && ComicSource.find(sourceKey) == null;
+      });
+      if (shouldEnsureSources) {
+        await ComicSourceManager().ensureInit();
+      }
+      restoreDownloadingTasks();
+      return true;
+    } catch (e) {
+      file.deleteIgnoreError();
+      Log.error("LocalManager", "Failed to restore downloading tasks: $e");
+      return false;
+    }
   }
 
   String findValidId(ComicType type) {
@@ -869,6 +914,10 @@ class LocalManager with ChangeNotifier {
     if (removeFileOnDisk) {
       _deleteDirectories(shouldRemovedDirs);
     }
+  }
+
+  void batchDeleteComicsKeepFavoritesAndHistory(List<LocalComic> comics) {
+    batchDeleteComics(comics, true, false);
   }
 
   /// Deletes the directories in a separate isolate to avoid blocking the UI thread.

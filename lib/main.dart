@@ -1,10 +1,12 @@
 import 'dart:async';
+import 'dart:ui' show PlatformDispatcher;
 import 'package:desktop_webview_window/desktop_webview_window.dart';
 import 'package:dynamic_color/dynamic_color.dart';
 import 'package:flex_seed_scheme/flex_seed_scheme.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_localizations/flutter_localizations.dart';
+import 'package:venera/foundation/bootstrap.dart';
 import 'package:venera/foundation/log.dart';
 import 'package:venera/pages/auth_page.dart';
 import 'package:venera/pages/main_page.dart';
@@ -14,9 +16,7 @@ import 'components/components.dart';
 import 'components/window_frame.dart';
 import 'foundation/app.dart';
 import 'foundation/appdata.dart';
-import 'foundation/cache_manager.dart';
 import 'headless.dart';
-import 'init.dart';
 
 void main(List<String> args) {
   if (args.contains('--headless')) {
@@ -28,8 +28,8 @@ void main(List<String> args) {
     runZonedGuarded(
       () async {
         WidgetsFlutterBinding.ensureInitialized();
-        await init();
         runApp(const MyApp());
+        bootstrapController.start();
         if (App.isDesktop) {
           await windowManager.ensureInitialized();
           windowManager.waitUntilReadyToShow().then((_) async {
@@ -75,11 +75,8 @@ class _MyAppState extends State<MyApp> with WidgetsBindingObserver {
     SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
     WidgetsBinding.instance.addObserver(this);
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      checkUpdates();
-      CacheManager().scheduleMaintenance();
-      Future.microtask(() {
-        App.local.repairAllDownloadedState();
-      });
+      logBootstrapEvent('first Flutter frame');
+      bootstrapController.schedulePostFrameWork();
     });
     super.initState();
   }
@@ -94,7 +91,9 @@ class _MyAppState extends State<MyApp> with WidgetsBindingObserver {
         state == AppLifecycleState.hidden ||
         state == AppLifecycleState.paused ||
         state == AppLifecycleState.detached) {
-      unawaited(App.local.flushCurrentDownloadingTasks());
+      if (App.isInitialized && bootstrapController.phaseAReady) {
+        unawaited(App.local.flushCurrentDownloadingTasks());
+      }
     }
     if (!App.isMobile || !appdata.settings['authorizationRequired']) {
       return;
@@ -193,113 +192,291 @@ class _MyAppState extends State<MyApp> with WidgetsBindingObserver {
 
   @override
   Widget build(BuildContext context) {
-    Widget home;
-    if (appdata.settings['authorizationRequired']) {
-      home = AuthPage(
-        onSuccessfulAuth: () {
-          App.rootContext.toReplacement(() => const MainPage());
-        },
-      );
-    } else {
-      home = const MainPage();
-    }
-    return DynamicColorBuilder(
-      builder: (light, dark) {
-        Color? primary, secondary, tertiary;
-        if (appdata.settings['color'] != 'system' ||
-            light == null ||
-            dark == null) {
-          primary = translateColorSetting();
-        } else {
-          primary = light.primary;
-          secondary = light.secondary;
-          tertiary = light.tertiary;
-        }
-        return MaterialApp(
-          title: "venera",
-          home: home,
-          debugShowCheckedModeBanner: false,
-          theme: getTheme(primary, secondary, tertiary, Brightness.light),
-          navigatorKey: App.rootNavigatorKey,
-          darkTheme: getTheme(primary, secondary, tertiary, Brightness.dark),
-          themeMode: switch (appdata.settings['theme_mode']) {
-            'light' => ThemeMode.light,
-            'dark' => ThemeMode.dark,
-            _ => ThemeMode.system,
-          },
-          color: Colors.transparent,
-          localizationsDelegates: [
-            GlobalMaterialLocalizations.delegate,
-            GlobalCupertinoLocalizations.delegate,
-          ],
-          locale: () {
-            var lang = appdata.settings['language'];
-            if (lang == 'system') {
-              return null;
+    final appBootstrapListenable = Listenable.merge([
+      bootstrapController,
+      appdata.settings,
+    ]);
+    return ListenableBuilder(
+      listenable: appBootstrapListenable,
+      builder: (context, _) {
+        return DynamicColorBuilder(
+          builder: (light, dark) {
+            Color? primary, secondary, tertiary;
+            if (appdata.settings['color'] != 'system' ||
+                light == null ||
+                dark == null) {
+              primary = translateColorSetting();
+            } else {
+              primary = light.primary;
+              secondary = light.secondary;
+              tertiary = light.tertiary;
             }
-            return switch (lang) {
-              'zh-CN' => const Locale('zh', 'CN'),
-              'zh-TW' => const Locale('zh', 'TW'),
-              'en-US' => const Locale('en'),
-              _ => null,
-            };
-          }(),
-          supportedLocales: const [
-            Locale('zh', 'CN'),
-            Locale('zh', 'TW'),
-            Locale('en'),
-          ],
-          builder: (context, widget) {
-            ErrorWidget.builder = (details) {
-              Log.error(
-                "Unhandled Exception",
-                "${details.exception}\n${details.stack}",
-              );
-              return Material(
-                child: Center(child: Text(details.exception.toString())),
-              );
-            };
-            if (widget != null) {
-              /// 如果无法检测到状态栏高度设定指定高度
-              /// https://github.com/flutter/flutter/issues/161086
-              var isPaddingCheckError =
-                  MediaQuery.of(context).viewPadding.top <= 0 ||
-                  MediaQuery.of(context).viewPadding.top > 200;
-
-              if (isPaddingCheckError && Platform.isAndroid) {
-                widget = MediaQuery(
-                  data: MediaQuery.of(context).copyWith(
-                    viewPadding: const EdgeInsets.only(top: 15, bottom: 15),
-                    padding: const EdgeInsets.only(top: 15, bottom: 15),
-                  ),
-                  child: widget,
-                );
-              }
-
-              widget = OverlayWidget(widget);
-              if (App.isDesktop) {
-                widget = Shortcuts(
-                  shortcuts: {
-                    LogicalKeySet(LogicalKeyboardKey.escape):
-                        VoidCallbackIntent(App.pop),
-                  },
-                  child: MouseBackDetector(
-                    onTapDown: App.pop,
-                    child: WindowFrame(widget),
-                  ),
-                );
-              }
-              return _SystemUiProvider(
-                Material(
-                  color: App.isLinux ? Colors.transparent : null,
-                  child: widget,
+            if (!bootstrapController.phaseAReady) {
+              return MaterialApp(
+                title: "venera",
+                home: const _BootstrapPage(),
+                debugShowCheckedModeBanner: false,
+                theme: getTheme(primary, secondary, tertiary, Brightness.light),
+                navigatorKey: App.rootNavigatorKey,
+                darkTheme: getTheme(
+                  primary,
+                  secondary,
+                  tertiary,
+                  Brightness.dark,
                 ),
+                themeMode: switch (appdata.settings['theme_mode']) {
+                  'light' => ThemeMode.light,
+                  'dark' => ThemeMode.dark,
+                  _ => ThemeMode.system,
+                },
+                color: Colors.transparent,
+                localizationsDelegates: [
+                  GlobalMaterialLocalizations.delegate,
+                  GlobalCupertinoLocalizations.delegate,
+                ],
+                locale: () {
+                  var lang = appdata.settings['language'];
+                  if (lang == 'system') {
+                    return null;
+                  }
+                  return switch (lang) {
+                    'zh-CN' => const Locale('zh', 'CN'),
+                    'zh-TW' => const Locale('zh', 'TW'),
+                    'en-US' => const Locale('en'),
+                    _ => null,
+                  };
+                }(),
+                supportedLocales: const [
+                  Locale('zh', 'CN'),
+                  Locale('zh', 'TW'),
+                  Locale('en'),
+                ],
+                builder: (context, widget) {
+                  ErrorWidget.builder = (details) {
+                    Log.error(
+                      "Unhandled Exception",
+                      "${details.exception}\n${details.stack}",
+                    );
+                    return Material(
+                      child: Center(child: Text(details.exception.toString())),
+                    );
+                  };
+                  if (widget != null) {
+                    var isPaddingCheckError =
+                        MediaQuery.of(context).viewPadding.top <= 0 ||
+                        MediaQuery.of(context).viewPadding.top > 200;
+
+                    if (isPaddingCheckError && Platform.isAndroid) {
+                      widget = MediaQuery(
+                        data: MediaQuery.of(context).copyWith(
+                          viewPadding: const EdgeInsets.only(
+                            top: 15,
+                            bottom: 15,
+                          ),
+                          padding: const EdgeInsets.only(top: 15, bottom: 15),
+                        ),
+                        child: widget,
+                      );
+                    }
+
+                    widget = OverlayWidget(widget);
+                    if (App.isDesktop) {
+                      widget = Shortcuts(
+                        shortcuts: {
+                          LogicalKeySet(LogicalKeyboardKey.escape):
+                              VoidCallbackIntent(App.pop),
+                        },
+                        child: MouseBackDetector(
+                          onTapDown: App.pop,
+                          child: WindowFrame(widget),
+                        ),
+                      );
+                    }
+                    return _SystemUiProvider(
+                      Material(
+                        color: App.isLinux ? Colors.transparent : null,
+                        child: widget,
+                      ),
+                    );
+                  }
+                  throw ('widget is null');
+                },
               );
             }
-            throw ('widget is null');
+            final home = appdata.settings['authorizationRequired']
+                ? AuthPage(
+                    onSuccessfulAuth: () {
+                      App.rootContext.toReplacement(() => const MainPage());
+                    },
+                  )
+                : const MainPage();
+            return MaterialApp(
+              title: "venera",
+              home: home,
+              debugShowCheckedModeBanner: false,
+              theme: getTheme(primary, secondary, tertiary, Brightness.light),
+              navigatorKey: App.rootNavigatorKey,
+              darkTheme: getTheme(
+                primary,
+                secondary,
+                tertiary,
+                Brightness.dark,
+              ),
+              themeMode: switch (appdata.settings['theme_mode']) {
+                'light' => ThemeMode.light,
+                'dark' => ThemeMode.dark,
+                _ => ThemeMode.system,
+              },
+              color: Colors.transparent,
+              localizationsDelegates: [
+                GlobalMaterialLocalizations.delegate,
+                GlobalCupertinoLocalizations.delegate,
+              ],
+              locale: () {
+                var lang = appdata.settings['language'];
+                if (lang == 'system') {
+                  return null;
+                }
+                return switch (lang) {
+                  'zh-CN' => const Locale('zh', 'CN'),
+                  'zh-TW' => const Locale('zh', 'TW'),
+                  'en-US' => const Locale('en'),
+                  _ => null,
+                };
+              }(),
+              supportedLocales: const [
+                Locale('zh', 'CN'),
+                Locale('zh', 'TW'),
+                Locale('en'),
+              ],
+              builder: (context, widget) {
+                ErrorWidget.builder = (details) {
+                  Log.error(
+                    "Unhandled Exception",
+                    "${details.exception}\n${details.stack}",
+                  );
+                  return Material(
+                    child: Center(child: Text(details.exception.toString())),
+                  );
+                };
+                if (widget != null) {
+                  /// 如果无法检测到状态栏高度设定指定高度
+                  /// https://github.com/flutter/flutter/issues/161086
+                  var isPaddingCheckError =
+                      MediaQuery.of(context).viewPadding.top <= 0 ||
+                      MediaQuery.of(context).viewPadding.top > 200;
+
+                  if (isPaddingCheckError && Platform.isAndroid) {
+                    widget = MediaQuery(
+                      data: MediaQuery.of(context).copyWith(
+                        viewPadding: const EdgeInsets.only(top: 15, bottom: 15),
+                        padding: const EdgeInsets.only(top: 15, bottom: 15),
+                      ),
+                      child: widget,
+                    );
+                  }
+
+                  widget = OverlayWidget(widget);
+                  if (App.isDesktop) {
+                    widget = Shortcuts(
+                      shortcuts: {
+                        LogicalKeySet(LogicalKeyboardKey.escape):
+                            VoidCallbackIntent(App.pop),
+                      },
+                      child: MouseBackDetector(
+                        onTapDown: App.pop,
+                        child: WindowFrame(widget),
+                      ),
+                    );
+                  }
+                  return _SystemUiProvider(
+                    Material(
+                      color: App.isLinux ? Colors.transparent : null,
+                      child: widget,
+                    ),
+                  );
+                }
+                throw ('widget is null');
+              },
+            );
           },
         );
       },
+    );
+  }
+}
+
+class _BootstrapPage extends StatelessWidget {
+  const _BootstrapPage();
+
+  String _phaseText(BootstrapPhase phase) {
+    final locale = PlatformDispatcher.instance.locale;
+    final isZh = locale.languageCode == 'zh';
+    if (isZh) {
+      return switch (phase) {
+        BootstrapPhase.idle => '正在启动',
+        BootstrapPhase.phaseA => '正在准备应用',
+        BootstrapPhase.phaseB => '正在加载本地数据',
+        BootstrapPhase.phaseC => '正在加载漫画源',
+        BootstrapPhase.ready => '准备完成',
+      };
+    }
+    return switch (phase) {
+      BootstrapPhase.idle => 'Starting',
+      BootstrapPhase.phaseA => 'Preparing app',
+      BootstrapPhase.phaseB => 'Loading local data',
+      BootstrapPhase.phaseC => 'Loading comic sources',
+      BootstrapPhase.ready => 'Ready',
+    };
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final colorScheme = Theme.of(context).colorScheme;
+    return Scaffold(
+      body: ListenableBuilder(
+        listenable: bootstrapController,
+        builder: (context, _) {
+          final phaseText = _phaseText(bootstrapController.phase);
+          return Center(
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 32),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Container(
+                    width: 92,
+                    height: 92,
+                    decoration: BoxDecoration(
+                      color: colorScheme.primaryContainer,
+                      borderRadius: BorderRadius.circular(24),
+                    ),
+                    child: Icon(
+                      Icons.auto_stories_rounded,
+                      size: 44,
+                      color: colorScheme.primary,
+                    ),
+                  ),
+                  const SizedBox(height: 24),
+                  Text("venera", style: ts.s20),
+                  const SizedBox(height: 12),
+                  Text(
+                    phaseText,
+                    style: ts.s14.copyWith(color: colorScheme.outline),
+                    textAlign: TextAlign.center,
+                  ),
+                  const SizedBox(height: 24),
+                  const SizedBox(
+                    width: 28,
+                    height: 28,
+                    child: CircularProgressIndicator(strokeWidth: 2.5),
+                  ),
+                ],
+              ),
+            ),
+          );
+        },
+      ),
     );
   }
 }

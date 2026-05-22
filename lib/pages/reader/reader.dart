@@ -21,6 +21,7 @@ import 'package:venera/components/window_frame.dart';
 import 'package:venera/foundation/app.dart';
 import 'package:venera/foundation/appdata.dart';
 import 'package:venera/foundation/cache_manager.dart';
+import 'package:venera/foundation/chapter_pages_repository.dart';
 import 'package:venera/foundation/comic_source/comic_source.dart';
 import 'package:venera/foundation/comic_details_repository.dart';
 import 'package:venera/foundation/comic_type.dart';
@@ -91,6 +92,46 @@ int? computeReaderHistoryPage({
   return (page - 2) * imagesPerPage + 2;
 }
 
+@visibleForTesting
+int? computeReaderDisplayPageForImageIndex({
+  required int imageIndex,
+  required int imageCount,
+  required int imagesPerPage,
+  required bool showSingleImageOnFirstPage,
+}) {
+  if (imageIndex < 0 || imageIndex >= imageCount || imageCount <= 0) {
+    return null;
+  }
+  if (!showSingleImageOnFirstPage || imagesPerPage == 1) {
+    return imageIndex ~/ imagesPerPage + 1;
+  }
+  if (imageIndex == 0) {
+    return 1;
+  }
+  return 2 + ((imageIndex - 1) ~/ imagesPerPage);
+}
+
+@visibleForTesting
+int? computeReaderImageStartIndexForDisplayPage({
+  required int page,
+  required int imageCount,
+  required int imagesPerPage,
+  required bool showSingleImageOnFirstPage,
+}) {
+  if (imageCount <= 0 || page <= 0) {
+    return null;
+  }
+  if (!showSingleImageOnFirstPage || imagesPerPage == 1) {
+    final index = (page - 1) * imagesPerPage;
+    return index >= imageCount ? null : index;
+  }
+  if (page == 1) {
+    return 0;
+  }
+  final index = (page - 2) * imagesPerPage + 1;
+  return index >= imageCount ? null : index;
+}
+
 class Reader extends StatefulWidget {
   const Reader({
     super.key,
@@ -136,6 +177,10 @@ class Reader extends StatefulWidget {
 class _ReaderState extends State<Reader>
     with _ReaderLocation, _ReaderWindow, _VolumeListener, _ImagePerPageHandler {
   final Set<int> _completedDownloadedChapters = {};
+  int _chapterPrefetchGeneration = 0;
+  String? _nextChapterPrefetchChapterId;
+  List<String>? _nextChapterPrefetchPages;
+  int _nextChapterPrefetchedImageCount = 0;
 
   @override
   void update() {
@@ -297,6 +342,7 @@ class _ReaderState extends State<Reader>
 
   @override
   void dispose() {
+    _resetNextChapterPrefetchState();
     _deleteReadChapterIfNeeded(chapter);
     if (isFullscreen) {
       fullscreen();
@@ -348,6 +394,7 @@ class _ReaderState extends State<Reader>
     final previousChapter = chapter;
     final changed = super.toChapter(c, toLastPage: toLastPage);
     if (changed) {
+      _resetNextChapterPrefetchState();
       _deleteReadChapterIfNeeded(previousChapter);
     }
     return changed;
@@ -432,11 +479,143 @@ class _ReaderState extends State<Reader>
       history!.ep = chapter;
     }
     history!.time = DateTime.now();
+    _maybeWarmRemainingNextChapterImages();
     _updateHistoryTimer?.cancel();
     _updateHistoryTimer = Timer(const Duration(seconds: 1), () {
       HistoryManager().addHistoryAsync(history!);
       _updateHistoryTimer = null;
     });
+  }
+
+  void onChapterImagesResolved() {
+    unawaited(_prepareNextChapterPrefetch());
+  }
+
+  void _maybeWarmRemainingNextChapterImages() {
+    if (images == null || images!.isEmpty) {
+      return;
+    }
+    final threshold = math.max(
+      1,
+      maxPage - (appdata.settings['preloadImageCount'] as int) + 1,
+    );
+    if (page >= threshold) {
+      unawaited(_prepareNextChapterPrefetch(warmRemainingImages: true));
+    }
+  }
+
+  void _resetNextChapterPrefetchState() {
+    _chapterPrefetchGeneration++;
+    _nextChapterPrefetchChapterId = null;
+    _nextChapterPrefetchPages = null;
+    _nextChapterPrefetchedImageCount = 0;
+    ImageDownloader.cancelReaderPrefetches();
+  }
+
+  String? _findNextChapterId() {
+    return widget.chapters?.ids.elementAtOrNull(chapter);
+  }
+
+  Future<void> _prepareNextChapterPrefetch({
+    bool warmRemainingImages = false,
+  }) async {
+    if (type == ComicType.local || widget.chapters == null) {
+      return;
+    }
+    final nextChapterId = _findNextChapterId();
+    if (nextChapterId == null) {
+      return;
+    }
+
+    final generation = _chapterPrefetchGeneration;
+    var pages = _nextChapterPrefetchChapterId == nextChapterId
+        ? _nextChapterPrefetchPages
+        : null;
+
+    if (pages == null) {
+      final res = await ChapterPagesRepository().load(
+        type.sourceKey,
+        cid,
+        nextChapterId,
+        onBackgroundUpdate: (updatedPages) async {
+          if (!mounted ||
+              generation != _chapterPrefetchGeneration ||
+              _findNextChapterId() != nextChapterId) {
+            return;
+          }
+          _nextChapterPrefetchChapterId = nextChapterId;
+          _nextChapterPrefetchPages = updatedPages;
+          _nextChapterPrefetchedImageCount = math.min(
+            _nextChapterPrefetchedImageCount,
+            updatedPages.length,
+          );
+          final shouldWarmRemaining =
+              page >=
+              math.max(
+                1,
+                maxPage - (appdata.settings['preloadImageCount'] as int) + 1,
+              );
+          await _warmNextChapterImages(
+            nextChapterId,
+            updatedPages,
+            generation: generation,
+            warmRemainingImages: shouldWarmRemaining,
+          );
+        },
+      );
+      if (!res.success ||
+          !mounted ||
+          generation != _chapterPrefetchGeneration ||
+          _findNextChapterId() != nextChapterId) {
+        return;
+      }
+      pages = res.data;
+      _nextChapterPrefetchChapterId = nextChapterId;
+      _nextChapterPrefetchPages = pages;
+      _nextChapterPrefetchedImageCount = 0;
+    }
+
+    await _warmNextChapterImages(
+      nextChapterId,
+      pages,
+      generation: generation,
+      warmRemainingImages: warmRemainingImages,
+    );
+  }
+
+  Future<void> _warmNextChapterImages(
+    String chapterId,
+    List<String> pages, {
+    required int generation,
+    required bool warmRemainingImages,
+  }) async {
+    if (!mounted ||
+        generation != _chapterPrefetchGeneration ||
+        _findNextChapterId() != chapterId) {
+      return;
+    }
+
+    final maxTargetCount = warmRemainingImages
+        ? pages.length
+        : math.min(8, pages.length);
+    if (maxTargetCount <= _nextChapterPrefetchedImageCount) {
+      return;
+    }
+
+    final sourceKey = type.sourceKey;
+    for (int i = _nextChapterPrefetchedImageCount; i < maxTargetCount; i++) {
+      if (!mounted ||
+          generation != _chapterPrefetchGeneration ||
+          _findNextChapterId() != chapterId) {
+        return;
+      }
+      final imageKey = pages[i];
+      if (imageKey.startsWith('file://')) {
+        continue;
+      }
+      ImageDownloader.prefetchReaderImage(imageKey, sourceKey, cid, chapterId);
+    }
+    _nextChapterPrefetchedImageCount = maxTargetCount;
   }
 
   bool get isFirstChapterOfGroup {

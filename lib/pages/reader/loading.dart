@@ -7,6 +7,8 @@ class ReaderWithLoading extends StatefulWidget {
     required this.sourceKey,
     this.initialEp,
     this.initialPage,
+    this.initialChapterGroup,
+    this.seed,
   });
 
   final String id;
@@ -17,12 +19,26 @@ class ReaderWithLoading extends StatefulWidget {
 
   final int? initialPage;
 
+  final int? initialChapterGroup;
+
+  final ReaderProps? seed;
+
   @override
   State<ReaderWithLoading> createState() => _ReaderWithLoadingState();
 }
 
 class _ReaderWithLoadingState
     extends LoadingState<ReaderWithLoading, ReaderProps> {
+  @override
+  ReaderProps? get initialData {
+    final seed = widget.seed;
+    if (seed == null) {
+      return null;
+    }
+    _logPerf('reader seed hit', seed.type.sourceKey, seed.cid);
+    return seed;
+  }
+
   @override
   Widget buildContent(BuildContext context, ReaderProps data) {
     return Reader(
@@ -33,7 +49,10 @@ class _ReaderWithLoadingState
       history: data.history,
       initialChapter: widget.initialEp ?? data.history.ep,
       initialPage: widget.initialPage ?? data.history.page,
-      initialChapterGroup: data.history.group,
+      initialChapterGroup: resolveReaderInitialChapterGroup(
+        requestedGroup: widget.initialChapterGroup,
+        historyGroup: data.history.group,
+      ),
       author: data.author,
       tags: data.tags,
     );
@@ -41,6 +60,9 @@ class _ReaderWithLoadingState
 
   @override
   Future<Res<ReaderProps>> loadData() async {
+    if (widget.seed != null) {
+      return Res(widget.seed!);
+    }
     var comicSource = ComicSource.find(widget.sourceKey);
     var history = HistoryManager().findBySourceKey(widget.id, widget.sourceKey);
     if (comicSource == null) {
@@ -64,6 +86,7 @@ class _ReaderWithLoadingState
         ),
       );
     } else {
+      _logPerf('reader seed fallback detail load', widget.sourceKey, widget.id);
       var comic = await ComicDetailsRepository().load(
         widget.sourceKey,
         widget.id,
@@ -85,6 +108,21 @@ class _ReaderWithLoadingState
       );
     }
   }
+
+  void _logPerf(String label, String sourceKey, String comicId) {
+    if (!kDebugMode) {
+      return;
+    }
+    Log.info('ReaderWithLoading', '[perf] $label $sourceKey@$comicId');
+  }
+}
+
+@visibleForTesting
+int? resolveReaderInitialChapterGroup({
+  required int? requestedGroup,
+  required int? historyGroup,
+}) {
+  return requestedGroup ?? historyGroup;
 }
 
 class ReaderProps {

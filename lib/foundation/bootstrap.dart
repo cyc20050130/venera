@@ -1,0 +1,299 @@
+import 'dart:async';
+
+import 'package:display_mode/display_mode.dart';
+import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart';
+import 'package:venera/foundation/app.dart';
+import 'package:venera/foundation/appdata.dart';
+import 'package:venera/foundation/cache_manager.dart';
+import 'package:venera/foundation/comic_source/comic_source.dart';
+import 'package:venera/foundation/js_engine.dart';
+import 'package:venera/foundation/log.dart';
+import 'package:venera/network/app_dio.dart';
+import 'package:venera/network/cookie_jar.dart';
+import 'package:venera/pages/comic_source_page.dart';
+import 'package:venera/pages/follow_updates_page.dart';
+import 'package:venera/pages/settings/settings_page.dart';
+import 'package:venera/utils/app_links.dart';
+import 'package:venera/utils/handle_text_share.dart';
+import 'package:venera/utils/opencc.dart';
+import 'package:venera/utils/tags_translation.dart';
+import 'package:venera/utils/translations.dart';
+import 'package:flutter_saf/flutter_saf.dart';
+
+enum BootstrapPhase { idle, phaseA, phaseB, phaseC, ready }
+
+final bootstrapController = BootstrapController();
+
+extension _FutureBootstrapInit<T> on Future<T> {
+  Future<void> wait() async {
+    try {
+      await this;
+    } catch (e, s) {
+      Log.error("bootstrap", "$e\n$s");
+    }
+  }
+}
+
+void logBootstrapEvent(String label) {
+  bootstrapController.logPerf(label);
+}
+
+Future<void> guardBootstrapTask(Future<void> future) async {
+  await future.wait();
+}
+
+void installFlutterErrorLogger({
+  void Function(String title, Object? message)? logError,
+}) {
+  final emit =
+      logError ??
+      (String title, Object? message) {
+        Log.error(title, message ?? 'null');
+      };
+  FlutterError.onError = (details) {
+    emit("Unhandled Exception", "${details.exception}\n${details.stack}");
+  };
+}
+
+Timer? installBootstrapStartupHooks({
+  required bool enableWindowsHeartbeat,
+  Timer? existingHeartbeatTimer,
+  Duration heartbeatInterval = const Duration(seconds: 1),
+  Future<void> Function()? sendHeartbeat,
+  void Function(String title, Object? message)? logError,
+}) {
+  installFlutterErrorLogger(logError: logError);
+  return existingHeartbeatTimer ??
+      startWindowsHeartbeat(
+        enabled: enableWindowsHeartbeat,
+        interval: heartbeatInterval,
+        sendHeartbeat: sendHeartbeat,
+      );
+}
+
+class BootstrapController extends ChangeNotifier {
+  BootstrapPhase phase = BootstrapPhase.idle;
+
+  bool phaseAReady = false;
+  bool phaseBReady = false;
+  bool comicSourceReady = false;
+  bool networkReady = false;
+
+  bool _started = false;
+  final Stopwatch _stopwatch = Stopwatch();
+  final Completer<void> _phaseBCompleter = Completer<void>();
+  final Completer<void> _readyCompleter = Completer<void>();
+
+  Future<void>? _phaseBFuture;
+  Future<void>? _phaseCFuture;
+  Timer? _windowsHeartbeatTimer;
+
+  void start() {
+    if (_started) {
+      return;
+    }
+    _started = true;
+    _prepareStartupHooks();
+    _stopwatch.start();
+    unawaited(_run());
+  }
+
+  Future<void> waitForPhaseB() async {
+    await _phaseBCompleter.future;
+  }
+
+  Future<void> waitForReady() async {
+    await _readyCompleter.future;
+  }
+
+  Future<void> _run() async {
+    phase = BootstrapPhase.phaseA;
+    notifyListeners();
+    logPerf('bootstrap start');
+
+    await App.init().wait();
+    await appdata.init().wait();
+
+    phaseAReady = true;
+    phase = BootstrapPhase.phaseB;
+    notifyListeners();
+    logPerf('phaseA ready');
+
+    _phaseBFuture = _runPhaseB();
+    await _phaseBFuture;
+
+    phaseBReady = true;
+    if (!_phaseBCompleter.isCompleted) {
+      _phaseBCompleter.complete();
+    }
+    phase = BootstrapPhase.phaseC;
+    notifyListeners();
+    logPerf('phaseB ready');
+
+    _phaseCFuture = _runPhaseC();
+    await _phaseCFuture;
+
+    phase = BootstrapPhase.ready;
+    if (!_readyCompleter.isCompleted) {
+      _readyCompleter.complete();
+    }
+    notifyListeners();
+    logPerf('bootstrap ready');
+  }
+
+  Future<void> _runPhaseB() async {
+    await SingleInstanceCookieJar.createInstance();
+    await Future.wait([
+      App.history.init().wait(),
+      App.favorites.init().wait(),
+      App.local.init().wait(),
+      AppTranslation.init().wait(),
+      TagsTranslation.readData().wait(),
+      guardBootstrapTask(OpenCC.init()),
+    ]);
+    CacheManager().setLimitSize(appdata.settings['cacheSize']);
+  }
+
+  Future<void> _runPhaseC() async {
+    await JsEngine().init().wait();
+    await ComicSourceManager().init().wait();
+    comicSourceReady = true;
+    notifyListeners();
+    logPerf('comic source ready');
+    _checkOldConfigs();
+
+    try {
+      await AppDio.ensureNetworkReady();
+      networkReady = true;
+      notifyListeners();
+      logPerf('network ready');
+    } catch (e, s) {
+      Log.error("bootstrap", "$e\n$s");
+    }
+
+    await SAFTaskWorker().init().wait();
+    _postBootstrapHooks();
+  }
+
+  void schedulePostFrameWork() {
+    unawaited(() async {
+      await waitForPhaseB();
+      await Future.delayed(const Duration(milliseconds: 800));
+      CacheManager().scheduleMaintenance();
+      await Future.delayed(const Duration(milliseconds: 1200));
+      App.local.repairAllDownloadedState();
+    }());
+    unawaited(() async {
+      await waitForReady();
+      await Future.delayed(const Duration(milliseconds: 800));
+      checkUpdates();
+    }());
+  }
+
+  void _postBootstrapHooks() {
+    if (App.isAndroid) {
+      handleLinks();
+      handleTextShare();
+      unawaited(_setHighRefreshRate());
+    }
+  }
+
+  void _prepareStartupHooks() {
+    _windowsHeartbeatTimer = installBootstrapStartupHooks(
+      enableWindowsHeartbeat: App.isWindows,
+      existingHeartbeatTimer: _windowsHeartbeatTimer,
+    );
+  }
+
+  Future<void> _setHighRefreshRate() async {
+    try {
+      await FlutterDisplayMode.setHighRefreshRate();
+    } catch (e) {
+      Log.error("Display Mode", "Failed to set high refresh rate: $e");
+    }
+  }
+
+  void logPerf(String label) {
+    if (!kDebugMode) {
+      return;
+    }
+    Log.info('Bootstrap', '[perf] $label ${_stopwatch.elapsedMilliseconds}ms');
+  }
+}
+
+Timer? startWindowsHeartbeat({
+  required bool enabled,
+  Duration interval = const Duration(seconds: 1),
+  Future<void> Function()? sendHeartbeat,
+}) {
+  if (!enabled) {
+    return null;
+  }
+  final emitHeartbeat =
+      sendHeartbeat ??
+      () async {
+        const methodChannel = MethodChannel('venera/method_channel');
+        await methodChannel.invokeMethod("heartBeat");
+      };
+  return Timer.periodic(interval, (_) {
+    unawaited(emitHeartbeat());
+  });
+}
+
+Future<void> _checkAppUpdates() async {
+  var lastCheck = appdata.implicitData['lastCheckUpdate'] ?? 0;
+  var now = DateTime.now().millisecondsSinceEpoch;
+  if (now - lastCheck < 24 * 60 * 60 * 1000) {
+    return;
+  }
+  appdata.implicitData['lastCheckUpdate'] = now;
+  appdata.writeImplicitData();
+  ComicSourcePage.checkComicSourceUpdate();
+  if (appdata.settings['checkUpdateOnStart']) {
+    await checkUpdateUi(false, true);
+  }
+}
+
+void checkUpdates() {
+  if (!AppDio.isNetworkReady) {
+    Log.error(
+      "Check Update",
+      "Skipped automatic update checks because network is unavailable. "
+              "${AppDio.networkUnavailableReason ?? ''}"
+          .trim(),
+    );
+    return;
+  }
+  _checkAppUpdates();
+  FollowUpdatesService.initChecker();
+}
+
+void _checkOldConfigs() {
+  if (appdata.settings['searchSources'] == null) {
+    appdata.settings['searchSources'] = ComicSource.all()
+        .where((e) => e.searchPageData != null)
+        .map((e) => e.key)
+        .toList();
+  }
+
+  if (appdata.implicitData['webdavAutoSync'] == null) {
+    var webdavConfig = appdata.settings['webdav'];
+    if (webdavConfig is List &&
+        webdavConfig.length == 3 &&
+        webdavConfig.whereType<String>().length == 3) {
+      appdata.implicitData['webdavAutoSync'] = true;
+    } else {
+      appdata.implicitData['webdavAutoSync'] = false;
+    }
+    appdata.writeImplicitData();
+  }
+
+  if (appdata.settings['comicSourceListUrl'].toString().contains(
+    "git.nyne.dev",
+  )) {
+    appdata.settings['comicSourceListUrl'] =
+        "https://cdn.jsdelivr.net/gh/cyc20050130/venera-configs@main/index.json";
+    appdata.saveData();
+  }
+}

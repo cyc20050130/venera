@@ -73,8 +73,7 @@ class NetworkError extends StatelessWidget {
               Row(
                 mainAxisAlignment: MainAxisAlignment.center,
                 children: [
-                  if (action != null)
-                    action!.paddingRight(8),
+                  if (action != null) action!.paddingRight(8),
                   FilledButton(
                     onPressed: retry,
                     child: Text(buttonText ?? 'Retry'.tl),
@@ -151,6 +150,8 @@ abstract class LoadingState<T extends StatefulWidget, S extends Object>
 
   FutureOr<void> onDataLoaded() {}
 
+  S? get initialData => null;
+
   Widget buildContent(BuildContext context, S data);
 
   Widget? buildFrame(BuildContext context, Widget child) => null;
@@ -191,24 +192,37 @@ abstract class LoadingState<T extends StatefulWidget, S extends Object>
   @override
   @mustCallSuper
   void initState() {
-    isLoading = true;
-    Future.microtask(() {
-      loadDataWithRetry().then((value) async {
+    final seed = initialData;
+    if (seed != null) {
+      data = seed;
+      isLoading = false;
+      Future.microtask(() async {
         if (!mounted) return;
-        if (value.success) {
-          data = value.data;
-          await onDataLoaded();
-          setState(() {
-            isLoading = false;
-          });
-        } else {
-          setState(() {
-            isLoading = false;
-            error = value.errorMessage!;
-          });
+        await onDataLoaded();
+        if (mounted) {
+          setState(() {});
         }
       });
-    });
+    } else {
+      isLoading = true;
+      Future.microtask(() {
+        loadDataWithRetry().then((value) async {
+          if (!mounted) return;
+          if (value.success) {
+            data = value.data;
+            await onDataLoaded();
+            setState(() {
+              isLoading = false;
+            });
+          } else {
+            setState(() {
+              isLoading = false;
+              error = value.errorMessage!;
+            });
+          }
+        });
+      });
+    }
     super.initState();
   }
 
