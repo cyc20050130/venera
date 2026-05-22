@@ -124,6 +124,8 @@ Widget buildComicCoverHero({required String heroTag, required Widget child}) {
   );
 }
 
+const bool comicPageReaderAllowSnapshotting = false;
+
 Widget buildComicPageCoverCard(
   BuildContext context, {
   required String? cover,
@@ -219,6 +221,9 @@ class _ComicPageState extends LoadingState<ComicPage, ComicDetails>
   bool _showDeferredRecommend = false;
   bool _favoriteRefreshDeferred = true;
   bool _hasLoggedFirstInteractiveFrame = false;
+
+  @override
+  BuildContext get pageContext => context;
 
   @override
   void invalidateFavoriteStatusRefresh() {

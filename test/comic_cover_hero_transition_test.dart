@@ -117,6 +117,10 @@ void main() {
 
     expect(route.allowSnapshotting, isFalse);
   });
+
+  test('comic page opens reader with snapshotting disabled', () {
+    expect(comicPageReaderAllowSnapshotting, isFalse);
+  });
 }
 
 const _kTransparentImageBase64 =

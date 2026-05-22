@@ -1,6 +1,8 @@
 part of 'comic_page.dart';
 
 abstract mixin class _ComicPageActions {
+  BuildContext get pageContext;
+
   void update();
 
   void invalidateFavoriteStatusRefresh();
@@ -105,7 +107,7 @@ abstract mixin class _ComicPageActions {
   ///
   /// [group] the chapter group number, start from 1
   void read([int? ep, int? page, int? group]) {
-    App.rootContext
+    pageContext
         .to(
           () => ReaderWithLoading(
             id: comic.id,
@@ -124,6 +126,7 @@ abstract mixin class _ComicPageActions {
               tags: comic.plainTags,
             ),
           ),
+          allowSnapshotting: comicPageReaderAllowSnapshotting,
         )
         .then((_) {
           onReadEnd();

@@ -11,6 +11,7 @@ class _ReaderImagesState extends State<_ReaderImages> {
   String? error;
 
   bool inProgress = false;
+  bool _loadScheduled = false;
 
   late _ReaderState reader;
 
@@ -19,6 +20,7 @@ class _ReaderImagesState extends State<_ReaderImages> {
     reader = context.reader;
     reader.isLoading = true;
     super.initState();
+    _scheduleLoadIfNeeded();
   }
 
   @override
@@ -37,6 +39,7 @@ class _ReaderImagesState extends State<_ReaderImages> {
 
   void load() async {
     if (inProgress) return;
+    _loadScheduled = false;
     inProgress = true;
     final requestChapter = reader.chapter;
     final requestChapterId = reader.widget.chapters?.ids.elementAtOrNull(
@@ -170,10 +173,34 @@ class _ReaderImagesState extends State<_ReaderImages> {
     context.readerScaffold.update();
   }
 
+  void _scheduleLoadIfNeeded() {
+    if (!reader.isLoading || inProgress || _loadScheduled) {
+      return;
+    }
+    _loadScheduled = true;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) {
+        _loadScheduled = false;
+        return;
+      }
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted) {
+          _loadScheduled = false;
+          return;
+        }
+        if (reader.isLoading && !inProgress) {
+          load();
+        } else {
+          _loadScheduled = false;
+        }
+      });
+    });
+  }
+
   @override
   Widget build(BuildContext context) {
     if (reader.isLoading) {
-      load();
+      _scheduleLoadIfNeeded();
       return const Center(child: CircularProgressIndicator());
     } else if (error != null) {
       return GestureDetector(

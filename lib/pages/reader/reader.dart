@@ -298,9 +298,16 @@ class _ReaderState extends State<Reader>
     )) {
       handleVolumeEvent();
     }
-    setImageCacheSize();
-    Future.delayed(const Duration(milliseconds: 200), () {
-      LocalFavoritesManager().onRead(cid, type);
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) {
+        return;
+      }
+      unawaited(setImageCacheSize());
+      Future.microtask(() {
+        if (mounted) {
+          LocalFavoritesManager().onRead(cid, type);
+        }
+      });
     });
     super.initState();
   }
@@ -320,7 +327,7 @@ class _ReaderState extends State<Reader>
     initReaderWindow();
   }
 
-  void setImageCacheSize() async {
+  Future<void> setImageCacheSize() async {
     var availableRAM = await MemoryInfo.getFreePhysicalMemorySize();
     if (availableRAM == null) return;
     int maxImageCacheSize;
@@ -362,6 +369,10 @@ class _ReaderState extends State<Reader>
   @override
   Widget build(BuildContext context) {
     _checkImagesPerPageChange();
+    Widget readerContent = _ReaderImages(key: Key(chapter.toString()));
+    if (!isLoading) {
+      readerContent = _ReaderGestureDetector(child: readerContent);
+    }
     return KeyboardListener(
       focusNode: focusNode,
       autofocus: true,
@@ -370,11 +381,7 @@ class _ReaderState extends State<Reader>
         initialEntries: [
           OverlayEntry(
             builder: (context) {
-              return _ReaderScaffold(
-                child: _ReaderGestureDetector(
-                  child: _ReaderImages(key: Key(chapter.toString())),
-                ),
-              );
+              return _ReaderScaffold(child: readerContent);
             },
           ),
         ],
