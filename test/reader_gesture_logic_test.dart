@@ -184,15 +184,15 @@ void main() {
     },
   );
 
-  test('edge tap suppression does not fallback into opening toolbar', () {
+  test('suppressed edge taps can fallback to toolbar opening when forced', () {
     expect(
       shouldOpenReaderToolbar(
         tapHandledByImageView: false,
         isToolbarOpen: false,
         isOnChapterCommentsPage: false,
-        isCentralToolbarTap: false,
+        isCentralToolbarTap: true,
       ),
-      isFalse,
+      isTrue,
     );
   });
 

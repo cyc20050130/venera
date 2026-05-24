@@ -258,6 +258,7 @@ class _ReaderGestureDetectorState
         Log.info('Reader', '[perf] reader tap-turn suppressed');
       }
       _previousEvent = null;
+      onTap(location, forceToolbarTap: true);
       return;
     }
     final suppressToolbarForTap =
@@ -296,8 +297,13 @@ class _ReaderGestureDetectorState
     });
   }
 
-  void onTap(Offset location, {bool suppressToolbar = false}) {
-    final isCentralToolbarTap = _getTapTurnAction(location) == null;
+  void onTap(
+    Offset location, {
+    bool suppressToolbar = false,
+    bool forceToolbarTap = false,
+  }) {
+    final isCentralToolbarTap =
+        forceToolbarTap || _getTapTurnAction(location) == null;
     final tapHandledByImageView = reader._imageViewController!.handleOnTap(
       location,
     );
