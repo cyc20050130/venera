@@ -174,6 +174,38 @@ class Reader extends StatefulWidget {
   State<Reader> createState() => _ReaderState();
 }
 
+@visibleForTesting
+Widget buildReaderOverlayHostForTest({required Widget child}) {
+  return _ReaderOverlayHost(child: child);
+}
+
+void applyReaderSystemUi({
+  required bool showStatusBar,
+  required bool controlsVisible,
+}) {
+  if (controlsVisible || showStatusBar) {
+    SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
+    return;
+  }
+  SystemChrome.setEnabledSystemUIMode(
+    SystemUiMode.manual,
+    overlays: const [SystemUiOverlay.bottom],
+  );
+}
+
+@visibleForTesting
+bool canReaderSwitchChapter({
+  required int currentChapter,
+  required int targetChapter,
+  required int maxChapter,
+  required bool isLoading,
+}) {
+  if (isLoading || targetChapter == currentChapter) {
+    return false;
+  }
+  return targetChapter >= 1 && targetChapter <= maxChapter;
+}
+
 class _ReaderState extends State<Reader>
     with _ReaderLocation, _ReaderWindow, _VolumeListener, _ImagePerPageHandler {
   final Set<int> _completedDownloadedChapters = {};
@@ -284,13 +316,14 @@ class _ReaderState extends State<Reader>
       }
     }
     history = widget.history;
-    if (!appdata.settings.getReaderSetting(
-      cid,
-      type.sourceKey,
-      'showSystemStatusBar',
-    )) {
-      SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersive);
-    }
+    applyReaderSystemUi(
+      showStatusBar: appdata.settings.getReaderSetting(
+        cid,
+        type.sourceKey,
+        'showSystemStatusBar',
+      ),
+      controlsVisible: false,
+    );
     if (appdata.settings.getReaderSetting(
       cid,
       type.sourceKey,
@@ -377,15 +410,7 @@ class _ReaderState extends State<Reader>
       focusNode: focusNode,
       autofocus: true,
       onKeyEvent: onKeyEvent,
-      child: Overlay(
-        initialEntries: [
-          OverlayEntry(
-            builder: (context) {
-              return _ReaderScaffold(child: readerContent);
-            },
-          ),
-        ],
-      ),
+      child: _ReaderOverlayHost(child: _ReaderScaffold(child: readerContent)),
     );
   }
 
@@ -398,13 +423,30 @@ class _ReaderState extends State<Reader>
 
   @override
   bool toChapter(int c, {bool toLastPage = false}) {
-    final previousChapter = chapter;
-    final changed = super.toChapter(c, toLastPage: toLastPage);
-    if (changed) {
-      _resetNextChapterPrefetchState();
-      _deleteReadChapterIfNeeded(previousChapter);
+    if (!canReaderSwitchChapter(
+      currentChapter: chapter,
+      targetChapter: c,
+      maxChapter: maxChapter,
+      isLoading: isLoading,
+    )) {
+      return false;
     }
-    return changed;
+    final previousChapter = chapter;
+    _resetNextChapterPrefetchState();
+    _deleteReadChapterIfNeeded(previousChapter);
+    _updateHistoryTimer?.cancel();
+    _updateHistoryTimer = null;
+    ImageDownloader.cancelAllLoadingImages();
+    ComicImage.clear();
+    setState(() {
+      images = null;
+      isLoading = true;
+      _imageViewController = null;
+      chapter = c;
+      _page = 1;
+      _jumpToLastPageOnLoad = toLastPage;
+    });
+    return true;
   }
 
   void _deleteReadChapterIfNeeded(int chapterNumber) {
@@ -664,6 +706,32 @@ class _ReaderState extends State<Reader>
   Size get size {
     var renderBox = context.findRenderObject() as RenderBox;
     return renderBox.size;
+  }
+}
+
+class _ReaderOverlayHost extends StatefulWidget {
+  const _ReaderOverlayHost({required this.child});
+
+  final Widget child;
+
+  @override
+  State<_ReaderOverlayHost> createState() => _ReaderOverlayHostState();
+}
+
+class _ReaderOverlayHostState extends State<_ReaderOverlayHost> {
+  late final OverlayEntry _entry = OverlayEntry(
+    builder: (context) => widget.child,
+  );
+
+  @override
+  void didUpdateWidget(covariant _ReaderOverlayHost oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    _entry.markNeedsBuild();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Overlay(initialEntries: [_entry]);
   }
 }
 

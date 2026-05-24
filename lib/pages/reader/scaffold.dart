@@ -118,17 +118,13 @@ class _ReaderScaffoldState extends State<_ReaderScaffold> {
   }
 
   void openOrClose() {
-    if (!_isOpen) {
-      SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
-    } else {
-      if (!appdata.settings['showSystemStatusBar']) {
-        SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersive);
-      } else {
-        SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
-      }
-    }
+    final nextOpen = !_isOpen;
+    applyReaderSystemUi(
+      showStatusBar: appdata.settings['showSystemStatusBar'],
+      controlsVisible: nextOpen,
+    );
     setState(() {
-      _isOpen = !_isOpen;
+      _isOpen = nextOpen;
     });
   }
 
@@ -759,6 +755,16 @@ class _ReaderScaffoldState extends State<_ReaderScaffold> {
           }
           if (key == "quickCollectImage") {
             addDragListener();
+          }
+          if (key == "showSystemStatusBar") {
+            applyReaderSystemUi(
+              showStatusBar: appdata.settings.getReaderSetting(
+                context.reader.cid,
+                context.reader.type.sourceKey,
+                key,
+              ),
+              controlsVisible: isOpen,
+            );
           }
           if (key == "showChapterComments" ||
               key == "showChapterCommentsAtEnd") {

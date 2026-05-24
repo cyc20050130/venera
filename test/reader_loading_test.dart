@@ -10,6 +10,54 @@ void main() {
     ReaderWithLoading.debugReaderBuilder = null;
   });
 
+  test('canReaderSwitchChapter ignores same chapter and invalid targets', () {
+    expect(
+      canReaderSwitchChapter(
+        currentChapter: 3,
+        targetChapter: 3,
+        maxChapter: 5,
+        isLoading: false,
+      ),
+      isFalse,
+    );
+    expect(
+      canReaderSwitchChapter(
+        currentChapter: 3,
+        targetChapter: 0,
+        maxChapter: 5,
+        isLoading: false,
+      ),
+      isFalse,
+    );
+    expect(
+      canReaderSwitchChapter(
+        currentChapter: 3,
+        targetChapter: 6,
+        maxChapter: 5,
+        isLoading: false,
+      ),
+      isFalse,
+    );
+    expect(
+      canReaderSwitchChapter(
+        currentChapter: 3,
+        targetChapter: 4,
+        maxChapter: 5,
+        isLoading: true,
+      ),
+      isFalse,
+    );
+    expect(
+      canReaderSwitchChapter(
+        currentChapter: 3,
+        targetChapter: 4,
+        maxChapter: 5,
+        isLoading: false,
+      ),
+      isTrue,
+    );
+  });
+
   test(
     'requested chapter group overrides history group when opening reader',
     () {
@@ -84,4 +132,53 @@ void main() {
 
     expect(find.text('reader-ready'), findsOneWidget);
   });
+
+  testWidgets('reader overlay host rebuilds child when chapter shell changes', (
+    tester,
+  ) async {
+    await tester.pumpWidget(const MaterialApp(home: _OverlayHostProbe()));
+
+    expect(find.text('chapter-1'), findsOneWidget);
+    expect(find.text('chapter-2'), findsNothing);
+
+    await tester.tap(find.text('next'));
+    await tester.pump();
+
+    expect(find.text('chapter-1'), findsNothing);
+    expect(find.text('chapter-2'), findsOneWidget);
+  });
+}
+
+class _OverlayHostProbe extends StatefulWidget {
+  const _OverlayHostProbe();
+
+  @override
+  State<_OverlayHostProbe> createState() => _OverlayHostProbeState();
+}
+
+class _OverlayHostProbeState extends State<_OverlayHostProbe> {
+  int chapter = 1;
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      children: [
+        TextButton(
+          onPressed: () {
+            setState(() {
+              chapter++;
+            });
+          },
+          child: const Text('next'),
+        ),
+        Expanded(
+          child: buildReaderOverlayHostForTest(
+            child: Center(
+              child: Text('chapter-$chapter', textDirection: TextDirection.ltr),
+            ),
+          ),
+        ),
+      ],
+    );
+  }
 }
