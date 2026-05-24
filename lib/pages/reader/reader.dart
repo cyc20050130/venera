@@ -179,20 +179,6 @@ Widget buildReaderOverlayHostForTest({required Widget child}) {
   return _ReaderOverlayHost(child: child);
 }
 
-void applyReaderSystemUi({
-  required bool showStatusBar,
-  required bool controlsVisible,
-}) {
-  if (controlsVisible || showStatusBar) {
-    SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
-    return;
-  }
-  SystemChrome.setEnabledSystemUIMode(
-    SystemUiMode.manual,
-    overlays: const [SystemUiOverlay.bottom],
-  );
-}
-
 @visibleForTesting
 bool canReaderSwitchChapter({
   required int currentChapter,
@@ -316,14 +302,15 @@ class _ReaderState extends State<Reader>
       }
     }
     history = widget.history;
-    applyReaderSystemUi(
-      showStatusBar: appdata.settings.getReaderSetting(
-        cid,
-        type.sourceKey,
-        'showSystemStatusBar',
-      ),
-      controlsVisible: false,
-    );
+    if (!appdata.settings.getReaderSetting(
+      cid,
+      type.sourceKey,
+      'showSystemStatusBar',
+    )) {
+      SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersive);
+    } else {
+      SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
+    }
     if (appdata.settings.getReaderSetting(
       cid,
       type.sourceKey,

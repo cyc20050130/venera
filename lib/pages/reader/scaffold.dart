@@ -119,10 +119,11 @@ class _ReaderScaffoldState extends State<_ReaderScaffold> {
 
   void openOrClose() {
     final nextOpen = !_isOpen;
-    applyReaderSystemUi(
-      showStatusBar: appdata.settings['showSystemStatusBar'],
-      controlsVisible: nextOpen,
-    );
+    if (nextOpen || appdata.settings['showSystemStatusBar']) {
+      SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
+    } else {
+      SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersive);
+    }
     setState(() {
       _isOpen = nextOpen;
     });
@@ -757,14 +758,16 @@ class _ReaderScaffoldState extends State<_ReaderScaffold> {
             addDragListener();
           }
           if (key == "showSystemStatusBar") {
-            applyReaderSystemUi(
-              showStatusBar: appdata.settings.getReaderSetting(
-                context.reader.cid,
-                context.reader.type.sourceKey,
-                key,
-              ),
-              controlsVisible: isOpen,
+            final showStatusBar = appdata.settings.getReaderSetting(
+              context.reader.cid,
+              context.reader.type.sourceKey,
+              key,
             );
+            if (isOpen || showStatusBar) {
+              SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
+            } else {
+              SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersive);
+            }
           }
           if (key == "showChapterComments" ||
               key == "showChapterCommentsAtEnd") {
