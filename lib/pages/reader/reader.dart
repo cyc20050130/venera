@@ -391,10 +391,9 @@ class _ReaderState extends State<Reader>
   @override
   Widget build(BuildContext context) {
     _checkImagesPerPageChange();
-    Widget readerContent = _ReaderImages(key: Key(chapter.toString()));
-    if (!isLoading) {
-      readerContent = _ReaderGestureDetector(child: readerContent);
-    }
+    Widget readerContent = _ReaderGestureDetector(
+      child: _ReaderImages(key: Key(chapter.toString())),
+    );
     return KeyboardListener(
       focusNode: focusNode,
       autofocus: true,

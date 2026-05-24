@@ -235,6 +235,11 @@ class _ReaderGestureDetectorState
       return;
     }
     final location = event.globalPosition;
+    if (reader.isLoading || reader._imageViewController == null) {
+      _previousEvent = null;
+      onTap(location);
+      return;
+    }
     final tapTurnAction = context.readerScaffold.isOpen
         ? null
         : _getTapTurnAction(location);
@@ -276,7 +281,8 @@ class _ReaderGestureDetectorState
 
   void onTap(Offset location, {bool suppressToolbar = false}) {
     final shouldOpenToolbar = shouldOpenReaderToolbar(
-      tapHandledByImageView: reader._imageViewController!.handleOnTap(location),
+      tapHandledByImageView:
+          reader._imageViewController?.handleOnTap(location) ?? false,
       isToolbarOpen: context.readerScaffold.isOpen,
       isOnChapterCommentsPage: reader.isOnChapterCommentsPage,
       suppressToolbarFromTapUp: suppressToolbar,
