@@ -123,16 +123,8 @@ void main() {
   test('toolbar suppression only applies before the deadline', () {
     final now = DateTime(2026, 5, 17, 12, 0, 0);
     expect(shouldSuppressReaderToolbarTap(null, now: now), isFalse);
-    expect(shouldSuppressReaderTapTurn(null, now: now), isFalse);
     expect(
       shouldSuppressReaderToolbarTap(
-        now.add(const Duration(milliseconds: 1)),
-        now: now,
-      ),
-      isTrue,
-    );
-    expect(
-      shouldSuppressReaderTapTurn(
         now.add(const Duration(milliseconds: 1)),
         now: now,
       ),
@@ -164,35 +156,6 @@ void main() {
         suppressToolbarNow: false,
       ),
       isFalse,
-    );
-  });
-
-  test(
-    'center taps can still open toolbar when only tap-turn suppression exists',
-    () {
-      expect(
-        shouldOpenReaderToolbar(
-          tapHandledByImageView: false,
-          isToolbarOpen: false,
-          isOnChapterCommentsPage: false,
-          suppressToolbarFromTapUp: false,
-          suppressToolbarNow: false,
-          isCentralToolbarTap: true,
-        ),
-        isTrue,
-      );
-    },
-  );
-
-  test('suppressed edge taps can fallback to toolbar opening when forced', () {
-    expect(
-      shouldOpenReaderToolbar(
-        tapHandledByImageView: false,
-        isToolbarOpen: false,
-        isOnChapterCommentsPage: false,
-        isCentralToolbarTap: true,
-      ),
-      isTrue,
     );
   });
 

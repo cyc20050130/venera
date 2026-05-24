@@ -881,9 +881,26 @@ class _ContinuousModeState extends State<_ContinuousMode>
 
   int get preCacheCount => appdata.settings["preloadImageCount"];
 
-  bool isActivelyScrolling = false;
+  /// Whether the user was scrolling the page.
+  /// The gesture detector has a delay to detect tap event.
+  /// To handle the tap event, we need to know if the user was scrolling before the delay.
+  bool delayedIsScrolling = false;
+
+  Timer? delayedSetIsScrollingTimer;
 
   var imageStates = <State<ComicImage>>{};
+
+  void delayedSetIsScrolling(bool value) {
+    delayedSetIsScrollingTimer?.cancel();
+    if (value) {
+      delayedIsScrolling = true;
+      return;
+    }
+    delayedSetIsScrollingTimer = Timer(
+      kReaderToolbarTapSuppressAfterScrollEnd,
+      () => delayedIsScrolling = false,
+    );
+  }
 
   bool prepareToPrevChapter = false;
   bool prepareToNextChapter = false;
@@ -909,6 +926,7 @@ class _ContinuousModeState extends State<_ContinuousMode>
   @override
   void dispose() {
     itemPositionsListener.itemPositions.removeListener(onPositionChanged);
+    delayedSetIsScrollingTimer?.cancel();
     super.dispose();
   }
 
@@ -1175,14 +1193,14 @@ class _ContinuousModeState extends State<_ContinuousMode>
       onNotification: (notification) {
         if (notification is ScrollStartNotification) {
           context.readerScaffold._gestureDetectorState
-              ?.registerTapTurnSuppression();
-          isActivelyScrolling = true;
+              ?.registerRecentInteraction();
+          delayedSetIsScrolling(true);
         } else if (notification is ScrollEndNotification) {
           context.readerScaffold._gestureDetectorState
-              ?.registerTapTurnSuppression(
+              ?.registerRecentInteraction(
                 kReaderToolbarTapSuppressAfterScrollEnd,
               );
-          isActivelyScrolling = false;
+          delayedSetIsScrolling(false);
         }
 
         var scale = photoViewController.scale ?? 1.0;
@@ -1301,7 +1319,7 @@ class _ContinuousModeState extends State<_ContinuousMode>
 
   @override
   void handleLongPressDown(Offset location) {
-    if (!appdata.settings['enableLongPressToZoom'] || isActivelyScrolling) {
+    if (!appdata.settings['enableLongPressToZoom'] || delayedIsScrolling) {
       return;
     }
     double target = photoViewController.getInitialScale!.call()! * 1.75;
@@ -1389,7 +1407,7 @@ class _ContinuousModeState extends State<_ContinuousMode>
 
   @override
   bool handleOnTap(Offset location) {
-    if (isActivelyScrolling) {
+    if (delayedIsScrolling) {
       return true;
     }
     return false;

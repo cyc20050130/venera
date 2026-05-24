@@ -82,17 +82,12 @@ bool shouldSuppressReaderToolbarTap(
   return suppressedUntil.isAfter(currentTime);
 }
 
-bool shouldSuppressReaderTapTurn(DateTime? suppressedUntil, {DateTime? now}) {
-  return shouldSuppressReaderToolbarTap(suppressedUntil, now: now);
-}
-
 bool shouldOpenReaderToolbar({
   required bool tapHandledByImageView,
   required bool isToolbarOpen,
   required bool isOnChapterCommentsPage,
   bool suppressToolbarFromTapUp = false,
   bool suppressToolbarNow = false,
-  bool isCentralToolbarTap = true,
 }) {
   if (tapHandledByImageView) {
     return false;
@@ -101,9 +96,6 @@ bool shouldOpenReaderToolbar({
     return true;
   }
   if (isOnChapterCommentsPage) {
-    return false;
-  }
-  if (!isCentralToolbarTap) {
     return false;
   }
   if (suppressToolbarFromTapUp || suppressToolbarNow) {
