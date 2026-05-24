@@ -1197,7 +1197,7 @@ class _ContinuousModeState extends State<_ContinuousMode>
           delayedSetIsScrolling(true);
         } else if (notification is ScrollEndNotification) {
           context.readerScaffold._gestureDetectorState
-              ?.registerRecentInteraction(
+              ?.registerTapTurnSuppression(
                 kReaderToolbarTapSuppressAfterScrollEnd,
               );
           delayedSetIsScrolling(false);
@@ -1441,15 +1441,27 @@ class _ContinuousModeState extends State<_ContinuousMode>
 ImageProvider _createImageProviderFromKey(
   String imageKey,
   BuildContext context,
-  int page,
-) {
+  int page, {
+  ReaderImageLoadPriority loadPriority =
+      ReaderImageLoadPriority.foregroundVisible,
+}) {
   var reader = context.reader;
+  if (!imageKey.startsWith('file://') &&
+      loadPriority == ReaderImageLoadPriority.foregroundVisible) {
+    ImageDownloader.markReaderImageVisible(
+      imageKey,
+      reader.type.comicSource?.key,
+      reader.cid,
+      reader.eid,
+    );
+  }
   return ReaderImageProvider(
     imageKey,
     reader.type.comicSource?.key,
     reader.cid,
     reader.eid,
     reader.page,
+    loadPriority: loadPriority,
     enableResize: reader
         .mode
         .isContinuous, // For continuous mode, we need to resize the image to improve performance
@@ -1475,9 +1487,23 @@ void _precacheImage(int page, BuildContext context) {
     var cid = reader.cid;
     var eid = reader.eid;
     var sourceKey = reader.type.comicSource?.key;
-    ImageDownloader.markReaderImagePrefetch(imageKey, sourceKey, cid, eid);
+    ImageDownloader.markReaderImagePrefetch(
+      imageKey,
+      sourceKey,
+      cid,
+      eid,
+      priority: ReaderImageLoadPriority.sameChapterPrefetch,
+    );
   }
-  precacheImage(_createImageProvider(page, context), context);
+  precacheImage(
+    _createImageProviderFromKey(
+      imageKey,
+      context,
+      page,
+      loadPriority: ReaderImageLoadPriority.sameChapterPrefetch,
+    ),
+    context,
+  );
 }
 
 /// [_preDownloadImage] is used to download the image for the given page.
@@ -1494,7 +1520,13 @@ void _preDownloadImage(int page, BuildContext context) {
   var cid = reader.cid;
   var eid = reader.eid;
   var sourceKey = reader.type.comicSource?.key;
-  ImageDownloader.prefetchReaderImage(imageKey, sourceKey, cid, eid);
+  ImageDownloader.prefetchReaderImage(
+    imageKey,
+    sourceKey,
+    cid,
+    eid,
+    priority: ReaderImageLoadPriority.sameChapterPrefetch,
+  );
 }
 
 class _SwipeChangeChapterProgress extends StatefulWidget {

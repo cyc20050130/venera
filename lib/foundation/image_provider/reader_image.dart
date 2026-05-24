@@ -12,7 +12,15 @@ import 'package:venera/foundation/appdata.dart';
 class ReaderImageProvider
     extends BaseImageProvider<image_provider.ReaderImageProvider> {
   /// Image provider for normal image.
-  const ReaderImageProvider(this.imageKey, this.sourceKey, this.cid, this.eid, this.page, {this.enableResize = false});
+  const ReaderImageProvider(
+    this.imageKey,
+    this.sourceKey,
+    this.cid,
+    this.eid,
+    this.page, {
+    this.enableResize = false,
+    this.loadPriority = ReaderImageLoadPriority.foregroundVisible,
+  });
 
   final String imageKey;
 
@@ -27,6 +35,8 @@ class ReaderImageProvider
   @override
   final bool enableResize;
 
+  final ReaderImageLoadPriority loadPriority;
+
   @override
   Future<Uint8List> load(chunkEvents, checkStop) async {
     Uint8List? imageBytes;
@@ -38,13 +48,21 @@ class ReaderImageProvider
         throw "Error: File not found.";
       }
     } else {
-      await for (var event
-        in ImageDownloader.loadComicImage(imageKey, sourceKey, cid, eid)) {
+      await for (var event in ImageDownloader.loadComicImage(
+        imageKey,
+        sourceKey,
+        cid,
+        eid,
+        cacheStrategy: ComicImageCacheStrategy.cacheHitIsTerminal,
+        priority: loadPriority,
+      )) {
         checkStop();
-        chunkEvents.add(ImageChunkEvent(
-          cumulativeBytesLoaded: event.currentBytes,
-          expectedTotalBytes: event.totalBytes,
-        ));
+        chunkEvents.add(
+          ImageChunkEvent(
+            cumulativeBytesLoaded: event.currentBytes,
+            expectedTotalBytes: event.totalBytes,
+          ),
+        );
         if (event.imageBytes != null) {
           imageBytes = event.imageBytes;
           break;
@@ -98,8 +116,7 @@ class ReaderImageProvider
               while (futureImage == null) {
                 try {
                   checkStop();
-                }
-                catch(e) {
+                } catch (e) {
                   onCancel([]);
                   rethrow;
                 }

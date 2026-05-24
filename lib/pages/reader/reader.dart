@@ -199,6 +199,8 @@ class _ReaderState extends State<Reader>
   String? _nextChapterPrefetchChapterId;
   List<String>? _nextChapterPrefetchPages;
   int _nextChapterPrefetchedImageCount = 0;
+  bool _nextChapterPrefetchRetryScheduled = false;
+  bool _nextChapterPrefetchRetryWarmRemainingImages = false;
 
   @override
   void update() {
@@ -545,6 +547,8 @@ class _ReaderState extends State<Reader>
     _nextChapterPrefetchChapterId = null;
     _nextChapterPrefetchPages = null;
     _nextChapterPrefetchedImageCount = 0;
+    _nextChapterPrefetchRetryScheduled = false;
+    _nextChapterPrefetchRetryWarmRemainingImages = false;
     ImageDownloader.cancelReaderPrefetches();
   }
 
@@ -560,6 +564,16 @@ class _ReaderState extends State<Reader>
     }
     final nextChapterId = _findNextChapterId();
     if (nextChapterId == null) {
+      return;
+    }
+
+    if (ImageDownloader.hasQueuedOrActiveReaderLoad(
+      ReaderImageLoadPriority.sameChapterPrefetch,
+    )) {
+      _logReaderPerf('reader next chapter prefetch deferred');
+      _scheduleDeferredNextChapterPrefetchRetry(
+        warmRemainingImages: warmRemainingImages,
+      );
       return;
     }
 
@@ -605,6 +619,8 @@ class _ReaderState extends State<Reader>
           _findNextChapterId() != nextChapterId) {
         return;
       }
+      _nextChapterPrefetchRetryScheduled = false;
+      _nextChapterPrefetchRetryWarmRemainingImages = false;
       pages = res.data;
       _nextChapterPrefetchChapterId = nextChapterId;
       _nextChapterPrefetchPages = pages;
@@ -649,9 +665,45 @@ class _ReaderState extends State<Reader>
       if (imageKey.startsWith('file://')) {
         continue;
       }
-      ImageDownloader.prefetchReaderImage(imageKey, sourceKey, cid, chapterId);
+      ImageDownloader.prefetchReaderImage(
+        imageKey,
+        sourceKey,
+        cid,
+        chapterId,
+        priority: ReaderImageLoadPriority.nextChapterPrefetch,
+      );
     }
     _nextChapterPrefetchedImageCount = maxTargetCount;
+  }
+
+  void _scheduleDeferredNextChapterPrefetchRetry({
+    required bool warmRemainingImages,
+  }) {
+    _nextChapterPrefetchRetryWarmRemainingImages =
+        _nextChapterPrefetchRetryWarmRemainingImages || warmRemainingImages;
+    if (_nextChapterPrefetchRetryScheduled) {
+      return;
+    }
+    _nextChapterPrefetchRetryScheduled = true;
+    final generation = _chapterPrefetchGeneration;
+    Future.delayed(const Duration(milliseconds: 200), () {
+      final shouldWarmRemaining = _nextChapterPrefetchRetryWarmRemainingImages;
+      _nextChapterPrefetchRetryScheduled = false;
+      _nextChapterPrefetchRetryWarmRemainingImages = false;
+      if (!mounted || generation != _chapterPrefetchGeneration) {
+        return;
+      }
+      unawaited(
+        _prepareNextChapterPrefetch(warmRemainingImages: shouldWarmRemaining),
+      );
+    });
+  }
+
+  void _logReaderPerf(String label) {
+    if (!kDebugMode) {
+      return;
+    }
+    Log.info('Reader', '[perf] $label ${type.sourceKey}@$cid#$eid');
   }
 
   bool get isFirstChapterOfGroup {

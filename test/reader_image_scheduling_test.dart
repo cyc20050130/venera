@@ -164,6 +164,7 @@ void main() {
         'source',
         'cid',
         'eid',
+        priority: ReaderImageLoadPriority.sameChapterPrefetch,
       ).listen((_) {});
       await Future<void>.delayed(const Duration(milliseconds: 120));
 
@@ -329,4 +330,235 @@ void main() {
     );
     expect(starts, ['prefetch']);
   });
+
+  test(
+    'same-chapter prefetch cancels active next-chapter prefetch before starting',
+    () async {
+      final starts = <String>[];
+      final nextChapterCancelled = Completer<void>();
+      StreamController<ImageDownloadProgress>? nextChapterController;
+
+      ImageDownloader.debugReaderImageLoader =
+          (
+            String imageKey,
+            String? sourceKey,
+            String cid,
+            String eid, {
+            bool useCache = true,
+          }) {
+            starts.add(imageKey);
+            if (imageKey == 'next-chapter') {
+              nextChapterController = StreamController<ImageDownloadProgress>(
+                onCancel: () async {
+                  if (!nextChapterCancelled.isCompleted) {
+                    nextChapterCancelled.complete();
+                  }
+                  await nextChapterController?.close();
+                },
+              );
+              return nextChapterController!.stream;
+            }
+            return Stream<ImageDownloadProgress>.fromIterable([
+              const ImageDownloadProgress(
+                currentBytes: 1,
+                totalBytes: 1,
+                imageBytes: null,
+              ),
+              ImageDownloadProgress(
+                currentBytes: 1,
+                totalBytes: 1,
+                imageBytes: Uint8List.fromList([1]),
+              ),
+            ]);
+          };
+
+      ImageDownloader.prefetchReaderImage(
+        'next-chapter',
+        'source',
+        'cid',
+        'eid',
+        priority: ReaderImageLoadPriority.nextChapterPrefetch,
+      );
+      await Future<void>.delayed(const Duration(milliseconds: 80));
+
+      ImageDownloader.prefetchReaderImage(
+        'same-chapter',
+        'source',
+        'cid',
+        'eid',
+        priority: ReaderImageLoadPriority.sameChapterPrefetch,
+      );
+
+      await expectLater(
+        nextChapterCancelled.future.timeout(const Duration(seconds: 1)),
+        completes,
+      );
+      await Future<void>.delayed(const Duration(milliseconds: 80));
+
+      expect(starts, ['next-chapter', 'same-chapter']);
+    },
+  );
+
+  test(
+    'foreground promotion keeps an active load from later prefetch cancellation',
+    () async {
+      final targetCancelled = Completer<void>();
+      final starts = <String>[];
+      StreamController<ImageDownloadProgress>? targetController;
+
+      ImageDownloader.debugReaderImageLoader =
+          (
+            String imageKey,
+            String? sourceKey,
+            String cid,
+            String eid, {
+            bool useCache = true,
+          }) {
+            starts.add(imageKey);
+            if (imageKey == 'target') {
+              targetController = StreamController<ImageDownloadProgress>(
+                onCancel: () async {
+                  if (!targetCancelled.isCompleted) {
+                    targetCancelled.complete();
+                  }
+                  await targetController?.close();
+                },
+              );
+              return targetController!.stream;
+            }
+            return Stream<ImageDownloadProgress>.fromIterable([
+              const ImageDownloadProgress(
+                currentBytes: 1,
+                totalBytes: 1,
+                imageBytes: null,
+              ),
+              ImageDownloadProgress(
+                currentBytes: 1,
+                totalBytes: 1,
+                imageBytes: Uint8List.fromList([1]),
+              ),
+            ]);
+          };
+
+      final prefetch = ImageDownloader.loadComicImage(
+        'target',
+        'source',
+        'cid',
+        'eid',
+        priority: ReaderImageLoadPriority.sameChapterPrefetch,
+      ).listen((_) {});
+      await Future<void>.delayed(const Duration(milliseconds: 40));
+
+      final visible = ImageDownloader.loadComicImage(
+        'target',
+        'source',
+        'cid',
+        'eid',
+      ).listen((_) {});
+      await Future<void>.delayed(const Duration(milliseconds: 40));
+
+      final otherVisible = ImageDownloader.loadComicImage(
+        'other-visible',
+        'source',
+        'cid',
+        'eid',
+      ).listen((_) {});
+      await Future<void>.delayed(const Duration(milliseconds: 80));
+
+      expect(starts, ['target', 'other-visible']);
+      expect(targetCancelled.isCompleted, isFalse);
+
+      await Future.wait([
+        prefetch.cancel(),
+        visible.cancel(),
+        otherVisible.cancel(),
+      ]);
+    },
+  );
+
+  test(
+    'foreground request cancels upstream once last listener leaves',
+    () async {
+      final cancelled = Completer<void>();
+      StreamController<ImageDownloadProgress>? controller;
+
+      ImageDownloader.debugReaderImageLoader =
+          (
+            String imageKey,
+            String? sourceKey,
+            String cid,
+            String eid, {
+            bool useCache = true,
+          }) {
+            controller = StreamController<ImageDownloadProgress>(
+              onCancel: () async {
+                if (!cancelled.isCompleted) {
+                  cancelled.complete();
+                }
+                await controller?.close();
+              },
+            );
+            return controller!.stream;
+          };
+
+      final sub = ImageDownloader.loadComicImage(
+        'visible',
+        'source',
+        'cid',
+        'eid',
+      ).listen((_) {});
+      await Future<void>.delayed(const Duration(milliseconds: 40));
+      await sub.cancel();
+
+      await expectLater(
+        cancelled.future.timeout(const Duration(seconds: 1)),
+        completes,
+      );
+    },
+  );
+
+  test(
+    'same-key request after foreground cancellation creates a fresh stream',
+    () async {
+      final starts = <String>[];
+      StreamController<ImageDownloadProgress>? controller;
+
+      ImageDownloader.debugReaderImageLoader =
+          (
+            String imageKey,
+            String? sourceKey,
+            String cid,
+            String eid, {
+            bool useCache = true,
+          }) {
+            starts.add(imageKey);
+            controller = StreamController<ImageDownloadProgress>(
+              onCancel: () async {
+                await controller?.close();
+              },
+            );
+            return controller!.stream;
+          };
+
+      final first = ImageDownloader.loadComicImage(
+        'visible',
+        'source',
+        'cid',
+        'eid',
+      ).listen((_) {});
+      await Future<void>.delayed(const Duration(milliseconds: 40));
+      await first.cancel();
+
+      final second = ImageDownloader.loadComicImage(
+        'visible',
+        'source',
+        'cid',
+        'eid',
+      ).listen((_) {});
+      await Future<void>.delayed(const Duration(milliseconds: 40));
+
+      expect(starts, ['visible', 'visible']);
+      await second.cancel();
+    },
+  );
 }

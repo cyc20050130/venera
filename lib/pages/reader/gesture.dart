@@ -167,6 +167,8 @@ class _ReaderGestureDetectorState
 
   Offset? _lastTapMoveDistance;
 
+  DateTime? _tapTurnSuppressedUntil;
+
   DateTime? _toolbarTapSuppressedUntil;
 
   bool _longPressInProgress = false;
@@ -183,15 +185,28 @@ class _ReaderGestureDetectorState
     return shouldSuppressReaderToolbarTap(_toolbarTapSuppressedUntil);
   }
 
+  bool get _shouldSuppressTapTurn {
+    return shouldSuppressReaderTapTurn(_tapTurnSuppressedUntil);
+  }
+
   void registerRecentInteraction([
     Duration duration = kReaderToolbarTapSuppressDuration,
   ]) {
     _previousEvent = null;
-    _toolbarTapSuppressedUntil = DateTime.now().add(duration);
+    final until = DateTime.now().add(duration);
+    _tapTurnSuppressedUntil = until;
+    _toolbarTapSuppressedUntil = until;
+  }
+
+  void registerTapTurnSuppression([
+    Duration duration = kReaderToolbarTapSuppressDuration,
+  ]) {
+    _previousEvent = null;
+    _tapTurnSuppressedUntil = DateTime.now().add(duration);
   }
 
   void registerNavigationInteraction() {
-    registerRecentInteraction(kReaderToolbarTapSuppressAfterNavigation);
+    registerTapTurnSuppression(kReaderToolbarTapSuppressAfterNavigation);
   }
 
   ReaderTapNavigationAction? _getTapTurnAction(Offset location) {
@@ -238,6 +253,13 @@ class _ReaderGestureDetectorState
     final tapTurnAction = context.readerScaffold.isOpen
         ? null
         : _getTapTurnAction(location);
+    if (tapTurnAction != null && _shouldSuppressTapTurn) {
+      if (kDebugMode) {
+        Log.info('Reader', '[perf] reader tap-turn suppressed');
+      }
+      _previousEvent = null;
+      return;
+    }
     final suppressToolbarForTap =
         !context.readerScaffold.isOpen && _shouldSuppressToolbarTap;
     if (tapTurnAction != null) {
@@ -275,15 +297,31 @@ class _ReaderGestureDetectorState
   }
 
   void onTap(Offset location, {bool suppressToolbar = false}) {
+    final isCentralToolbarTap = _getTapTurnAction(location) == null;
+    final tapHandledByImageView = reader._imageViewController!.handleOnTap(
+      location,
+    );
     final shouldOpenToolbar = shouldOpenReaderToolbar(
-      tapHandledByImageView: reader._imageViewController!.handleOnTap(location),
+      tapHandledByImageView: tapHandledByImageView,
       isToolbarOpen: context.readerScaffold.isOpen,
       isOnChapterCommentsPage: reader.isOnChapterCommentsPage,
       suppressToolbarFromTapUp: suppressToolbar,
       suppressToolbarNow: _shouldSuppressToolbarTap,
+      isCentralToolbarTap: isCentralToolbarTap,
     );
     if (shouldOpenToolbar) {
+      if (kDebugMode) {
+        Log.info('Reader', '[perf] reader toolbar tap accepted');
+      }
       context.readerScaffold.openOrClose();
+    } else if (kDebugMode) {
+      if (!isCentralToolbarTap ||
+          suppressToolbar ||
+          _shouldSuppressToolbarTap) {
+        Log.info('Reader', '[perf] reader toolbar tap suppressed');
+      } else if (tapHandledByImageView) {
+        Log.info('Reader', '[perf] reader toolbar tap blocked by image view');
+      }
     }
   }
 
