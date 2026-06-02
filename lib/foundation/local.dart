@@ -819,6 +819,48 @@ class LocalManager with ChangeNotifier {
     }
   }
 
+  Future<void> repairAllDownloadedStateBatched({
+    int batchSize = 8,
+    bool notify = true,
+  }) async {
+    assert(batchSize > 0);
+    var changed = false;
+    var processed = 0;
+    for (var comic in getComics(LocalSortType.timeDesc)) {
+      if (comic.chapters == null) {
+        continue;
+      }
+      var validDownloaded = comic.downloadedChapters
+          .where((chapterId) => _chapterDirectoryHasImages(comic, chapterId))
+          .toList();
+      if (validDownloaded.length != comic.downloadedChapters.length) {
+        changed = true;
+        if (validDownloaded.isEmpty) {
+          _db.execute('DELETE FROM comics WHERE id = ? AND comic_type = ?;', [
+            comic.id,
+            comic.comicType.value,
+          ]);
+        } else {
+          _db.execute(
+            'UPDATE comics SET downloadedChapters = ? WHERE id = ? AND comic_type = ?;',
+            [jsonEncode(validDownloaded), comic.id, comic.comicType.value],
+          );
+        }
+      }
+      processed++;
+      if (processed % batchSize == 0) {
+        Log.info(
+          'LocalManager',
+          '[perf] local repair batch complete processed=$processed',
+        );
+        await Future<void>.delayed(Duration.zero);
+      }
+    }
+    if (changed && notify) {
+      notifyListeners();
+    }
+  }
+
   void deleteComic(LocalComic c, [bool removeFileOnDisk = true]) {
     if (removeFileOnDisk) {
       var dir = Directory(FilePath.join(path, c.directory));

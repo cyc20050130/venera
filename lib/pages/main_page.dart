@@ -12,6 +12,15 @@ import 'explore_page.dart';
 import 'favorites/favorites_page.dart';
 import 'home_page.dart';
 
+@visibleForTesting
+void markMainPageFirstFrameInteractive(
+  BootstrapController controller, {
+  void Function(String event) logEvent = logBootstrapEvent,
+}) {
+  logEvent('main page visible');
+  controller.markHomeInteractive();
+}
+
 class MainPage extends StatefulWidget {
   const MainPage({super.key});
 
@@ -43,7 +52,7 @@ class _MainPageState extends State<MainPage> {
     App.mainNavigatorKey = _navigatorKey;
     index = int.tryParse(appdata.settings['initialPage'].toString()) ?? 0;
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      logBootstrapEvent('main page visible');
+      markMainPageFirstFrameInteractive(bootstrapController);
     });
     super.initState();
   }

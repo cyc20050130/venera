@@ -84,4 +84,47 @@ void main() {
       expect(heartbeats, greaterThanOrEqualTo(2));
     },
   );
+
+  test('startup background task waits for home interactive', () async {
+    final controller = BootstrapController(
+      startupInteractionProtectionWindow: Duration.zero,
+    );
+    var runs = 0;
+
+    controller.scheduleStartupBackgroundTask('probe', Duration.zero, () {
+      runs++;
+    });
+
+    await Future<void>.delayed(const Duration(milliseconds: 20));
+    expect(runs, 0);
+
+    controller.phaseBReady = true;
+    controller.debugCompletePhaseBForTest();
+    await Future<void>.delayed(const Duration(milliseconds: 20));
+    expect(runs, 0);
+
+    controller.markHomeInteractive();
+    await Future<void>.delayed(const Duration(milliseconds: 20));
+    expect(runs, 1);
+  });
+
+  test('startup background task names are scheduled once', () async {
+    final controller = BootstrapController(
+      startupInteractionProtectionWindow: Duration.zero,
+    );
+    var runs = 0;
+
+    controller.phaseBReady = true;
+    controller.debugCompletePhaseBForTest();
+    controller.markHomeInteractive();
+    controller.scheduleStartupBackgroundTask('same', Duration.zero, () {
+      runs++;
+    });
+    controller.scheduleStartupBackgroundTask('same', Duration.zero, () {
+      runs++;
+    });
+
+    await Future<void>.delayed(const Duration(milliseconds: 20));
+    expect(runs, 1);
+  });
 }

@@ -73,21 +73,29 @@ Timer? installBootstrapStartupHooks({
 }
 
 class BootstrapController extends ChangeNotifier {
+  BootstrapController({
+    Duration startupInteractionProtectionWindow = const Duration(seconds: 6),
+  }) : _startupInteractionProtectionWindow = startupInteractionProtectionWindow;
+
   BootstrapPhase phase = BootstrapPhase.idle;
 
   bool phaseAReady = false;
   bool phaseBReady = false;
   bool comicSourceReady = false;
   bool networkReady = false;
+  bool homeInteractive = false;
 
   bool _started = false;
   final Stopwatch _stopwatch = Stopwatch();
   final Completer<void> _phaseBCompleter = Completer<void>();
   final Completer<void> _readyCompleter = Completer<void>();
+  final Completer<void> _homeInteractiveCompleter = Completer<void>();
 
   Future<void>? _phaseBFuture;
   Future<void>? _phaseCFuture;
   Timer? _windowsHeartbeatTimer;
+  final Duration _startupInteractionProtectionWindow;
+  final Set<String> _scheduledStartupBackgroundTasks = {};
 
   void start() {
     if (_started) {
@@ -103,8 +111,31 @@ class BootstrapController extends ChangeNotifier {
     await _phaseBCompleter.future;
   }
 
+  @visibleForTesting
+  void debugCompletePhaseBForTest() {
+    if (!_phaseBCompleter.isCompleted) {
+      _phaseBCompleter.complete();
+    }
+  }
+
   Future<void> waitForReady() async {
     await _readyCompleter.future;
+  }
+
+  Future<void> waitForHomeInteractive() async {
+    await _homeInteractiveCompleter.future;
+  }
+
+  void markHomeInteractive() {
+    if (homeInteractive) {
+      return;
+    }
+    homeInteractive = true;
+    if (!_homeInteractiveCompleter.isCompleted) {
+      _homeInteractiveCompleter.complete();
+    }
+    logPerf('home interactive');
+    notifyListeners();
   }
 
   Future<void> _run() async {
@@ -177,17 +208,51 @@ class BootstrapController extends ChangeNotifier {
   }
 
   void schedulePostFrameWork() {
+    scheduleStartupBackgroundTask(
+      'cache maintenance',
+      const Duration(seconds: 10),
+      () async {
+        CacheManager().scheduleMaintenance(Duration.zero);
+      },
+    );
+    scheduleStartupBackgroundTask(
+      'local downloaded state repair',
+      const Duration(seconds: 15),
+      () => App.local.repairAllDownloadedStateBatched(),
+    );
+    scheduleStartupBackgroundTask(
+      'update checks',
+      const Duration(seconds: 20),
+      () async {
+        await waitForReady();
+        if (networkReady) {
+          checkUpdates();
+        }
+      },
+    );
+  }
+
+  void scheduleStartupBackgroundTask(
+    String name,
+    Duration delay,
+    FutureOr<void> Function() action,
+  ) {
+    if (!_scheduledStartupBackgroundTasks.add(name)) {
+      return;
+    }
+    logPerf('startup task scheduled $name');
     unawaited(() async {
       await waitForPhaseB();
-      await Future.delayed(const Duration(milliseconds: 800));
-      CacheManager().scheduleMaintenance();
-      await Future.delayed(const Duration(milliseconds: 1200));
-      App.local.repairAllDownloadedState();
-    }());
-    unawaited(() async {
-      await waitForReady();
-      await Future.delayed(const Duration(milliseconds: 800));
-      checkUpdates();
+      await waitForHomeInteractive();
+      await Future.delayed(_startupInteractionProtectionWindow + delay);
+      logPerf('startup task start $name');
+      try {
+        await action();
+      } catch (e, s) {
+        Log.error('Bootstrap', 'Startup task "$name" failed: $e\n$s');
+      } finally {
+        logPerf('startup task complete $name');
+      }
     }());
   }
 

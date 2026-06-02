@@ -435,11 +435,10 @@ class _GalleryModeState extends State<_GalleryMode>
   }
 
   void cache(int startPage) {
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (!mounted) {
-        return;
+    reader.runAfterInitialReaderWarmup('gallery-cache-$startPage', () {
+      if (mounted) {
+        _scheduleCache(startPage);
       }
-      _scheduleCache(startPage);
     });
   }
 
@@ -899,10 +898,11 @@ class _ContinuousModeState extends State<_ContinuousMode>
     reader._imageViewController = this;
     itemPositionsListener.itemPositions.addListener(onPositionChanged);
     cached = List.filled(reader.maxPage + 2, false);
-    Future.delayed(
-      const Duration(milliseconds: 100),
-      () => cacheImages(reader.page),
-    );
+    reader.runAfterInitialReaderWarmup('continuous-cache', () {
+      if (mounted) {
+        cacheImages(reader.page);
+      }
+    });
     super.initState();
   }
 
@@ -986,11 +986,10 @@ class _ContinuousModeState extends State<_ContinuousMode>
   }
 
   void cacheImages(int current) {
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (!mounted) {
-        return;
+    reader.runAfterInitialReaderWarmup('continuous-cache', () {
+      if (mounted) {
+        _scheduleCacheImages(current);
       }
-      _scheduleCacheImages(current);
     });
   }
 

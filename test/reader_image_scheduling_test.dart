@@ -518,6 +518,83 @@ void main() {
   );
 
   test(
+    'cancelled active prefetch still allows the next prefetch to start',
+    () async {
+      final starts = <String>[];
+      final slowPrefetchCancelled = Completer<void>();
+      StreamController<ImageDownloadProgress>? slowPrefetchController;
+
+      ImageDownloader.debugReaderImageLoader =
+          (
+            String imageKey,
+            String? sourceKey,
+            String cid,
+            String eid, {
+            bool useCache = true,
+          }) {
+            starts.add(imageKey);
+            if (imageKey == 'slow-prefetch') {
+              slowPrefetchController = StreamController<ImageDownloadProgress>(
+                onCancel: () async {
+                  if (!slowPrefetchCancelled.isCompleted) {
+                    slowPrefetchCancelled.complete();
+                  }
+                  await slowPrefetchController?.close();
+                },
+              );
+              return slowPrefetchController!.stream;
+            }
+            return Stream<ImageDownloadProgress>.fromIterable([
+              const ImageDownloadProgress(
+                currentBytes: 1,
+                totalBytes: 1,
+                imageBytes: null,
+              ),
+              ImageDownloadProgress(
+                currentBytes: 1,
+                totalBytes: 1,
+                imageBytes: Uint8List.fromList([1]),
+              ),
+            ]);
+          };
+
+      ImageDownloader.prefetchReaderImage(
+        'slow-prefetch',
+        'source',
+        'cid',
+        'eid',
+      );
+      await Future<void>.delayed(const Duration(milliseconds: 60));
+
+      final visible = ImageDownloader.loadComicImage(
+        'visible',
+        'source',
+        'cid',
+        'eid',
+      ).listen((_) {});
+      await Future<void>.delayed(const Duration(milliseconds: 80));
+
+      expect(slowPrefetchCancelled.isCompleted, isTrue);
+      await visible.cancel();
+      await Future<void>.delayed(const Duration(milliseconds: 40));
+
+      ImageDownloader.prefetchReaderImage(
+        'next-prefetch',
+        'source',
+        'cid',
+        'eid',
+      );
+      await Future<void>.delayed(const Duration(milliseconds: 160));
+
+      expect(
+        starts,
+        containsAllInOrder(['slow-prefetch', 'visible', 'next-prefetch']),
+      );
+      ImageDownloader.cancelReaderPrefetches();
+    },
+  );
+
+  test(
     'same-key request after foreground cancellation creates a fresh stream',
     () async {
       final starts = <String>[];

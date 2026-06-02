@@ -75,6 +75,43 @@ void main() {
     );
   });
 
+  test('reader deferred work keeps initial interactive window clear', () {
+    final startedAt = DateTime(2026, 6, 2, 12);
+    expect(
+      computeReaderDeferredWorkRemaining(
+        startedAt: startedAt,
+        now: startedAt.add(const Duration(milliseconds: 500)),
+        delay: const Duration(milliseconds: 1200),
+      ),
+      const Duration(milliseconds: 700),
+    );
+    expect(
+      computeReaderDeferredWorkRemaining(
+        startedAt: startedAt,
+        now: startedAt.add(const Duration(seconds: 2)),
+        delay: const Duration(milliseconds: 1200),
+      ),
+      Duration.zero,
+    );
+  });
+
+  test('reader deferred work coalesces tasks by key', () async {
+    final scheduler = ReaderDeferredWorkScheduler(
+      remainingDelay: () => const Duration(milliseconds: 40),
+      schedulePostFrame: (task) => task(),
+    );
+    final runs = <int>[];
+
+    scheduler.run('same', () => runs.add(1));
+    scheduler.run('same', () => runs.add(2));
+    scheduler.run('other', () => runs.add(3));
+
+    await Future<void>.delayed(const Duration(milliseconds: 90));
+
+    expect(runs, [2, 3]);
+    scheduler.dispose();
+  });
+
   testWidgets('reader shell appears before reader content mounts', (
     tester,
   ) async {

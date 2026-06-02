@@ -353,7 +353,7 @@ class HistoryManager with ChangeNotifier {
   bool _haveAsyncTask = false;
 
   /// Create a isolate to add history to prevent blocking the UI thread.
-  Future<void> addHistoryAsync(History newItem) async {
+  Future<void> addHistoryAsync(History newItem, {bool notify = true}) async {
     while (_haveAsyncTask) {
       await Future.delayed(Duration(milliseconds: 20));
     }
@@ -370,13 +370,15 @@ class HistoryManager with ChangeNotifier {
     if (cachedHistories.length > 10) {
       cachedHistories.remove(cachedHistories.keys.first);
     }
-    notifyListeners();
+    if (notify) {
+      notifyListeners();
+    }
   }
 
   /// add history. if exists, update time.
   ///
   /// This function would be called when user start reading.
-  void addHistory(History newItem) {
+  void addHistory(History newItem, {bool notify = true}) {
     _db.execute(_insertHistorySql, [
       newItem.id,
       newItem.sourceKey,
@@ -400,7 +402,9 @@ class HistoryManager with ChangeNotifier {
     if (cachedHistories.length > 10) {
       cachedHistories.remove(cachedHistories.keys.first);
     }
-    notifyListeners();
+    if (notify) {
+      notifyListeners();
+    }
   }
 
   void clearHistory() {

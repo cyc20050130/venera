@@ -269,6 +269,7 @@ abstract class ImageDownloader {
       keepAliveWithoutListeners: true,
     );
     _loadingImages[cacheKey] = stream;
+    stream.stream.listen((_) {}, onError: (_) {});
   }
 
   static Stream<ImageDownloadProgress> loadComicImageUnwrapped(
@@ -663,7 +664,7 @@ abstract class ImageDownloader {
       }
     }
     for (final key in keysToCancel) {
-      _removeReaderImageLoadState(key);
+      _finishReaderImageLoad(key);
     }
   }
 
@@ -672,6 +673,12 @@ abstract class ImageDownloader {
     _readerImagePriorities.remove(cacheKey);
     _activeReaderImageKinds.remove(cacheKey);
     _pendingReaderPrefetchRequests.remove(cacheKey);
+  }
+
+  static void _finishReaderImageLoad(String cacheKey) {
+    final priority = _activeReaderImageKinds.remove(cacheKey);
+    _decrementActiveReaderLoadCount(priority);
+    _removeReaderImageLoadState(cacheKey);
   }
 
   static void _logReaderImagePerf(String label, String cacheKey) {

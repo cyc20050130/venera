@@ -105,6 +105,37 @@ void main() {
     },
   );
 
+  test('silent history update persists without notifying listeners', () {
+    final manager = HistoryManager();
+    var notifications = 0;
+    void listener() {
+      notifications++;
+    }
+
+    manager.addListener(listener);
+    addTearDown(() => manager.removeListener(listener));
+
+    manager.addHistory(
+      History.fromMap({
+        'type': 'picacg'.hashCode,
+        'sourceKey': 'source-silent',
+        'id': 'comic-silent',
+        'title': 'Silent',
+        'subtitle': '',
+        'cover': '',
+        'time': DateTime(2026).millisecondsSinceEpoch,
+        'ep': 1,
+        'page': 2,
+        'max_page': 9,
+        'readEpisode': ['1'],
+      }),
+      notify: false,
+    );
+
+    expect(notifications, 0);
+    expect(manager.findBySourceKey('comic-silent', 'source-silent')?.page, 2);
+  });
+
   test('reinitializing history opens the existing database again', () async {
     final history = HistoryManager();
     history.close();

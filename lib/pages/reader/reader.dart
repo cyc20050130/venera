@@ -192,8 +192,69 @@ bool canReaderSwitchChapter({
   return targetChapter >= 1 && targetChapter <= maxChapter;
 }
 
+@visibleForTesting
+class ReaderDeferredWorkScheduler {
+  ReaderDeferredWorkScheduler({
+    required this.remainingDelay,
+    required this.schedulePostFrame,
+  });
+
+  final Duration Function() remainingDelay;
+  final void Function(VoidCallback task) schedulePostFrame;
+  final Map<Object, VoidCallback> _pendingTasks = {};
+  final Map<Object, Timer> _timers = {};
+
+  void run(Object key, VoidCallback task) {
+    final remaining = remainingDelay();
+    void runPostFrame(VoidCallback callback) {
+      schedulePostFrame(callback);
+    }
+
+    if (remaining <= Duration.zero) {
+      _timers.remove(key)?.cancel();
+      _pendingTasks.remove(key);
+      runPostFrame(task);
+      return;
+    }
+
+    _pendingTasks[key] = task;
+    if (_timers.containsKey(key)) {
+      return;
+    }
+    _timers[key] = Timer(remaining, () {
+      _timers.remove(key);
+      final pending = _pendingTasks.remove(key);
+      if (pending != null) {
+        runPostFrame(pending);
+      }
+    });
+  }
+
+  void dispose() {
+    for (final timer in _timers.values) {
+      timer.cancel();
+    }
+    _timers.clear();
+    _pendingTasks.clear();
+  }
+}
+
+@visibleForTesting
+Duration computeReaderDeferredWorkRemaining({
+  required DateTime startedAt,
+  required DateTime now,
+  required Duration delay,
+}) {
+  final remaining = delay - now.difference(startedAt);
+  return remaining > Duration.zero ? remaining : Duration.zero;
+}
+
 class _ReaderState extends State<Reader>
     with _ReaderLocation, _ReaderWindow, _VolumeListener, _ImagePerPageHandler {
+  static const _initialReaderBackgroundWorkDelay = Duration(milliseconds: 2500);
+  static const _firstHistoryWriteDelay = Duration(milliseconds: 1200);
+  static const _subsequentHistoryWriteDelay = Duration(seconds: 1);
+
   final Set<int> _completedDownloadedChapters = {};
   int _chapterPrefetchGeneration = 0;
   String? _nextChapterPrefetchChapterId;
@@ -201,6 +262,11 @@ class _ReaderState extends State<Reader>
   int _nextChapterPrefetchedImageCount = 0;
   bool _nextChapterPrefetchRetryScheduled = false;
   bool _nextChapterPrefetchRetryWarmRemainingImages = false;
+  Timer? _nextChapterPrefetchWarmupTimer;
+  bool _nextChapterPrefetchWarmupWantsRemainingImages = false;
+  late final DateTime _readerMountedAt;
+  late final ReaderDeferredWorkScheduler _initialReaderWorkScheduler;
+  bool _historyWriteHasRun = false;
 
   @override
   void update() {
@@ -280,6 +346,17 @@ class _ReaderState extends State<Reader>
 
   @override
   void initState() {
+    _readerMountedAt = DateTime.now();
+    _initialReaderWorkScheduler = ReaderDeferredWorkScheduler(
+      remainingDelay: () => _initialReaderBackgroundWorkRemaining,
+      schedulePostFrame: (task) {
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (mounted) {
+            task();
+          }
+        });
+      },
+    );
     // mode = ReaderMode.fromKey(appdata.settings['readerMode']);
     mode = ReaderMode.fromKey(
       appdata.settings.getReaderSetting(cid, type.sourceKey, 'readerMode'),
@@ -327,7 +404,7 @@ class _ReaderState extends State<Reader>
       unawaited(setImageCacheSize());
       Future.microtask(() {
         if (mounted) {
-          LocalFavoritesManager().onRead(cid, type);
+          LocalFavoritesManager().onRead(cid, type, notify: false);
         }
       });
     });
@@ -371,6 +448,8 @@ class _ReaderState extends State<Reader>
 
   @override
   void dispose() {
+    _flushPendingHistoryUpdate();
+    _initialReaderWorkScheduler.dispose();
     _resetNextChapterPrefetchState();
     _deleteReadChapterIfNeeded(chapter);
     if (isFullscreen) {
@@ -420,10 +499,9 @@ class _ReaderState extends State<Reader>
       return false;
     }
     final previousChapter = chapter;
+    _flushPendingHistoryUpdate();
     _resetNextChapterPrefetchState();
     _deleteReadChapterIfNeeded(previousChapter);
-    _updateHistoryTimer?.cancel();
-    _updateHistoryTimer = null;
     ImageDownloader.cancelAllLoadingImages();
     ComicImage.clear();
     setState(() {
@@ -518,9 +596,8 @@ class _ReaderState extends State<Reader>
     history!.time = DateTime.now();
     _maybeWarmRemainingNextChapterImages();
     _updateHistoryTimer?.cancel();
-    _updateHistoryTimer = Timer(const Duration(seconds: 1), () {
-      HistoryManager().addHistoryAsync(history!);
-      _updateHistoryTimer = null;
+    _updateHistoryTimer = Timer(_nextHistoryWriteDelay, () {
+      _persistHistorySnapshot();
     });
   }
 
@@ -543,6 +620,9 @@ class _ReaderState extends State<Reader>
 
   void _resetNextChapterPrefetchState() {
     _chapterPrefetchGeneration++;
+    _nextChapterPrefetchWarmupTimer?.cancel();
+    _nextChapterPrefetchWarmupTimer = null;
+    _nextChapterPrefetchWarmupWantsRemainingImages = false;
     _nextChapterPrefetchChapterId = null;
     _nextChapterPrefetchPages = null;
     _nextChapterPrefetchedImageCount = 0;
@@ -559,6 +639,10 @@ class _ReaderState extends State<Reader>
     bool warmRemainingImages = false,
   }) async {
     if (type == ComicType.local || widget.chapters == null) {
+      return;
+    }
+    if (_deferNextChapterPrefetchUntilReaderWarmsUp(warmRemainingImages)) {
+      _logReaderPerf('reader next chapter prefetch warmup deferred');
       return;
     }
     final nextChapterId = _findNextChapterId();
@@ -696,6 +780,96 @@ class _ReaderState extends State<Reader>
         _prepareNextChapterPrefetch(warmRemainingImages: shouldWarmRemaining),
       );
     });
+  }
+
+  Duration get _initialReaderBackgroundWorkRemaining {
+    return computeReaderDeferredWorkRemaining(
+      startedAt: _readerMountedAt,
+      now: DateTime.now(),
+      delay: _initialReaderBackgroundWorkDelay,
+    );
+  }
+
+  Duration get _nextHistoryWriteDelay {
+    if (_historyWriteHasRun) {
+      return _subsequentHistoryWriteDelay;
+    }
+    return computeReaderDeferredWorkRemaining(
+      startedAt: _readerMountedAt,
+      now: DateTime.now(),
+      delay: _firstHistoryWriteDelay,
+    );
+  }
+
+  bool _deferNextChapterPrefetchUntilReaderWarmsUp(bool warmRemainingImages) {
+    final remaining = _initialReaderBackgroundWorkRemaining;
+    if (remaining <= Duration.zero) {
+      return false;
+    }
+    _nextChapterPrefetchWarmupWantsRemainingImages =
+        _nextChapterPrefetchWarmupWantsRemainingImages || warmRemainingImages;
+    if (_nextChapterPrefetchWarmupTimer != null) {
+      return true;
+    }
+    final generation = _chapterPrefetchGeneration;
+    _nextChapterPrefetchWarmupTimer = Timer(remaining, () {
+      _nextChapterPrefetchWarmupTimer = null;
+      final shouldWarmRemaining =
+          _nextChapterPrefetchWarmupWantsRemainingImages;
+      _nextChapterPrefetchWarmupWantsRemainingImages = false;
+      if (!mounted || generation != _chapterPrefetchGeneration) {
+        return;
+      }
+      unawaited(
+        _prepareNextChapterPrefetch(warmRemainingImages: shouldWarmRemaining),
+      );
+    });
+    return true;
+  }
+
+  void runAfterInitialReaderWarmup(Object key, VoidCallback task) {
+    _initialReaderWorkScheduler.run(key, task);
+  }
+
+  void _flushPendingHistoryUpdate() {
+    if (_updateHistoryTimer == null || history == null) {
+      return;
+    }
+    _updateHistoryTimer?.cancel();
+    _persistHistorySnapshot();
+  }
+
+  void _persistHistorySnapshot() {
+    _updateHistoryTimer = null;
+    final currentHistory = history;
+    if (currentHistory == null) {
+      return;
+    }
+    _historyWriteHasRun = true;
+    unawaited(
+      HistoryManager().addHistoryAsync(
+        _snapshotHistory(currentHistory),
+        notify: false,
+      ),
+    );
+  }
+
+  History _snapshotHistory(History source) {
+    final snapshot = History.fromMap({
+      'type': source.type.value,
+      'sourceKey': source.sourceKey,
+      'time': source.time.millisecondsSinceEpoch,
+      'title': source.title,
+      'subtitle': source.subtitle,
+      'cover': source.cover,
+      'ep': source.ep,
+      'page': source.page,
+      'id': source.id,
+      'readEpisode': source.readEpisode.toList(),
+      'max_page': source.maxPage,
+    });
+    snapshot.group = source.group;
+    return snapshot;
   }
 
   void _logReaderPerf(String label) {

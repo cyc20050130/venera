@@ -222,6 +222,45 @@ void main() {
     historyDb.dispose();
   });
 
+  test('batched downloaded state repair notifies once after changes', () async {
+    await manager.init();
+    managerInitialized = true;
+    var notifications = 0;
+    void listener() {
+      notifications++;
+    }
+
+    manager.addListener(listener);
+    addTearDown(() => manager.removeListener(listener));
+
+    final comicDir = Directory('${tempDir.path}/comic-batched');
+    final validChapterDir = Directory('${comicDir.path}/valid');
+    await validChapterDir.create(recursive: true);
+    await File('${validChapterDir.path}/001.jpg').writeAsBytes([1, 2, 3]);
+
+    final comic = LocalComic(
+      id: 'comic-batched',
+      title: 'Batched Comic',
+      subtitle: 'Author',
+      tags: const ['tag'],
+      directory: comicDir.path,
+      chapters: ComicChapters({'valid': 'Valid', 'missing': 'Missing'}),
+      cover: 'cover.jpg',
+      comicType: ComicType.local,
+      downloadedChapters: const ['valid', 'missing'],
+      createdAt: DateTime(2026, 6, 2),
+    );
+    await manager.add(comic);
+    notifications = 0;
+
+    await manager.repairAllDownloadedStateBatched(batchSize: 1);
+
+    expect(notifications, 1);
+    expect(manager.find(comic.id, comic.comicType)?.downloadedChapters, [
+      'valid',
+    ]);
+  });
+
   test('init restores downloading tasks before it completes', () async {
     final source = _buildSource();
     ComicSourceManager().add(source);

@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:sliver_tools/sliver_tools.dart';
 import 'package:url_launcher/url_launcher_string.dart';
@@ -24,6 +26,24 @@ import 'package:venera/utils/translations.dart';
 
 import 'local_comics_page.dart';
 
+@visibleForTesting
+class HomeRefreshDebouncer {
+  HomeRefreshDebouncer({this.delay = const Duration(milliseconds: 250)});
+
+  final Duration delay;
+  Timer? _timer;
+
+  void schedule(VoidCallback callback) {
+    _timer?.cancel();
+    _timer = Timer(delay, callback);
+  }
+
+  void dispose() {
+    _timer?.cancel();
+    _timer = null;
+  }
+}
+
 class HomePage extends StatefulWidget {
   const HomePage({super.key});
 
@@ -33,11 +53,20 @@ class HomePage extends StatefulWidget {
 
 class _HomePageState extends State<HomePage> {
   bool _hasLoggedHomeSectionsReady = false;
+  bool _hasLoggedHomeFirstFrame = false;
 
   @override
   void initState() {
     super.initState();
     bootstrapController.addListener(_onBootstrapChanged);
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || _hasLoggedHomeFirstFrame) {
+        return;
+      }
+      _hasLoggedHomeFirstFrame = true;
+      logBootstrapEvent('home first frame');
+      bootstrapController.markHomeInteractive();
+    });
   }
 
   @override
@@ -82,6 +111,34 @@ class _HomePageState extends State<HomePage> {
       ],
     );
     return context.width > changePoint ? widget.paddingHorizontal(8) : widget;
+  }
+}
+
+mixin _HomeDebouncedRefresh<T extends StatefulWidget> on State<T> {
+  late final HomeRefreshDebouncer _homeRefreshDebouncer =
+      HomeRefreshDebouncer();
+
+  void scheduleHomeRefresh(VoidCallback refresh, {Duration? delay}) {
+    if (!mounted) {
+      return;
+    }
+    final debouncer = delay == null
+        ? _homeRefreshDebouncer
+        : HomeRefreshDebouncer(delay: delay);
+    debouncer.schedule(() {
+      if (mounted) {
+        setState(refresh);
+      }
+      if (delay != null) {
+        debouncer.dispose();
+      }
+    });
+  }
+
+  @override
+  void dispose() {
+    _homeRefreshDebouncer.dispose();
+    super.dispose();
   }
 }
 
@@ -264,7 +321,7 @@ class _History extends StatefulWidget {
   State<_History> createState() => _HistoryState();
 }
 
-class _HistoryState extends State<_History> {
+class _HistoryState extends State<_History> with _HomeDebouncedRefresh {
   List<History> history = const [];
   int count = 0;
 
@@ -277,18 +334,17 @@ class _HistoryState extends State<_History> {
   }
 
   void onHistoryChange() {
-    if (mounted) {
-      setState(() {
-        _refreshIfReady();
-      });
+    if (!mounted || !bootstrapController.phaseBReady) {
+      return;
     }
+    scheduleHomeRefresh(_refreshIfReady);
   }
 
   void _onBootstrapChanged() {
     if (!mounted || !bootstrapController.phaseBReady) {
       return;
     }
-    setState(_refreshIfReady);
+    scheduleHomeRefresh(_refreshIfReady);
   }
 
   @override
@@ -397,7 +453,7 @@ class _Local extends StatefulWidget {
   State<_Local> createState() => _LocalState();
 }
 
-class _LocalState extends State<_Local> {
+class _LocalState extends State<_Local> with _HomeDebouncedRefresh {
   List<LocalComic> local = const [];
   int count = 0;
 
@@ -410,14 +466,17 @@ class _LocalState extends State<_Local> {
   }
 
   void onLocalComicsChange() {
-    setState(_refreshIfReady);
+    if (!mounted || !bootstrapController.phaseBReady) {
+      return;
+    }
+    scheduleHomeRefresh(_refreshIfReady);
   }
 
   void _onBootstrapChanged() {
     if (!mounted || !bootstrapController.phaseBReady) {
       return;
     }
-    setState(_refreshIfReady);
+    scheduleHomeRefresh(_refreshIfReady);
   }
 
   @override
@@ -732,7 +791,8 @@ class _ComicSourceWidget extends StatefulWidget {
   State<_ComicSourceWidget> createState() => _ComicSourceWidgetState();
 }
 
-class _ComicSourceWidgetState extends State<_ComicSourceWidget> {
+class _ComicSourceWidgetState extends State<_ComicSourceWidget>
+    with _HomeDebouncedRefresh {
   List<String> comicSources = const [];
 
   void _refreshIfReady() {
@@ -743,16 +803,17 @@ class _ComicSourceWidgetState extends State<_ComicSourceWidget> {
   }
 
   void onComicSourceChange() {
-    setState(() {
-      _refreshIfReady();
-    });
+    if (!mounted || !bootstrapController.comicSourceReady) {
+      return;
+    }
+    scheduleHomeRefresh(_refreshIfReady);
   }
 
   void _onBootstrapChanged() {
     if (!mounted || !bootstrapController.comicSourceReady) {
       return;
     }
-    setState(_refreshIfReady);
+    scheduleHomeRefresh(_refreshIfReady);
   }
 
   @override
@@ -927,10 +988,7 @@ class _HomeCardPlaceholder extends StatelessWidget {
         margin: const EdgeInsets.symmetric(horizontal: 8, vertical: 8),
         padding: const EdgeInsets.all(16),
         decoration: BoxDecoration(
-          border: Border.all(
-            color: colorScheme.outlineVariant,
-            width: 0.6,
-          ),
+          border: Border.all(color: colorScheme.outlineVariant, width: 0.6),
           borderRadius: BorderRadius.circular(8),
         ),
         child: Column(
