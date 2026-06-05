@@ -519,6 +519,47 @@ class HistoryManager with ChangeNotifier {
     }
   }
 
+  bool updateExistingHistoryMetadata(HistoryMixin model) {
+    if (!isInitialized || model.sourceKey == 'local') {
+      return false;
+    }
+    final current = findBySourceKey(model.id, model.sourceKey);
+    if (current == null) {
+      return false;
+    }
+    final nextTitle = model.title;
+    final nextSubtitle = model.subTitle ?? '';
+    final nextCover = model.cover;
+    final nextMaxPage = model.maxPage ?? current.maxPage;
+    if (current.title == nextTitle &&
+        current.subtitle == nextSubtitle &&
+        current.cover == nextCover &&
+        current.maxPage == nextMaxPage) {
+      return false;
+    }
+
+    final updatedHistory = History.fromMap({
+      'type': current.type.value,
+      'sourceKey': current.sourceKey,
+      'time': current.time.millisecondsSinceEpoch,
+      'title': nextTitle,
+      'subtitle': nextSubtitle,
+      'cover': nextCover,
+      'ep': current.ep,
+      'page': current.page,
+      'id': current.id,
+      'readEpisode': current.readEpisode.toList(),
+      'max_page': nextMaxPage,
+      'group': current.group,
+    });
+    addHistory(updatedHistory);
+    Log.info(
+      "History",
+      "[perf] cover sync history metadata ${current.sourceKey}@${current.id}",
+    );
+    return true;
+  }
+
   void clearHistory() {
     _db.execute("delete from history;");
     updateCache();
@@ -724,24 +765,7 @@ class HistoryManager with ChangeNotifier {
           continue;
         }
 
-        var comicDetails = res.data;
-        // Update history info while keeping reading progress
-        var updatedHistory = History.fromMap({
-          'type': history.type.value,
-          'sourceKey': history.sourceKey,
-          'time': history.time.millisecondsSinceEpoch,
-          'title': comicDetails.title,
-          'subtitle': comicDetails.subTitle ?? '',
-          'cover': comicDetails.cover,
-          'ep': history.ep,
-          'page': history.page,
-          'id': history.id,
-          'readEpisode': history.readEpisode.toList(),
-          'max_page': history.maxPage,
-        });
-        updatedHistory.group = history.group;
-
-        addHistory(updatedHistory);
+        updateExistingHistoryMetadata(res.data);
         return true;
       } catch (e, s) {
         Log.error("History", "Exception while refreshing history info: $e\n$s");

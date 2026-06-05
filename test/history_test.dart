@@ -136,6 +136,128 @@ void main() {
     expect(manager.findBySourceKey('comic-silent', 'source-silent')?.page, 2);
   });
 
+  test(
+    'existing history metadata sync updates cover without changing progress',
+    () {
+      final manager = HistoryManager();
+      final originalTime = DateTime(2026, 6, 4);
+      var notifications = 0;
+      void listener() {
+        notifications++;
+      }
+
+      manager.addListener(listener);
+      addTearDown(() => manager.removeListener(listener));
+      manager.addHistory(
+        History.fromMap({
+          'type': 'picacg'.hashCode,
+          'sourceKey': 'source-cover-sync',
+          'id': 'comic-cover-sync',
+          'title': 'Old Title',
+          'subtitle': 'Old Author',
+          'cover': 'old-cover',
+          'time': originalTime.millisecondsSinceEpoch,
+          'ep': 6,
+          'page': 18,
+          'group': 2,
+          'max_page': 40,
+          'readEpisode': ['2-6'],
+        }),
+        notify: false,
+      );
+
+      final changed = manager.updateExistingHistoryMetadata(
+        const _TestHistoryMetadata(
+          sourceKey: 'source-cover-sync',
+          id: 'comic-cover-sync',
+          title: 'New Title',
+          subTitle: 'New Author',
+          cover: 'https://example.test/new-cover.jpg',
+          maxPage: 99,
+        ),
+      );
+
+      expect(changed, isTrue);
+      expect(notifications, 1);
+
+      final updated = manager.findBySourceKey(
+        'comic-cover-sync',
+        'source-cover-sync',
+      );
+      expect(updated, isNotNull);
+      expect(updated!.title, 'New Title');
+      expect(updated.subtitle, 'New Author');
+      expect(updated.cover, 'https://example.test/new-cover.jpg');
+      expect(updated.maxPage, 99);
+      expect(updated.time, originalTime);
+      expect(updated.ep, 6);
+      expect(updated.page, 18);
+      expect(updated.group, 2);
+      expect(updated.readEpisode, {'2-6'});
+    },
+  );
+
+  test('history metadata sync does not create history rows', () {
+    final manager = HistoryManager();
+    final changed = manager.updateExistingHistoryMetadata(
+      const _TestHistoryMetadata(
+        sourceKey: 'source-cover-sync',
+        id: 'missing-history',
+        title: 'New Title',
+        subTitle: 'New Author',
+        cover: 'https://example.test/new-cover.jpg',
+        maxPage: 99,
+      ),
+    );
+
+    expect(changed, isFalse);
+    expect(
+      manager.findBySourceKey('missing-history', 'source-cover-sync'),
+      isNull,
+    );
+  });
+
+  test('unchanged history metadata sync is silent', () {
+    final manager = HistoryManager();
+    var notifications = 0;
+    void listener() {
+      notifications++;
+    }
+
+    manager.addListener(listener);
+    addTearDown(() => manager.removeListener(listener));
+    manager.addHistory(
+      History.fromMap({
+        'type': 'picacg'.hashCode,
+        'sourceKey': 'source-cover-sync',
+        'id': 'comic-unchanged',
+        'title': 'Title',
+        'subtitle': 'Author',
+        'cover': 'https://example.test/cover.jpg',
+        'time': DateTime(2026, 6, 4).millisecondsSinceEpoch,
+        'ep': 1,
+        'page': 2,
+        'max_page': 12,
+        'readEpisode': ['1'],
+      }),
+      notify: false,
+    );
+
+    final changed = manager.updateExistingHistoryMetadata(
+      const _TestHistoryMetadata(
+        sourceKey: 'source-cover-sync',
+        id: 'comic-unchanged',
+        title: 'Title',
+        subTitle: 'Author',
+        cover: 'https://example.test/cover.jpg',
+        maxPage: 12,
+      ),
+    );
+
+    expect(changed, isFalse);
+    expect(notifications, 0);
+  });
+
   test('History.fromMap normalizes mixed legacy field types', () {
     final history = History.fromMap({
       'type': '0',
@@ -588,4 +710,36 @@ void main() {
       await targetCacheDir.delete(recursive: true);
     },
   );
+}
+
+class _TestHistoryMetadata with HistoryMixin {
+  const _TestHistoryMetadata({
+    required this.sourceKey,
+    required this.id,
+    required this.title,
+    required this.subTitle,
+    required this.cover,
+    required this.maxPage,
+  });
+
+  @override
+  final String sourceKey;
+
+  @override
+  final String id;
+
+  @override
+  final String title;
+
+  @override
+  final String? subTitle;
+
+  @override
+  final String cover;
+
+  @override
+  final int? maxPage;
+
+  @override
+  HistoryType get historyType => HistoryType(sourceKey.hashCode);
 }

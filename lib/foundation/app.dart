@@ -35,7 +35,7 @@ String resolveAndroidExternalStoragePath(
 }
 
 class _App {
-  final version = "1.6.26";
+  final version = "1.6.27";
 
   bool get isAndroid => Platform.isAndroid;
 

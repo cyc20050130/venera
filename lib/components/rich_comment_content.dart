@@ -290,6 +290,8 @@ class _RichCommentContentState extends State<RichCommentContent> {
 
   @override
   Widget build(BuildContext context) {
+    final devicePixelRatio = MediaQuery.devicePixelRatioOf(context);
+    final inlineImageCacheSize = (100 * devicePixelRatio).ceil().clamp(1, 4096);
     Widget content = SelectableText.rich(
       TextSpan(style: DefaultTextStyle.of(context).style, children: textSpan),
     );
@@ -312,7 +314,11 @@ class _RichCommentContentState extends State<RichCommentContent> {
                 child: Image(
                   width: 100,
                   height: 100,
-                  image: CachedImageProvider(e.url),
+                  image: ResizeImage.resizeIfNeeded(
+                    inlineImageCacheSize,
+                    inlineImageCacheSize,
+                    CachedImageProvider(e.url),
+                  ),
                 ),
               );
               if (e.link != null) {

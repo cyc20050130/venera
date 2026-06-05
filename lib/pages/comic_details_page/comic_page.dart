@@ -654,6 +654,7 @@ class _ComicPageState extends LoadingState<ComicPage, ComicDetails>
     if (comic.chapters == null) {
       isDownloaded = LocalManager().isDownloaded(comic.id, comic.comicType, 0);
     }
+    HistoryManager().updateExistingHistoryMetadata(comic);
     _syncDisplayedCoverUrl(notify: mounted);
     _logPerf('onDataLoaded complete');
   }

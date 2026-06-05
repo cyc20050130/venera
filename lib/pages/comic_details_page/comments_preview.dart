@@ -107,6 +107,8 @@ class _CommentWidget extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final devicePixelRatio = MediaQuery.devicePixelRatioOf(context);
+    final avatarCacheSize = resolveCoverDecodeDimension(36, devicePixelRatio);
     return Container(
       height: double.infinity,
       margin: const EdgeInsets.fromLTRB(16, 8, 0, 8),
@@ -130,7 +132,11 @@ class _CommentWidget extends StatelessWidget {
                   ),
                   clipBehavior: Clip.antiAlias,
                   child: Image(
-                    image: CachedImageProvider(comment.avatar!),
+                    image: ResizeImage.resizeIfNeeded(
+                      avatarCacheSize,
+                      avatarCacheSize,
+                      CachedImageProvider(comment.avatar!),
+                    ),
                     width: 36,
                     height: 36,
                     fit: BoxFit.cover,

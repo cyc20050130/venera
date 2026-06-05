@@ -180,6 +180,9 @@ class _DownloadTaskTileState extends State<_DownloadTaskTile> {
 
   @override
   Widget build(BuildContext context) {
+    final devicePixelRatio = MediaQuery.devicePixelRatioOf(context);
+    final coverCacheWidth = resolveCoverDecodeDimension(82, devicePixelRatio);
+    final coverCacheHeight = resolveCoverDecodeDimension(120, devicePixelRatio);
     return Container(
       height: 136,
       padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 12),
@@ -196,7 +199,11 @@ class _DownloadTaskTileState extends State<_DownloadTaskTile> {
             child: widget.task.cover == null
                 ? null
                 : Image(
-                    image: CachedImageProvider(widget.task.cover!),
+                    image: ResizeImage.resizeIfNeeded(
+                      coverCacheWidth,
+                      coverCacheHeight,
+                      CachedImageProvider(widget.task.cover!),
+                    ),
                     filterQuality: FilterQuality.medium,
                     fit: BoxFit.cover,
                   ),

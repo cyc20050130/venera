@@ -405,6 +405,8 @@ class _CommentTileState extends State<_CommentTile> {
 
   @override
   Widget build(BuildContext context) {
+    final devicePixelRatio = MediaQuery.devicePixelRatioOf(context);
+    final avatarCacheSize = resolveCoverDecodeDimension(36, devicePixelRatio);
     return Container(
       padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 16),
       child: Row(
@@ -426,6 +428,8 @@ class _CommentTileState extends State<_CommentTile> {
                         widget.comment.avatar!,
                         sourceKey: widget.source.key,
                       ),
+                      cacheWidth: avatarCacheSize,
+                      cacheHeight: avatarCacheSize,
                     ),
             ).paddingRight(8),
           Expanded(

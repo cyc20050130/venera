@@ -408,52 +408,105 @@ void main() {
     },
   );
 
-  test('thumbnail cache hit still allows one shared refresh', () async {
-    await CacheManager().writeCache(
-      'https://example.com/thumb-hit.jpg@null@cid',
-      [1, 1, 1, 1],
-    );
+  test(
+    'thumbnail cache hit returns immediately and refreshes in background',
+    () async {
+      await CacheManager().writeCache(
+        'https://example.com/thumb-hit.jpg@null@cid',
+        [1, 1, 1, 1],
+      );
+
+      var networkCalls = 0;
+      var cacheWrites = 0;
+      final releaseNetwork = Completer<void>();
+      ImageDownloader.debugThumbnailNetworkLoader =
+          (url, sourceKey, cid) async* {
+            networkCalls++;
+            await releaseNetwork.future;
+            yield ImageDownloadProgress(
+              currentBytes: 4,
+              totalBytes: 4,
+              imageBytes: Uint8List.fromList([2, 2, 2, 2]),
+            );
+          };
+      ImageDownloader.debugThumbnailCacheWriter = (cacheKey, data) async {
+        cacheWrites++;
+        await CacheManager().writeCache(cacheKey, data);
+      };
+
+      final first = ImageDownloader.loadThumbnail(
+        'https://example.com/thumb-hit.jpg',
+        null,
+        'cid',
+      ).toList();
+      await Future<void>.delayed(Duration.zero);
+      final second = ImageDownloader.loadThumbnail(
+        'https://example.com/thumb-hit.jpg',
+        null,
+        'cid',
+      ).toList();
+      await Future<void>.delayed(Duration.zero);
+
+      final firstEvents = await first;
+      final secondEvents = await second;
+
+      expect(networkCalls, 1);
+      expect(cacheWrites, 0);
+      expect(firstEvents, hasLength(1));
+      expect(secondEvents, hasLength(1));
+      expect(firstEvents.single.imageBytes, [1, 1, 1, 1]);
+      expect(secondEvents.single.imageBytes, [1, 1, 1, 1]);
+
+      releaseNetwork.complete();
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+
+      expect(networkCalls, 1);
+      expect(cacheWrites, 1);
+      final cached = await CacheManager().findCache(
+        'https://example.com/thumb-hit.jpg@null@cid',
+      );
+      expect(cached, isNotNull);
+      expect(await cached!.readAsBytes(), [2, 2, 2, 2]);
+    },
+  );
+
+  test('thumbnail cache hit background refresh is throttled', () async {
+    const cacheKey = 'https://example.com/thumb-cooldown.jpg@null@cid';
+    await CacheManager().writeCache(cacheKey, [1, 1, 1, 1]);
 
     var networkCalls = 0;
-    var cacheWrites = 0;
-    final releaseNetwork = Completer<void>();
     ImageDownloader.debugThumbnailNetworkLoader = (url, sourceKey, cid) async* {
       networkCalls++;
-      await releaseNetwork.future;
       yield ImageDownloadProgress(
         currentBytes: 4,
         totalBytes: 4,
-        imageBytes: Uint8List.fromList([2, 2, 2, 2]),
+        imageBytes: Uint8List.fromList([networkCalls, 2, 2, 2]),
       );
     };
-    ImageDownloader.debugThumbnailCacheWriter = (cacheKey, data) async {
-      cacheWrites++;
-      await CacheManager().writeCache(cacheKey, data);
-    };
 
-    final first = ImageDownloader.loadThumbnail(
-      'https://example.com/thumb-hit.jpg',
+    final firstEvents = await ImageDownloader.loadThumbnail(
+      'https://example.com/thumb-cooldown.jpg',
       null,
       'cid',
     ).toList();
-    await Future<void>.delayed(Duration.zero);
-    final second = ImageDownloader.loadThumbnail(
-      'https://example.com/thumb-hit.jpg',
-      null,
-      'cid',
-    ).toList();
-    await Future<void>.delayed(Duration.zero);
+    await Future<void>.delayed(const Duration(milliseconds: 50));
 
-    releaseNetwork.complete();
-    final firstEvents = await first;
-    final secondEvents = await second;
-
+    expect(firstEvents.single.imageBytes, [1, 1, 1, 1]);
     expect(networkCalls, 1);
-    expect(cacheWrites, 1);
-    expect(firstEvents.first.imageBytes, [1, 1, 1, 1]);
-    expect(secondEvents.first.imageBytes, [1, 1, 1, 1]);
-    expect(firstEvents.last.imageBytes, [2, 2, 2, 2]);
-    expect(secondEvents.last.imageBytes, [2, 2, 2, 2]);
+    expect(
+      ImageDownloader.shouldStartThumbnailBackgroundRefresh(cacheKey),
+      isFalse,
+    );
+
+    final secondEvents = await ImageDownloader.loadThumbnail(
+      'https://example.com/thumb-cooldown.jpg',
+      null,
+      'cid',
+    ).toList();
+    await Future<void>.delayed(const Duration(milliseconds: 50));
+
+    expect(secondEvents.single.imageBytes, [1, 2, 2, 2]);
+    expect(networkCalls, 1);
   });
 
   test('thumbnail cover redirect requires comic id and info loader', () {

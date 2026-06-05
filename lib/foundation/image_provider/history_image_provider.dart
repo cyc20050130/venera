@@ -8,6 +8,9 @@ import '../history.dart';
 import 'base_image_provider.dart';
 import 'history_image_provider.dart' as image_provider;
 
+final Map<String, Future<String>> _historyCoverLoads =
+    <String, Future<String>>{};
+
 class HistoryImageProvider
     extends BaseImageProvider<image_provider.HistoryImageProvider> {
   /// Image provider for normal image.
@@ -35,17 +38,9 @@ class HistoryImageProvider
           // Fall back to the remote cover path below.
         }
       }
-      var comic = await ComicDetailsRepository().load(
-        history.sourceKey,
-        history.id,
-      );
+      url = await _loadHistoryCoverUrl(history);
       checkStop();
-      if (comic.error) {
-        throw comic.errorMessage ?? "Comic source not found.";
-      }
-      url = comic.data.cover;
       history.cover = url;
-      HistoryManager().addHistory(history);
     }
     await for (var progress in ImageDownloader.loadThumbnail(
       url,
@@ -73,4 +68,29 @@ class HistoryImageProvider
 
   @override
   String get key => "history${history.id}${history.sourceKey}";
+}
+
+Future<String> _loadHistoryCoverUrl(History history) {
+  final key = '${history.sourceKey}@${history.id}';
+  final existing = _historyCoverLoads[key];
+  if (existing != null) {
+    return existing;
+  }
+  final future = () async {
+    final comic = await ComicDetailsRepository().load(
+      history.sourceKey,
+      history.id,
+    );
+    if (comic.error) {
+      throw comic.errorMessage ?? "Comic source not found.";
+    }
+    HistoryManager().updateExistingHistoryMetadata(comic.data);
+    return comic.data.cover;
+  }();
+  _historyCoverLoads[key] = future;
+  return future.whenComplete(() {
+    if (_historyCoverLoads[key] == future) {
+      _historyCoverLoads.remove(key);
+    }
+  });
 }
