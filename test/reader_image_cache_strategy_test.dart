@@ -409,20 +409,16 @@ void main() {
   );
 
   test(
-    'thumbnail cache hit returns immediately and refreshes in background',
+    'thumbnail cache hit returns immediately without background refresh',
     () async {
-      await CacheManager().writeCache(
-        'https://example.com/thumb-hit.jpg@null@cid',
-        [1, 1, 1, 1],
-      );
+      const cacheKey = 'https://example.com/thumb-hit.jpg@null@cid';
+      await CacheManager().writeCache(cacheKey, [1, 1, 1, 1]);
 
       var networkCalls = 0;
       var cacheWrites = 0;
-      final releaseNetwork = Completer<void>();
       ImageDownloader.debugThumbnailNetworkLoader =
           (url, sourceKey, cid) async* {
             networkCalls++;
-            await releaseNetwork.future;
             yield ImageDownloadProgress(
               currentBytes: 4,
               totalBytes: 4,
@@ -450,64 +446,56 @@ void main() {
       final firstEvents = await first;
       final secondEvents = await second;
 
-      expect(networkCalls, 1);
+      expect(networkCalls, 0);
       expect(cacheWrites, 0);
       expect(firstEvents, hasLength(1));
       expect(secondEvents, hasLength(1));
       expect(firstEvents.single.imageBytes, [1, 1, 1, 1]);
       expect(secondEvents.single.imageBytes, [1, 1, 1, 1]);
 
-      releaseNetwork.complete();
       await Future<void>.delayed(const Duration(milliseconds: 50));
 
-      expect(networkCalls, 1);
-      expect(cacheWrites, 1);
-      final cached = await CacheManager().findCache(
-        'https://example.com/thumb-hit.jpg@null@cid',
-      );
+      expect(networkCalls, 0);
+      expect(cacheWrites, 0);
+      final cached = await CacheManager().findCache(cacheKey);
       expect(cached, isNotNull);
-      expect(await cached!.readAsBytes(), [2, 2, 2, 2]);
+      expect(await cached!.readAsBytes(), [1, 1, 1, 1]);
     },
   );
 
-  test('thumbnail cache hit background refresh is throttled', () async {
-    const cacheKey = 'https://example.com/thumb-cooldown.jpg@null@cid';
-    await CacheManager().writeCache(cacheKey, [1, 1, 1, 1]);
+  test(
+    'distinct visible thumbnails are not throttled by a global queue',
+    () async {
+      final started = <String>[];
+      final releaseNetwork = Completer<void>();
+      ImageDownloader.debugThumbnailNetworkLoader =
+          (url, sourceKey, cid) async* {
+            started.add(url);
+            yield const ImageDownloadProgress(currentBytes: 1, totalBytes: 4);
+            await releaseNetwork.future;
+            yield ImageDownloadProgress(
+              currentBytes: 4,
+              totalBytes: 4,
+              imageBytes: Uint8List.fromList([url.hashCode & 0xff, 2, 2, 2]),
+            );
+          };
 
-    var networkCalls = 0;
-    ImageDownloader.debugThumbnailNetworkLoader = (url, sourceKey, cid) async* {
-      networkCalls++;
-      yield ImageDownloadProgress(
-        currentBytes: 4,
-        totalBytes: 4,
-        imageBytes: Uint8List.fromList([networkCalls, 2, 2, 2]),
-      );
-    };
+      final loads = List.generate(6, (index) {
+        return ImageDownloader.loadThumbnail(
+          'https://example.com/visible-$index.jpg',
+          null,
+          'cid-$index',
+        ).toList();
+      });
+      await Future<void>.delayed(Duration.zero);
 
-    final firstEvents = await ImageDownloader.loadThumbnail(
-      'https://example.com/thumb-cooldown.jpg',
-      null,
-      'cid',
-    ).toList();
-    await Future<void>.delayed(const Duration(milliseconds: 50));
+      expect(started, hasLength(6));
 
-    expect(firstEvents.single.imageBytes, [1, 1, 1, 1]);
-    expect(networkCalls, 1);
-    expect(
-      ImageDownloader.shouldStartThumbnailBackgroundRefresh(cacheKey),
-      isFalse,
-    );
-
-    final secondEvents = await ImageDownloader.loadThumbnail(
-      'https://example.com/thumb-cooldown.jpg',
-      null,
-      'cid',
-    ).toList();
-    await Future<void>.delayed(const Duration(milliseconds: 50));
-
-    expect(secondEvents.single.imageBytes, [1, 2, 2, 2]);
-    expect(networkCalls, 1);
-  });
+      releaseNetwork.complete();
+      final events = await Future.wait(loads);
+      expect(events, everyElement(isNotEmpty));
+    },
+  );
 
   test('thumbnail cover redirect requires comic id and info loader', () {
     expect(

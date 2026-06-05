@@ -108,26 +108,16 @@ abstract class ImageDownloader {
   static const _kReaderPrefetchPollInterval = Duration(milliseconds: 16);
   static const _kMaxConcurrentReaderPrefetches = 1;
   static const _kReaderLifecycleResumeQuietWindow = Duration(milliseconds: 900);
-  static const _kThumbnailPollInterval = Duration(milliseconds: 16);
-  static const _kMaxConcurrentVisibleThumbnails = 4;
-  static const _kMaxConcurrentBackgroundThumbnailRefreshes = 1;
-  static const _kThumbnailBackgroundRefreshCooldown = Duration(minutes: 10);
 
   static final _readerImagePriorities = <String, ReaderImageLoadPriority>{};
   static final _pendingReaderPrefetchRequests =
       <String, ReaderImageLoadPriority>{};
   static final _activeReaderImageKinds = <String, ReaderImageLoadPriority>{};
-  static final _thumbnailPriorities = <String, ThumbnailLoadPriority>{};
-  static final _activeThumbnailKinds = <String, ThumbnailLoadPriority>{};
-  static final _thumbnailBackgroundRefreshStartedAt = <String, DateTime>{};
   static DateTime? _readerLifecycleQuietUntil;
 
   static int _activeReaderForegroundLoads = 0;
   static int _activeReaderSameChapterPrefetchLoads = 0;
   static int _activeReaderNextChapterPrefetchLoads = 0;
-  static int _activeForegroundThumbnailLoads = 0;
-  static int _activeVisibleThumbnailLoads = 0;
-  static int _activeBackgroundThumbnailRefreshes = 0;
 
   @visibleForTesting
   static Stream<ImageDownloadProgress> Function(
@@ -158,12 +148,10 @@ abstract class ImageDownloader {
     String url,
     String? sourceKey, [
     String? cid,
-    ThumbnailLoadPriority priority = ThumbnailLoadPriority.visible,
   ]) async* {
     final cacheKey = "$url@$sourceKey${cid != null ? '@$cid' : ''}";
     final data = await _readNonEmptyImageCache(cacheKey);
     if (data != null) {
-      _scheduleThumbnailBackgroundRefresh(cacheKey, url, sourceKey, cid);
       _logThumbnailPerf('cover cache hit', cacheKey);
       yield ImageDownloadProgress(
         currentBytes: data.length,
@@ -173,83 +161,35 @@ abstract class ImageDownloader {
       return;
     }
 
-    yield* _thumbnailRefreshStream(
-      cacheKey,
-      url,
-      sourceKey,
-      cid,
-      priority: priority,
-    );
+    yield* _thumbnailRefreshStream(cacheKey, url, sourceKey, cid);
   }
 
   static Stream<ImageDownloadProgress> _thumbnailRefreshStream(
     String cacheKey,
     String url,
     String? sourceKey,
-    String? cid, {
-    ThumbnailLoadPriority priority = ThumbnailLoadPriority.visible,
-  }) {
+    String? cid,
+  ) {
     var existing = _loadingThumbnails[cacheKey];
     if (existing != null && existing.isClosed) {
-      _removeThumbnailLoadState(cacheKey);
+      _loadingThumbnails.remove(cacheKey);
       existing = null;
     }
     if (existing != null) {
-      _promoteThumbnailLoad(cacheKey, priority);
       return existing.stream;
     }
 
-    _thumbnailPriorities[cacheKey] = priority;
     final stream = _StreamWrapper<ImageDownloadProgress>(
       _loadThumbnailRefresh(cacheKey, url, sourceKey, cid),
       (wrapper) {
         if (_loadingThumbnails[cacheKey] == wrapper) {
-          _removeThumbnailLoadState(cacheKey);
+          _loadingThumbnails.remove(cacheKey);
         }
       },
-      beforeListen: () => _waitForThumbnailTurn(cacheKey),
-      onListenStart: () => _markThumbnailLoadStarted(cacheKey),
-      onListenFinish: () => _markThumbnailLoadFinished(cacheKey),
-      keepAliveWithoutListeners:
-          priority == ThumbnailLoadPriority.backgroundRefresh,
       replayLastValue: true,
     );
     _loadingThumbnails[cacheKey] = stream;
     return stream.stream;
-  }
-
-  static void _scheduleThumbnailBackgroundRefresh(
-    String cacheKey,
-    String url,
-    String? sourceKey,
-    String? cid,
-  ) {
-    final existing = _loadingThumbnails[cacheKey];
-    if (existing != null && !existing.isClosed) {
-      return;
-    }
-    final now = DateTime.now();
-    if (!shouldStartThumbnailBackgroundRefresh(cacheKey, now: now)) {
-      _logThumbnailPerf('cover background refresh cooldown', cacheKey);
-      return;
-    }
-    _thumbnailBackgroundRefreshStartedAt[cacheKey] = now;
-    final stream = _thumbnailRefreshStream(
-      cacheKey,
-      url,
-      sourceKey,
-      cid,
-      priority: ThumbnailLoadPriority.backgroundRefresh,
-    );
-    stream.listen(
-      (_) {},
-      onError: (Object error, StackTrace stackTrace) {
-        Log.warning(
-          "ImageDownloader",
-          "[perf] cover background refresh failed $cacheKey: $error\n$stackTrace",
-        );
-      },
-    );
   }
 
   static Stream<ImageDownloadProgress> _loadThumbnailRefresh(
@@ -619,12 +559,6 @@ abstract class ImageDownloader {
       wrapper.cancel();
     }
     _loadingThumbnails.clear();
-    _thumbnailPriorities.clear();
-    _activeThumbnailKinds.clear();
-    _thumbnailBackgroundRefreshStartedAt.clear();
-    _activeForegroundThumbnailLoads = 0;
-    _activeVisibleThumbnailLoads = 0;
-    _activeBackgroundThumbnailRefreshes = 0;
     if (resetDebugLoader) {
       debugThumbnailNetworkLoader = null;
       debugThumbnailCacheWriter = null;
@@ -649,34 +583,6 @@ abstract class ImageDownloader {
       return false;
     }
     return quietUntil.isAfter(now ?? DateTime.now());
-  }
-
-  @visibleForTesting
-  static bool shouldDeferThumbnailLoadForLifecycle(
-    ThumbnailLoadPriority priority, {
-    DateTime? now,
-  }) {
-    if (priority != ThumbnailLoadPriority.backgroundRefresh) {
-      return false;
-    }
-    final quietUntil = _readerLifecycleQuietUntil;
-    if (quietUntil == null) {
-      return false;
-    }
-    return quietUntil.isAfter(now ?? DateTime.now());
-  }
-
-  @visibleForTesting
-  static bool shouldStartThumbnailBackgroundRefresh(
-    String cacheKey, {
-    DateTime? now,
-  }) {
-    final lastStarted = _thumbnailBackgroundRefreshStartedAt[cacheKey];
-    if (lastStarted == null) {
-      return true;
-    }
-    final elapsed = (now ?? DateTime.now()).difference(lastStarted);
-    return elapsed >= _kThumbnailBackgroundRefreshCooldown;
   }
 
   static bool hasQueuedOrActiveReaderLoad(ReaderImageLoadPriority priority) {
@@ -800,126 +706,6 @@ abstract class ImageDownloader {
     _readerLifecycleQuietUntil = null;
     if (resetDebugLoader) {
       debugReaderImageLoader = null;
-    }
-  }
-
-  static Future<void> _waitForThumbnailTurn(String cacheKey) async {
-    while (true) {
-      final priority =
-          _thumbnailPriorities[cacheKey] ?? ThumbnailLoadPriority.visible;
-      if (priority == ThumbnailLoadPriority.backgroundRefresh) {
-        if (shouldDeferThumbnailLoadForLifecycle(priority) ||
-            _activeForegroundThumbnailLoads > 0 ||
-            _activeVisibleThumbnailLoads > 0 ||
-            _activeBackgroundThumbnailRefreshes >=
-                _kMaxConcurrentBackgroundThumbnailRefreshes ||
-            _hasQueuedVisibleThumbnail(excludeCacheKey: cacheKey)) {
-          await Future.delayed(_kThumbnailPollInterval);
-          continue;
-        }
-        _logThumbnailPerf('cover background refresh start', cacheKey);
-        return;
-      }
-
-      final activeVisible =
-          _activeForegroundThumbnailLoads + _activeVisibleThumbnailLoads;
-      if (activeVisible < _kMaxConcurrentVisibleThumbnails) {
-        _logThumbnailPerf('cover visible network start', cacheKey);
-        return;
-      }
-      await Future.delayed(_kThumbnailPollInterval);
-    }
-  }
-
-  static bool _hasQueuedVisibleThumbnail({String? excludeCacheKey}) {
-    for (final entry in _thumbnailPriorities.entries) {
-      if (entry.key == excludeCacheKey) {
-        continue;
-      }
-      if (entry.value != ThumbnailLoadPriority.backgroundRefresh) {
-        return true;
-      }
-    }
-    for (final entry in _activeThumbnailKinds.entries) {
-      if (entry.key == excludeCacheKey) {
-        continue;
-      }
-      if (entry.value != ThumbnailLoadPriority.backgroundRefresh) {
-        return true;
-      }
-    }
-    return false;
-  }
-
-  static void _markThumbnailLoadStarted(String cacheKey) {
-    final priority =
-        _thumbnailPriorities[cacheKey] ?? ThumbnailLoadPriority.visible;
-    _activeThumbnailKinds[cacheKey] = priority;
-    _incrementActiveThumbnailLoadCount(priority);
-  }
-
-  static void _markThumbnailLoadFinished(String cacheKey) {
-    final priority = _activeThumbnailKinds.remove(cacheKey);
-    _decrementActiveThumbnailLoadCount(priority);
-  }
-
-  static void _removeThumbnailLoadState(String cacheKey) {
-    _loadingThumbnails.remove(cacheKey);
-    _thumbnailPriorities.remove(cacheKey);
-    final activePriority = _activeThumbnailKinds.remove(cacheKey);
-    _decrementActiveThumbnailLoadCount(activePriority);
-  }
-
-  static void _promoteThumbnailLoad(
-    String cacheKey,
-    ThumbnailLoadPriority targetPriority,
-  ) {
-    final storedPriority = _thumbnailPriorities[cacheKey];
-    if (storedPriority == null || targetPriority.index < storedPriority.index) {
-      _thumbnailPriorities[cacheKey] = targetPriority;
-    }
-    final activePriority = _activeThumbnailKinds[cacheKey];
-    if (activePriority != null && targetPriority.index < activePriority.index) {
-      _decrementActiveThumbnailLoadCount(activePriority);
-      _activeThumbnailKinds[cacheKey] = targetPriority;
-      _incrementActiveThumbnailLoadCount(targetPriority);
-    }
-  }
-
-  static void _incrementActiveThumbnailLoadCount(
-    ThumbnailLoadPriority priority,
-  ) {
-    switch (priority) {
-      case ThumbnailLoadPriority.foregroundVisible:
-        _activeForegroundThumbnailLoads++;
-      case ThumbnailLoadPriority.visible:
-        _activeVisibleThumbnailLoads++;
-      case ThumbnailLoadPriority.backgroundRefresh:
-        _activeBackgroundThumbnailRefreshes++;
-    }
-  }
-
-  static void _decrementActiveThumbnailLoadCount(
-    ThumbnailLoadPriority? priority,
-  ) {
-    switch (priority) {
-      case ThumbnailLoadPriority.foregroundVisible:
-        _activeForegroundThumbnailLoads--;
-      case ThumbnailLoadPriority.visible:
-        _activeVisibleThumbnailLoads--;
-      case ThumbnailLoadPriority.backgroundRefresh:
-        _activeBackgroundThumbnailRefreshes--;
-      case null:
-        break;
-    }
-    if (_activeForegroundThumbnailLoads < 0) {
-      _activeForegroundThumbnailLoads = 0;
-    }
-    if (_activeVisibleThumbnailLoads < 0) {
-      _activeVisibleThumbnailLoads = 0;
-    }
-    if (_activeBackgroundThumbnailRefreshes < 0) {
-      _activeBackgroundThumbnailRefreshes = 0;
     }
   }
 
@@ -1358,8 +1144,6 @@ enum ReaderImageLoadPriority {
   sameChapterPrefetch,
   nextChapterPrefetch,
 }
-
-enum ThumbnailLoadPriority { foregroundVisible, visible, backgroundRefresh }
 
 class ImageDownloadProgress {
   final int currentBytes;
