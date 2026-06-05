@@ -47,6 +47,11 @@ class _ProxySettingViewState extends State<_ProxySettingView> {
   String username = '';
   String password = '';
 
+  late final TextEditingController _hostController;
+  late final TextEditingController _portController;
+  late final TextEditingController _usernameController;
+  late final TextEditingController _passwordController;
+
   // USERNAME:PASSWORD@HOST:PORT
   String toProxyStr() {
     if (type == 'direct') {
@@ -101,9 +106,22 @@ class _ProxySettingViewState extends State<_ProxySettingView> {
 
   @override
   void initState() {
-    var proxy = appdata.settings['proxy'];
-    parseProxyString(proxy);
     super.initState();
+    var proxy = appdata.settings['proxy'];
+    parseProxyString(proxy == null ? 'system' : proxy.toString());
+    _hostController = TextEditingController(text: host);
+    _portController = TextEditingController(text: port);
+    _usernameController = TextEditingController(text: username);
+    _passwordController = TextEditingController(text: password);
+  }
+
+  @override
+  void dispose() {
+    _hostController.dispose();
+    _portController.dispose();
+    _usernameController.dispose();
+    _passwordController.dispose();
+    super.dispose();
   }
 
   @override
@@ -119,23 +137,14 @@ class _ProxySettingViewState extends State<_ProxySettingView> {
             });
             if (type != 'manual') {
               appdata.settings['proxy'] = toProxyStr();
-              appdata.saveData();
+              appdata.saveDataInBackground();
             }
           },
           child: Column(
             children: [
-              RadioListTile<String>(
-                title: Text("Direct".tl),
-                value: 'direct',
-              ),
-              RadioListTile<String>(
-                title: Text("System".tl),
-                value: 'system',
-              ),
-              RadioListTile(
-                title: Text("Manual".tl),
-                value: 'manual',
-              ),
+              RadioListTile<String>(title: Text("Direct".tl), value: 'direct'),
+              RadioListTile<String>(title: Text("System".tl), value: 'system'),
+              RadioListTile(title: Text("Manual".tl), value: 'manual'),
               if (type == 'manual') buildManualProxy(),
             ],
           ),
@@ -156,7 +165,7 @@ class _ProxySettingViewState extends State<_ProxySettingView> {
               border: const OutlineInputBorder(),
               labelText: "Host".tl,
             ),
-            controller: TextEditingController(text: host),
+            controller: _hostController,
             onChanged: (v) {
               host = v;
             },
@@ -173,7 +182,7 @@ class _ProxySettingViewState extends State<_ProxySettingView> {
               border: const OutlineInputBorder(),
               labelText: "Port".tl,
             ),
-            controller: TextEditingController(text: port),
+            controller: _portController,
             onChanged: (v) {
               port = v;
             },
@@ -193,7 +202,7 @@ class _ProxySettingViewState extends State<_ProxySettingView> {
               border: const OutlineInputBorder(),
               labelText: "Username".tl,
             ),
-            controller: TextEditingController(text: username),
+            controller: _usernameController,
             onChanged: (v) {
               username = v;
             },
@@ -210,7 +219,7 @@ class _ProxySettingViewState extends State<_ProxySettingView> {
               border: const OutlineInputBorder(),
               labelText: "Password".tl,
             ),
-            controller: TextEditingController(text: password),
+            controller: _passwordController,
             onChanged: (v) {
               password = v;
             },
@@ -220,7 +229,7 @@ class _ProxySettingViewState extends State<_ProxySettingView> {
             onPressed: () {
               if (formKey.currentState?.validate() ?? false) {
                 appdata.settings['proxy'] = toProxyStr();
-                appdata.saveData();
+                appdata.saveDataInBackground();
                 App.rootContext.pop();
               }
             },
@@ -244,11 +253,15 @@ class __DNSOverridesState extends State<_DNSOverrides> {
 
   @override
   void initState() {
-    for (var entry in (appdata.settings['dnsOverrides'] as Map).entries) {
+    final dnsOverrides = appdata.settings['dnsOverrides'];
+    final entries = dnsOverrides is Map
+        ? dnsOverrides.entries
+        : <MapEntry<dynamic, dynamic>>[];
+    for (var entry in entries) {
       if (entry.key is String && entry.value is String) {
         overrides.add((
           TextEditingController(text: entry.key),
-          TextEditingController(text: entry.value)
+          TextEditingController(text: entry.value),
         ));
       }
     }
@@ -260,9 +273,11 @@ class __DNSOverridesState extends State<_DNSOverrides> {
     var map = <String, String>{};
     for (var entry in overrides) {
       map[entry.$1.text] = entry.$2.text;
+      entry.$1.dispose();
+      entry.$2.dispose();
     }
     appdata.settings['dnsOverrides'] = map;
-    appdata.saveData();
+    appdata.saveDataInBackground();
     JsEngine().resetDio();
     super.dispose();
   }
@@ -278,10 +293,7 @@ class __DNSOverridesState extends State<_DNSOverrides> {
               title: "Enable DNS Overrides".tl,
               settingKey: "enableDnsOverrides",
             ),
-            _SwitchSetting(
-              title: "Server Name Indication",
-              settingKey: "sni",
-            ),
+            _SwitchSetting(title: "Server Name Indication", settingKey: "sni"),
             const SizedBox(height: 8),
             Container(
               height: 1,
@@ -293,8 +305,10 @@ class __DNSOverridesState extends State<_DNSOverrides> {
             TextButton.icon(
               onPressed: () {
                 setState(() {
-                  overrides
-                      .add((TextEditingController(), TextEditingController()));
+                  overrides.add((
+                    TextEditingController(),
+                    TextEditingController(),
+                  ));
                 });
               },
               icon: const Icon(Icons.add),
@@ -314,15 +328,9 @@ class __DNSOverridesState extends State<_DNSOverrides> {
       margin: EdgeInsets.symmetric(horizontal: 8),
       decoration: BoxDecoration(
         border: Border(
-          bottom: BorderSide(
-            color: context.colorScheme.outlineVariant,
-          ),
-          left: BorderSide(
-            color: context.colorScheme.outlineVariant,
-          ),
-          right: BorderSide(
-            color: context.colorScheme.outlineVariant,
-          ),
+          bottom: BorderSide(color: context.colorScheme.outlineVariant),
+          left: BorderSide(color: context.colorScheme.outlineVariant),
+          right: BorderSide(color: context.colorScheme.outlineVariant),
         ),
       ),
       child: Row(
@@ -336,10 +344,7 @@ class __DNSOverridesState extends State<_DNSOverrides> {
               controller: entry.$1,
             ).paddingHorizontal(8),
           ),
-          Container(
-            width: 1,
-            color: context.colorScheme.outlineVariant,
-          ),
+          Container(width: 1, color: context.colorScheme.outlineVariant),
           Expanded(
             child: TextField(
               decoration: InputDecoration(
@@ -349,15 +354,14 @@ class __DNSOverridesState extends State<_DNSOverrides> {
               controller: entry.$2,
             ).paddingHorizontal(8),
           ),
-          Container(
-            width: 1,
-            color: context.colorScheme.outlineVariant,
-          ),
+          Container(width: 1, color: context.colorScheme.outlineVariant),
           IconButton(
             icon: const Icon(Icons.delete_outline),
             onPressed: () {
               setState(() {
-                overrides.removeAt(index);
+                final removed = overrides.removeAt(index);
+                removed.$1.dispose();
+                removed.$2.dispose();
               });
             },
           ),

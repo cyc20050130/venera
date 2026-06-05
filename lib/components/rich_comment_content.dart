@@ -102,11 +102,12 @@ class _Tag {
   }
 
   static void handleLink(String link) async {
-    if (link.isURL) {
-      if (await handleAppLink(Uri.parse(link))) {
+    final uri = parseSafeLinkUri(link);
+    if (uri != null) {
+      if (await handleAppLink(uri)) {
         Navigator.of(App.rootContext).maybePop();
       } else {
-        launchUrlString(link);
+        launchUrlString(uri.toString());
       }
     }
   }
@@ -180,6 +181,11 @@ class _RichCommentContentState extends State<RichCommentContent> {
             var tagContent = text.substring(i + 1, j);
             var splits = tagContent.split(' ');
             splits.removeWhere((element) => element.isEmpty);
+            if (splits.isEmpty) {
+              buffer.write(text[i]);
+              i++;
+              continue;
+            }
             var tagName = splits[0];
             var attributes = <String, String>{};
             for (var k = 1; k < splits.length; k++) {
@@ -230,6 +236,11 @@ class _RichCommentContentState extends State<RichCommentContent> {
             var tagContent = text.substring(i + 2, j);
             var splits = tagContent.split(' ');
             splits.removeWhere((element) => element.isEmpty);
+            if (splits.isEmpty) {
+              buffer.write(text[i]);
+              i++;
+              continue;
+            }
             var tagName = splits[0];
             if (s.isNotEmpty && s.last.name == tagName) {
               writeBuffer();

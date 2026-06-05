@@ -40,4 +40,13 @@ void main() {
       2,
     );
   });
+
+  test('normalizeReaderPageForLoadedImages clamps stale history pages', () {
+    expect(normalizeReaderPageForLoadedImages(page: 1, maxPage: 5), 1);
+    expect(normalizeReaderPageForLoadedImages(page: 5, maxPage: 5), 5);
+    expect(normalizeReaderPageForLoadedImages(page: 99, maxPage: 5), 5);
+    expect(normalizeReaderPageForLoadedImages(page: 0, maxPage: 5), 1);
+    expect(normalizeReaderPageForLoadedImages(page: -7, maxPage: 5), 1);
+    expect(normalizeReaderPageForLoadedImages(page: 3, maxPage: 0), 1);
+  });
 }

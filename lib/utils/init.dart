@@ -27,6 +27,17 @@ abstract mixin class Init {
   }
 
   @protected
+  void markUninitialized() {
+    _isInit = false;
+    for (var completer in _initCompleter) {
+      if (!completer.isCompleted) {
+        completer.complete();
+      }
+    }
+    _initCompleter.clear();
+  }
+
+  @protected
   Future<void> doInit();
 
   /// Initialize the class.

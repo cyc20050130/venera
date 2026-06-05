@@ -112,4 +112,25 @@ void main() {
     var item4 = await channel.pop();
     expect(item4, null);
   });
+
+  test("blocked producers do not exceed capacity after one release", () async {
+    var channel = Channel<int>(1);
+
+    await channel.push(1);
+    var push2 = channel.push(2);
+    var push3 = channel.push(3);
+    await Future<void>.delayed(Duration.zero);
+
+    expect(channel.currentSize, 1);
+    expect(await channel.pop(), 1);
+    await Future<void>.delayed(Duration.zero);
+
+    expect(channel.currentSize, 1);
+    expect(await channel.pop(), 2);
+    await Future<void>.delayed(Duration.zero);
+
+    expect(channel.currentSize, 1);
+    expect(await channel.pop(), 3);
+    await Future.wait([push2, push3]);
+  });
 }

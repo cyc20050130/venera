@@ -112,7 +112,7 @@ class NaviPaneState extends State<NaviPane>
       listener(index);
     }
     if (widget.observer.routes.length > 1) {
-      widget.navigatorKey.currentState!.popUntil((route) => route.isFirst);
+      widget.navigatorKey.currentState?.popUntil((route) => route.isFirst);
     }
     if (currentPage == index) {
       return;
@@ -183,8 +183,9 @@ class NaviPaneState extends State<NaviPane>
         : EdgeInsets.zero;
     return _NaviPopScope(
       action: () {
-        if (App.mainNavigatorKey!.currentState!.canPop()) {
-          App.mainNavigatorKey!.currentState!.maybePop();
+        final mainNavigator = App.mainNavigatorKey?.currentState;
+        if (mainNavigator?.canPop() ?? false) {
+          mainNavigator?.maybePop();
         } else {
           SystemNavigator.pop();
         }
@@ -212,10 +213,7 @@ class NaviPaneState extends State<NaviPane>
             ],
           );
           if (sideInsets != EdgeInsets.zero) {
-            content = Padding(
-              padding: sideInsets,
-              child: content,
-            );
+            content = Padding(padding: sideInsets, child: content);
           }
           return content;
         },
@@ -565,7 +563,7 @@ class NaviObserver extends NavigatorObserver implements Listenable {
 
   @override
   void didPop(Route route, Route? previousRoute) {
-    routes.removeLast();
+    routes.remove(route);
     notifyListeners();
   }
 
@@ -590,7 +588,7 @@ class NaviObserver extends NavigatorObserver implements Listenable {
     notifyListeners();
   }
 
-  List<VoidCallback> listeners = [];
+  final List<VoidCallback> listeners = [];
 
   @override
   void addListener(VoidCallback listener) {
@@ -603,7 +601,11 @@ class NaviObserver extends NavigatorObserver implements Listenable {
   }
 
   void notifyListeners() {
-    for (var listener in listeners) {
+    final currentListeners = List<VoidCallback>.of(listeners);
+    for (var listener in currentListeners) {
+      if (!listeners.contains(listener)) {
+        continue;
+      }
       listener();
     }
   }
@@ -660,12 +662,24 @@ class _NaviMainView extends StatefulWidget {
 class _NaviMainViewState extends State<_NaviMainView> {
   NaviPaneState get state => widget.state;
 
+  late final VoidCallback _mainViewUpdateHandler;
+
   @override
   void initState() {
-    state.mainViewUpdateHandler = () {
+    _mainViewUpdateHandler = () {
+      if (!mounted) return;
       setState(() {});
     };
+    state.mainViewUpdateHandler = _mainViewUpdateHandler;
     super.initState();
+  }
+
+  @override
+  void dispose() {
+    if (identical(state.mainViewUpdateHandler, _mainViewUpdateHandler)) {
+      state.mainViewUpdateHandler = null;
+    }
+    super.dispose();
   }
 
   @override

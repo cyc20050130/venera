@@ -3,13 +3,24 @@ part of 'comic_page.dart';
 abstract mixin class _ComicPageActions {
   BuildContext get pageContext;
 
+  bool get isPageMounted;
+
   void update();
 
   void invalidateFavoriteStatusRefresh();
 
   ComicDetails get comic;
 
-  ComicSource get comicSource => ComicSource.find(comic.sourceKey)!;
+  ComicSource? get comicSource => ComicSource.find(comic.sourceKey);
+
+  ComicSource? get _activeComicSource {
+    final source = comicSource;
+    if (!shouldEnableComicPageSourceAction(source)) {
+      App.rootContext.showMessage(message: "Comic source not found".tl);
+      return null;
+    }
+    return source;
+  }
 
   History? get history;
 
@@ -17,18 +28,50 @@ abstract mixin class _ComicPageActions {
 
   bool isLiked = false;
 
+  int _likeRequestId = 0;
+
   void likeOrUnlike() async {
     if (isLiking) return;
+    final requestId = ++_likeRequestId;
+    final comicId = comic.id;
+    final wasLiked = isLiked;
+    final source = _activeComicSource;
+    if (source == null || source.likeOrUnlikeComic == null) {
+      return;
+    }
     isLiking = true;
     update();
-    var res = await comicSource.likeOrUnlikeComic!(comic.id, isLiked);
-    if (res.error) {
-      App.rootContext.showMessage(message: res.errorMessage!);
-    } else {
-      isLiked = !isLiked;
+
+    try {
+      var res = await source.likeOrUnlikeComic!(comicId, wasLiked);
+      if (!_shouldApplyLikeResult(requestId)) {
+        return;
+      }
+      if (res.error) {
+        App.rootContext.showMessage(message: res.errorMessage!);
+      } else {
+        isLiked = !wasLiked;
+      }
+    } catch (e, s) {
+      if (!_shouldApplyLikeResult(requestId)) {
+        return;
+      }
+      Log.error("ComicPage", "Failed to update like for $comicId: $e", s);
+      App.rootContext.showMessage(message: e.toString());
+    } finally {
+      if (_shouldApplyLikeResult(requestId)) {
+        isLiking = false;
+        update();
+      }
     }
-    isLiking = false;
-    update();
+  }
+
+  bool _shouldApplyLikeResult(int requestId) {
+    return shouldApplyComicPageAsyncResult(
+      mounted: isPageMounted,
+      requestId: requestId,
+      activeRequestId: _likeRequestId,
+    );
   }
 
   /// whether the comic is added to local favorite
@@ -143,6 +186,10 @@ abstract mixin class _ComicPageActions {
   void onReadEnd();
 
   void download() async {
+    final source = _activeComicSource;
+    if (source == null) {
+      return;
+    }
     if (LocalManager().isDownloading(comic.id, comic.comicType)) {
       App.rootContext.showMessage(message: "The comic is downloading".tl);
       return;
@@ -153,7 +200,8 @@ abstract mixin class _ComicPageActions {
       return;
     }
 
-    if (comicSource.archiveDownloader != null) {
+    final archiveDownloader = source.archiveDownloader;
+    if (archiveDownloader != null) {
       bool useNormalDownload = false;
       List<ArchiveInfo>? archives;
       int selected = -1;
@@ -187,21 +235,24 @@ abstract mixin class _ComicPageActions {
                         ),
                         onExpansionChanged: (b) {
                           if (!isLoading && b && archives == null) {
-                            isLoading = true;
-                            comicSource.archiveDownloader!
-                                .getArchives(comic.id)
-                                .then((value) {
-                                  if (value.success) {
-                                    archives = value.data;
-                                  } else {
-                                    App.rootContext.showMessage(
-                                      message: value.errorMessage!,
-                                    );
-                                  }
-                                  setState(() {
-                                    isLoading = false;
-                                  });
-                                });
+                            setState(() {
+                              isLoading = true;
+                            });
+                            archiveDownloader.getArchives(comic.id).then((
+                              value,
+                            ) {
+                              if (!context.mounted) return;
+                              if (value.success) {
+                                archives = value.data;
+                              } else {
+                                App.rootContext.showMessage(
+                                  message: value.errorMessage!,
+                                );
+                              }
+                              setState(() {
+                                isLoading = false;
+                              });
+                            });
                           }
                         },
                         children: [
@@ -231,18 +282,30 @@ abstract mixin class _ComicPageActions {
                       setState(() {
                         isGettingLink = true;
                       });
-                      var res = await comicSource.archiveDownloader!
-                          .getDownloadUrl(comic.id, archives![selected].id);
+                      var res = await archiveDownloader.getDownloadUrl(
+                        comic.id,
+                        archives![selected].id,
+                      );
+                      if (!context.mounted) return;
                       if (res.error) {
                         App.rootContext.showMessage(message: res.errorMessage!);
                         setState(() {
                           isGettingLink = false;
                         });
-                      } else if (context.mounted) {
+                      } else {
                         if (res.data.isNotEmpty) {
-                          LocalManager().addTask(
-                            ArchiveDownloadTask(res.data, comic),
+                          final task = ArchiveDownloadTask.tryCreate(
+                            res.data,
+                            comic,
                           );
+                          if (task == null) {
+                            App.rootContext.showMessage(
+                              message: "Comic source not found".tl,
+                            );
+                            context.pop();
+                            return;
+                          }
+                          LocalManager().addTask(task);
                           App.rootContext.showMessage(
                             message: "Download started".tl,
                           );
@@ -265,11 +328,7 @@ abstract mixin class _ComicPageActions {
 
     if (comic.chapters == null) {
       LocalManager().addTask(
-        ImagesDownloadTask(
-          source: comicSource,
-          comicId: comic.id,
-          comic: comic,
-        ),
+        ImagesDownloadTask(source: source, comicId: comic.id, comic: comic),
       );
     } else {
       List<int>? selected;
@@ -295,7 +354,7 @@ abstract mixin class _ComicPageActions {
       if (selected == null) return;
       LocalManager().addTask(
         ImagesDownloadTask(
-          source: comicSource,
+          source: source,
           comicId: comic.id,
           comic: comic,
           chapters: selected!.map((i) {
@@ -309,8 +368,9 @@ abstract mixin class _ComicPageActions {
   }
 
   void onTapTag(String tag, String namespace) {
-    var target = comicSource.handleClickTagEvent?.call(namespace, tag);
-    var context = App.mainNavigatorKey!.currentContext!;
+    var target = comicSource?.handleClickTagEvent?.call(namespace, tag);
+    var context = App.mainNavigatorKey?.currentContext;
+    if (context == null || !context.mounted) return;
     target?.jump(context);
   }
 
@@ -354,14 +414,16 @@ abstract mixin class _ComicPageActions {
   }
 
   void showComments() {
-    showSideBar(
-      App.rootContext,
-      CommentsPage(data: comic, source: comicSource),
-    );
+    final source = _activeComicSource;
+    if (source == null) {
+      return;
+    }
+    showSideBar(App.rootContext, CommentsPage(data: comic, source: source));
   }
 
   void starRating() {
-    if (!comicSource.isLogged) {
+    final source = _activeComicSource;
+    if (source == null || !source.isLogged || source.starRatingFunc == null) {
       return;
     }
     var rating = 0.0;
@@ -395,22 +457,26 @@ abstract mixin class _ComicPageActions {
                           setState(() {
                             isLoading = true;
                           });
-                          comicSource.starRatingFunc!(comic.id, rating.round())
-                              .then((value) {
-                                if (value.success) {
-                                  App.rootContext.showMessage(
-                                    message: "Success".tl,
-                                  );
-                                  Navigator.of(dialogContext).pop();
-                                } else {
-                                  App.rootContext.showMessage(
-                                    message: value.errorMessage!,
-                                  );
-                                  setState(() {
-                                    isLoading = false;
-                                  });
-                                }
-                              });
+                          source.starRatingFunc!(comic.id, rating.round()).then(
+                            (value) {
+                              if (!context.mounted || !dialogContext.mounted) {
+                                return;
+                              }
+                              if (value.success) {
+                                App.rootContext.showMessage(
+                                  message: "Success".tl,
+                                );
+                                Navigator.of(dialogContext).pop();
+                              } else {
+                                App.rootContext.showMessage(
+                                  message: value.errorMessage!,
+                                );
+                                setState(() {
+                                  isLoading = false;
+                                });
+                              }
+                            },
+                          );
                         },
                         child: Text("Submit".tl),
                       ),

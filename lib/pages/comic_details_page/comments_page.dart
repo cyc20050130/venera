@@ -1,9 +1,9 @@
 part of 'comic_page.dart';
 
 bool _shouldBlockComment(Comment comment) {
-  var blockedWords = appdata.settings["blockedCommentWords"] as List;
+  var blockedWords = appdata.settings.stringList("blockedCommentWords");
   if (blockedWords.isEmpty) return false;
-  
+
   var content = comment.content.toLowerCase();
   for (var word in blockedWords) {
     if (content.contains(word.toString().toLowerCase())) {
@@ -11,6 +11,27 @@ bool _shouldBlockComment(Comment comment) {
     }
   }
   return false;
+}
+
+@visibleForTesting
+bool shouldStartCommentLoad({required bool loading, required bool inFlight}) =>
+    loading && !inFlight;
+
+@visibleForTesting
+bool shouldApplyCommentActionResult({
+  required bool mounted,
+  required int requestId,
+  required int activeRequestId,
+}) {
+  return mounted && requestId == activeRequestId;
+}
+
+@visibleForTesting
+int resolveCommentVoteStatus({required bool isUp, required bool isCancel}) {
+  if (isCancel) {
+    return 0;
+  }
+  return isUp ? 1 : -1;
 }
 
 class CommentsPage extends StatefulWidget {
@@ -39,37 +60,87 @@ class _CommentsPageState extends State<CommentsPage> {
   int? maxPage;
   var controller = TextEditingController();
   bool sending = false;
+  bool _firstLoadInFlight = false;
+  bool _loadMoreInFlight = false;
+  int _loadRequestId = 0;
+  int _sendCommentRequestId = 0;
+
+  @override
+  void dispose() {
+    _loadRequestId++;
+    _sendCommentRequestId++;
+    _firstLoadInFlight = false;
+    _loadMoreInFlight = false;
+    controller.dispose();
+    super.dispose();
+  }
 
   void firstLoad() async {
-    var res = await widget.source.commentsLoader!(
-        widget.data.comicId, widget.data.subId, 1, widget.replyComment?.id);
+    if (!shouldStartCommentLoad(
+      loading: _loading,
+      inFlight: _firstLoadInFlight,
+    )) {
+      return;
+    }
+    _firstLoadInFlight = true;
+    final requestId = ++_loadRequestId;
+    late final Res<List<Comment>> res;
+    try {
+      res = await widget.source.commentsLoader!(
+        widget.data.comicId,
+        widget.data.subId,
+        1,
+        widget.replyComment?.id,
+      );
+    } catch (e) {
+      res = Res.error(e.toString());
+    }
+    if (!mounted || requestId != _loadRequestId) return;
+    _firstLoadInFlight = false;
     if (res.error) {
       setState(() {
         _error = res.errorMessage;
         _loading = false;
       });
-    } else if (mounted) {
-      var filteredComments = res.data.where((c) => !_shouldBlockComment(c)).toList();
-      setState(() {
-        _comments = filteredComments;
-        _loading = false;
-        maxPage = res.subData;
-      });
+      return;
     }
+    var filteredComments = res.data
+        .where((c) => !_shouldBlockComment(c))
+        .toList();
+    setState(() {
+      _comments = filteredComments;
+      _loading = false;
+      maxPage = normalizeLoadingMaxPage(res.subData);
+    });
   }
 
   void loadMore() async {
-    var res = await widget.source.commentsLoader!(
-      widget.data.comicId,
-      widget.data.subId,
-      _page + 1,
-      widget.replyComment?.id,
-    );
+    if (_loadMoreInFlight) return;
+    _loadMoreInFlight = true;
+    final requestId = _loadRequestId;
+    late final Res<List<Comment>> res;
+    try {
+      res = await widget.source.commentsLoader!(
+        widget.data.comicId,
+        widget.data.subId,
+        _page + 1,
+        widget.replyComment?.id,
+      );
+    } catch (e) {
+      res = Res.error(e.toString());
+    }
+    if (!mounted || requestId != _loadRequestId) return;
     if (res.error) {
+      setState(() {
+        _loadMoreInFlight = false;
+      });
       context.showMessage(message: res.errorMessage ?? "Unknown Error");
     } else {
-      var filteredComments = res.data.where((c) => !_shouldBlockComment(c)).toList();
+      var filteredComments = res.data
+          .where((c) => !_shouldBlockComment(c))
+          .toList();
       setState(() {
+        _loadMoreInFlight = false;
         _comments!.addAll(filteredComments);
         _page++;
         if (maxPage == null && res.data.isEmpty) {
@@ -83,10 +154,7 @@ class _CommentsPageState extends State<CommentsPage> {
   Widget build(BuildContext context) {
     return Scaffold(
       resizeToAvoidBottomInset: false,
-      appBar: Appbar(
-        title: Text("Comments".tl),
-        style: AppbarStyle.shadow,
-      ),
+      appBar: Appbar(title: Text("Comments".tl), style: AppbarStyle.shadow),
       body: buildBody(context),
     );
   }
@@ -94,15 +162,17 @@ class _CommentsPageState extends State<CommentsPage> {
   Widget buildBody(BuildContext context) {
     if (_loading) {
       firstLoad();
-      return const Center(
-        child: CircularProgressIndicator(),
-      );
+      return const Center(child: CircularProgressIndicator());
     } else if (_error != null) {
       return NetworkError(
         message: _error!,
         retry: () {
           setState(() {
             _loading = true;
+            _error = null;
+            _firstLoadInFlight = false;
+            _loadMoreInFlight = false;
+            _loadRequestId++;
           });
         },
         withAppbar: false,
@@ -148,10 +218,7 @@ class _CommentsPageState extends State<CommentsPage> {
                                   ),
                                 ),
                               ),
-                              child: Text(
-                                "Replies".tl,
-                                style: ts.s18,
-                              ),
+                              child: Text("Replies".tl, style: ts.s18),
                             ),
                           ],
                         );
@@ -181,7 +248,7 @@ class _CommentsPageState extends State<CommentsPage> {
               },
             ),
           ),
-          buildBottom(context)
+          buildBottom(context),
         ],
       );
     }
@@ -189,9 +256,7 @@ class _CommentsPageState extends State<CommentsPage> {
 
   Widget buildBottom(BuildContext context) {
     if (widget.source.sendCommentFunc == null) {
-      return const SizedBox(
-        height: 0,
-      );
+      return const SizedBox(height: 0);
     }
     return Container(
       padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 8),
@@ -213,9 +278,10 @@ class _CommentsPageState extends State<CommentsPage> {
               child: TextField(
                 controller: controller,
                 decoration: InputDecoration(
-                    border: InputBorder.none,
-                    isCollapsed: true,
-                    hintText: "Comment".tl),
+                  border: InputBorder.none,
+                  isCollapsed: true,
+                  hintText: "Comment".tl,
+                ),
                 minLines: 1,
                 maxLines: 5,
               ),
@@ -226,9 +292,7 @@ class _CommentsPageState extends State<CommentsPage> {
                 child: SizedBox(
                   width: 24,
                   height: 24,
-                  child: CircularProgressIndicator(
-                    strokeWidth: 2,
-                  ),
+                  child: CircularProgressIndicator(strokeWidth: 2),
                 ),
               )
             else
@@ -237,25 +301,51 @@ class _CommentsPageState extends State<CommentsPage> {
                   if (controller.text.isEmpty) {
                     return;
                   }
+                  final requestId = ++_sendCommentRequestId;
+                  final text = controller.text;
                   setState(() {
                     sending = true;
                   });
-                  var b = await widget.source.sendCommentFunc!(
+
+                  try {
+                    var b = await widget.source.sendCommentFunc!(
                       widget.data.comicId,
                       widget.data.subId,
-                      controller.text,
-                      widget.replyComment?.id);
-                  if (!b.error) {
-                    controller.text = "";
-                    setState(() {
-                      sending = false;
-                      _loading = true;
-                      _comments?.clear();
-                      _page = 1;
-                      maxPage = null;
-                    });
-                  } else {
-                    context.showMessage(message: b.errorMessage ?? "Error");
+                      text,
+                      widget.replyComment?.id,
+                    );
+                    if (!_shouldApplySendCommentResult(requestId)) {
+                      return;
+                    }
+                    if (!b.error) {
+                      controller.text = "";
+                      setState(() {
+                        sending = false;
+                        _loading = true;
+                        _error = null;
+                        _comments?.clear();
+                        _page = 1;
+                        maxPage = null;
+                        _firstLoadInFlight = false;
+                        _loadMoreInFlight = false;
+                        _loadRequestId++;
+                      });
+                    } else {
+                      context.showMessage(message: b.errorMessage ?? "Error");
+                      setState(() {
+                        sending = false;
+                      });
+                    }
+                  } catch (e, s) {
+                    if (!_shouldApplySendCommentResult(requestId)) {
+                      return;
+                    }
+                    Log.error(
+                      "CommentsPage",
+                      "Failed to send comment for ${widget.data.comicId}: $e",
+                      s,
+                    );
+                    context.showMessage(message: e.toString());
                     setState(() {
                       sending = false;
                     });
@@ -265,10 +355,18 @@ class _CommentsPageState extends State<CommentsPage> {
                   Icons.send,
                   color: Theme.of(context).colorScheme.secondary,
                 ),
-              )
+              ),
           ],
         ).paddingLeft(16).paddingRight(4),
       ),
+    );
+  }
+
+  bool _shouldApplySendCommentResult(int requestId) {
+    return shouldApplyCommentActionResult(
+      mounted: mounted,
+      requestId: requestId,
+      activeRequestId: _sendCommentRequestId,
     );
   }
 }
@@ -318,8 +416,9 @@ class _CommentTileState extends State<_CommentTile> {
               height: 36,
               clipBehavior: Clip.antiAlias,
               decoration: BoxDecoration(
-                  borderRadius: BorderRadius.circular(18),
-                  color: Theme.of(context).colorScheme.secondaryContainer),
+                borderRadius: BorderRadius.circular(18),
+                color: Theme.of(context).colorScheme.secondaryContainer,
+              ),
               child: widget.comment.avatar == null
                   ? null
                   : AnimatedImage(
@@ -333,10 +432,7 @@ class _CommentTileState extends State<_CommentTile> {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Text(
-                  widget.comment.userName,
-                  style: ts.bold,
-                ),
+                Text(widget.comment.userName, style: ts.bold),
                 if (widget.comment.time != null)
                   Text(widget.comment.time!, style: ts.s12),
                 const SizedBox(height: 4),
@@ -344,7 +440,7 @@ class _CommentTileState extends State<_CommentTile> {
                 buildActions(),
               ],
             ),
-          )
+          ),
         ],
       ),
     );
@@ -413,7 +509,18 @@ class _CommentTileState extends State<_CommentTile> {
 
   bool isLiked = false;
 
+  int _likeRequestId = 0;
+
+  int _voteRequestId = 0;
+
   var likes = 0;
+
+  @override
+  void dispose() {
+    _likeRequestId++;
+    _voteRequestId++;
+    super.dispose();
+  }
 
   Widget buildLike() {
     return Container(
@@ -429,24 +536,45 @@ class _CommentTileState extends State<_CommentTile> {
         borderRadius: BorderRadius.circular(16),
         onTap: () async {
           if (isLiking) return;
+          final requestId = ++_likeRequestId;
+          final wasLiked = isLiked;
           setState(() {
             isLiking = true;
           });
-          var res = await widget.source.likeCommentFunc!(
-            widget.comic.comicId,
-            widget.comic.subId,
-            widget.comment.id!,
-            !isLiked,
-          );
-          if (res.success) {
-            isLiked = !isLiked;
-            likes += isLiked ? 1 : -1;
-          } else {
-            context.showMessage(message: res.errorMessage ?? "Error");
+
+          try {
+            var res = await widget.source.likeCommentFunc!(
+              widget.comic.comicId,
+              widget.comic.subId,
+              widget.comment.id!,
+              !wasLiked,
+            );
+            if (!_shouldApplyLikeResult(requestId)) {
+              return;
+            }
+            if (res.success) {
+              isLiked = !wasLiked;
+              likes += isLiked ? 1 : -1;
+            } else {
+              context.showMessage(message: res.errorMessage ?? "Error");
+            }
+          } catch (e, s) {
+            if (!_shouldApplyLikeResult(requestId)) {
+              return;
+            }
+            Log.error(
+              "CommentsPage",
+              "Failed to update comment like for ${widget.comment.id}: $e",
+              s,
+            );
+            context.showMessage(message: e.toString());
+          } finally {
+            if (_shouldApplyLikeResult(requestId)) {
+              setState(() {
+                isLiking = false;
+              });
+            }
           }
-          setState(() {
-            isLiking = false;
-          });
         },
         child: Row(
           mainAxisSize: MainAxisSize.min,
@@ -481,6 +609,7 @@ class _CommentTileState extends State<_CommentTile> {
 
   void vote(bool isUp) async {
     if (isVotingUp || isVotingDown) return;
+    final requestId = ++_voteRequestId;
     setState(() {
       if (isUp) {
         isVotingUp = true;
@@ -489,32 +618,61 @@ class _CommentTileState extends State<_CommentTile> {
       }
     });
     var isCancel = (isUp && voteStatus == 1) || (!isUp && voteStatus == -1);
-    var res = await widget.source.voteCommentFunc!(
-      widget.comic.comicId,
-      widget.comic.subId,
-      widget.comment.id!,
-      isUp,
-      isCancel,
-    );
-    if (res.success) {
-      if (isCancel) {
-        voteStatus = 0;
-      } else {
-        if (isUp) {
-          voteStatus = 1;
-        } else {
-          voteStatus = -1;
-        }
+    try {
+      var res = await widget.source.voteCommentFunc!(
+        widget.comic.comicId,
+        widget.comic.subId,
+        widget.comment.id!,
+        isUp,
+        isCancel,
+      );
+      if (!_shouldApplyVoteResult(requestId)) {
+        return;
       }
-      widget.comment.voteStatus = voteStatus;
-      widget.comment.score = res.data ?? widget.comment.score;
-    } else {
-      context.showMessage(message: res.errorMessage ?? "Error");
+      if (res.success) {
+        voteStatus = resolveCommentVoteStatus(isUp: isUp, isCancel: isCancel);
+        widget.comment.voteStatus = voteStatus;
+        widget.comment.score = res.data ?? widget.comment.score;
+      } else {
+        context.showMessage(message: res.errorMessage ?? "Error");
+      }
+    } catch (e, s) {
+      if (!_shouldApplyVoteResult(requestId)) {
+        return;
+      }
+      Log.error(
+        "CommentsPage",
+        "Failed to update comment vote for ${widget.comment.id}: $e",
+        s,
+      );
+      context.showMessage(message: e.toString());
+    } finally {
+      if (_shouldApplyVoteResult(requestId)) {
+        setState(() {
+          if (isUp) {
+            isVotingUp = false;
+          } else {
+            isVotingDown = false;
+          }
+        });
+      }
     }
-    setState(() {
-      isVotingUp = false;
-      isVotingDown = false;
-    });
+  }
+
+  bool _shouldApplyLikeResult(int requestId) {
+    return shouldApplyCommentActionResult(
+      mounted: mounted,
+      requestId: requestId,
+      activeRequestId: _likeRequestId,
+    );
+  }
+
+  bool _shouldApplyVoteResult(int requestId) {
+    return shouldApplyCommentActionResult(
+      mounted: mounted,
+      requestId: requestId,
+      activeRequestId: _voteRequestId,
+    );
   }
 
   Widget buildVote() {

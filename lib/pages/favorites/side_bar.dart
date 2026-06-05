@@ -26,7 +26,7 @@ class _LeftBarState extends State<_LeftBar> implements FolderList {
         .where((e) => e.favoriteData != null)
         .map((e) => e.favoriteData!.key)
         .toList();
-    var settings = appdata.settings['favorites'] as List;
+    var settings = appdata.settings.stringList('favorites');
     for (var p in settings) {
       if (all.contains(p) && !networkFolders.contains(p)) {
         networkFolders.add(p);
@@ -36,7 +36,8 @@ class _LeftBarState extends State<_LeftBar> implements FolderList {
 
   @override
   void initState() {
-    favPage = widget.favPage ??
+    favPage =
+        widget.favPage ??
         context.findAncestorStateOfType<_FavoritesPageState>()!;
     favPage.folderList = this;
     folders = LocalFavoritesManager().folderNames;
@@ -48,9 +49,9 @@ class _LeftBarState extends State<_LeftBar> implements FolderList {
 
   @override
   void dispose() {
-    super.dispose();
     appdata.settings.removeListener(updateFolders);
     LocalFavoritesManager().removeListener(updateFolders);
+    super.dispose();
   }
 
   @override
@@ -76,10 +77,7 @@ class _LeftBarState extends State<_LeftBar> implements FolderList {
                   const SizedBox(width: 8),
                   const CloseButton(),
                   const SizedBox(width: 8),
-                  Text(
-                    "Folders".tl,
-                    style: ts.s18,
-                  ),
+                  Text("Folders".tl, style: ts.s18),
                 ],
               ),
             ).paddingTop(context.padding.top),
@@ -109,7 +107,7 @@ class _LeftBarState extends State<_LeftBar> implements FolderList {
                 return buildNetworkFolder(networkFolders[index]);
               },
             ),
-          )
+          ),
         ],
       ),
     );
@@ -120,10 +118,7 @@ class _LeftBarState extends State<_LeftBar> implements FolderList {
       padding: const EdgeInsets.symmetric(vertical: 8),
       child: Row(
         children: [
-          Icon(
-            Icons.local_activity,
-            color: context.colorScheme.secondary,
-          ),
+          Icon(Icons.local_activity, color: context.colorScheme.secondary),
           const SizedBox(width: 12),
           Text("Local".tl),
           const Spacer(),
@@ -134,6 +129,7 @@ class _LeftBarState extends State<_LeftBar> implements FolderList {
                 text: 'Create Folder'.tl,
                 onClick: () {
                   newFolder().then((value) {
+                    if (!mounted) return;
                     setState(() {
                       folders = LocalFavoritesManager().folderNames;
                     });
@@ -145,6 +141,7 @@ class _LeftBarState extends State<_LeftBar> implements FolderList {
                 text: 'Sort'.tl,
                 onClick: () {
                   sortFolders().then((value) {
+                    if (!mounted) return;
                     setState(() {
                       folders = LocalFavoritesManager().folderNames;
                     });
@@ -172,20 +169,14 @@ class _LeftBarState extends State<_LeftBar> implements FolderList {
       ),
       child: Row(
         children: [
-          Icon(
-            Icons.cloud,
-            color: context.colorScheme.secondary,
-          ),
+          Icon(Icons.cloud, color: context.colorScheme.secondary),
           const SizedBox(width: 12),
           Text("Network".tl),
           const Spacer(),
           IconButton(
             icon: const Icon(Icons.settings),
             onPressed: () {
-              showPopUpWidget(
-                App.rootContext,
-                setFavoritesPagesWidget(),
-              );
+              showPopUpWidget(App.rootContext, setFavoritesPagesWidget());
             },
           ),
         ],
@@ -221,8 +212,9 @@ class _LeftBarState extends State<_LeftBar> implements FolderList {
               : null,
           border: Border(
             left: BorderSide(
-              color:
-                  isSelected ? context.colorScheme.primary : Colors.transparent,
+              color: isSelected
+                  ? context.colorScheme.primary
+                  : Colors.transparent,
               width: 2,
             ),
           ),
@@ -230,15 +222,10 @@ class _LeftBarState extends State<_LeftBar> implements FolderList {
         padding: const EdgeInsets.only(left: 16),
         child: Row(
           children: [
-            Expanded(
-              child: Text(folderName),
-            ),
+            Expanded(child: Text(folderName)),
             Container(
               margin: EdgeInsets.only(right: 8),
-              padding: EdgeInsets.symmetric(
-                horizontal: 8,
-                vertical: 2,
-              ),
+              padding: EdgeInsets.symmetric(horizontal: 8, vertical: 2),
               decoration: BoxDecoration(
                 color: context.colorScheme.surfaceContainer,
                 borderRadius: BorderRadius.circular(8),
@@ -274,8 +261,9 @@ class _LeftBarState extends State<_LeftBar> implements FolderList {
               : null,
           border: Border(
             left: BorderSide(
-              color:
-                  isSelected ? context.colorScheme.primary : Colors.transparent,
+              color: isSelected
+                  ? context.colorScheme.primary
+                  : Colors.transparent,
               width: 2,
             ),
           ),

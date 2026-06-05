@@ -7,18 +7,22 @@ void showToast({
   Widget? trailing,
   int? seconds,
 }) {
-  var newEntry = OverlayEntry(
-      builder: (context) => _ToastOverlay(
-            message: message,
-            icon: icon,
-            trailing: trailing,
-          ));
-
   var state = context.findAncestorStateOfType<OverlayWidgetState>();
+  if (state == null) {
+    return;
+  }
 
-  state?.addOverlay(newEntry);
+  var newEntry = OverlayEntry(
+    builder: (context) =>
+        _ToastOverlay(message: message, icon: icon, trailing: trailing),
+  );
 
-  Timer(Duration(seconds: seconds ?? 2), () => state?.remove(newEntry));
+  if (!state.addOverlay(newEntry)) {
+    newEntry.dispose();
+    return;
+  }
+
+  Timer(Duration(seconds: seconds ?? 2), () => state.remove(newEntry));
 }
 
 class _ToastOverlay extends StatelessWidget {
@@ -42,18 +46,20 @@ class _ToastOverlay extends StatelessWidget {
           color: Theme.of(context).colorScheme.inverseSurface,
           borderRadius: BorderRadius.circular(8),
           elevation: 2,
-          textStyle:
-              ts.withColor(Theme.of(context).colorScheme.onInverseSurface),
+          textStyle: ts.withColor(
+            Theme.of(context).colorScheme.onInverseSurface,
+          ),
           child: IconTheme(
             data: IconThemeData(
-                color: Theme.of(context).colorScheme.onInverseSurface),
+              color: Theme.of(context).colorScheme.onInverseSurface,
+            ),
             child: IntrinsicWidth(
               child: Container(
-                padding:
-                    const EdgeInsets.symmetric(vertical: 6, horizontal: 16),
-                constraints: BoxConstraints(
-                  maxWidth: context.width - 32,
+                padding: const EdgeInsets.symmetric(
+                  vertical: 6,
+                  horizontal: 16,
                 ),
+                constraints: BoxConstraints(maxWidth: context.width - 32),
                 child: Row(
                   mainAxisSize: MainAxisSize.min,
                   children: [
@@ -62,12 +68,14 @@ class _ToastOverlay extends StatelessWidget {
                       child: Text(
                         message,
                         style: const TextStyle(
-                            fontSize: 16, fontWeight: FontWeight.w500),
+                          fontSize: 16,
+                          fontWeight: FontWeight.w500,
+                        ),
                         maxLines: 3,
                         overflow: TextOverflow.ellipsis,
                       ),
                     ),
-                    if (trailing != null) trailing!.paddingLeft(8)
+                    if (trailing != null) trailing!.paddingLeft(8),
                   ],
                 ),
               ),
@@ -90,35 +98,51 @@ class OverlayWidget extends StatefulWidget {
 
 class OverlayWidgetState extends State<OverlayWidget> {
   final overlayKey = GlobalKey<OverlayState>();
+  late final OverlayEntry _rootEntry = OverlayEntry(
+    builder: (context) => widget.child,
+  );
 
   var entries = <OverlayEntry>[];
 
-  void addOverlay(OverlayEntry entry) {
-    if (overlayKey.currentState != null) {
-      overlayKey.currentState!.insert(entry);
+  @override
+  void didUpdateWidget(covariant OverlayWidget oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    _rootEntry.markNeedsBuild();
+  }
+
+  bool addOverlay(OverlayEntry entry) {
+    final overlay = overlayKey.currentState;
+    if (overlay != null) {
+      overlay.insert(entry);
       entries.add(entry);
+      return true;
     }
+    return false;
   }
 
   void remove(OverlayEntry entry) {
     if (entries.remove(entry)) {
-      entry.remove();
+      removeAndDisposeOverlayEntry(entry);
     }
   }
 
   void removeAll() {
     for (var entry in entries) {
-      entry.remove();
+      removeAndDisposeOverlayEntry(entry);
     }
     entries.clear();
   }
 
   @override
+  void dispose() {
+    removeAll();
+    removeAndDisposeOverlayEntry(_rootEntry);
+    super.dispose();
+  }
+
+  @override
   Widget build(BuildContext context) {
-    return Overlay(
-      key: overlayKey,
-      initialEntries: [OverlayEntry(builder: (context) => widget.child)],
-    );
+    return Overlay(key: overlayKey, initialEntries: [_rootEntry]);
   }
 }
 
@@ -128,12 +152,7 @@ void showDialogMessage(BuildContext context, String title, String message) {
     builder: (context) => ContentDialog(
       title: title,
       content: Text(message).paddingHorizontal(16),
-      actions: [
-        FilledButton(
-          onPressed: context.pop,
-          child: Text("OK".tl),
-        )
-      ],
+      actions: [FilledButton(onPressed: context.pop, child: Text("OK".tl))],
     ),
   );
 }
@@ -157,9 +176,7 @@ Future<void> showConfirmDialog({
             context.pop();
             onConfirm();
           },
-          style: FilledButton.styleFrom(
-            backgroundColor: btnColor,
-          ),
+          style: FilledButton.styleFrom(backgroundColor: btnColor),
           child: Text(confirmText.tl),
         ),
       ],
@@ -180,15 +197,38 @@ class LoadingDialogController {
 
   bool closed = false;
 
+  bool _closePending = false;
+
+  double? _normalizeProgress(double? value) {
+    if (value == null || value.isNaN || value.isInfinite) {
+      return null;
+    }
+    if (value < 0) {
+      return 0;
+    }
+    if (value > 1) {
+      return 1;
+    }
+    return value;
+  }
+
   void close() {
     if (closed) {
       return;
     }
     closed = true;
-    if (_closeDialog == null) {
-      Future.microtask(_closeDialog!);
+    final closeDialog = _closeDialog;
+    if (closeDialog == null) {
+      _closePending = true;
     } else {
-      _closeDialog!();
+      closeDialog();
+    }
+  }
+
+  void _attachCloseDialog(void Function() closeDialog) {
+    _closeDialog = closeDialog;
+    if (_closePending) {
+      closeDialog();
     }
   }
 
@@ -196,7 +236,7 @@ class LoadingDialogController {
     if (closed) {
       return;
     }
-    _serProgress?.call(value);
+    _serProgress?.call(_normalizeProgress(value));
   }
 
   void setMessage(String message) {
@@ -215,6 +255,7 @@ LoadingDialogController showLoadingDialog(
   String? message,
   String cancelButtonText = "Cancel",
   bool withProgress = false,
+  void Function()? onClosed,
 }) {
   var controller = LoadingDialogController();
   controller._message = message;
@@ -227,46 +268,56 @@ LoadingDialogController showLoadingDialog(
     context: context,
     barrierDismissible: barrierDismissible,
     builder: (BuildContext context) {
-      return StatefulBuilder(builder: (context, setState) {
-        controller._serProgress = (value) {
-          setState(() {
-            controller._progress = value;
-          });
-        };
-        controller._setMessage = (message) {
-          setState(() {
-            controller._message = message;
-          });
-        };
-        return ContentDialog(
-          title: controller._message ?? 'Loading',
-          content: LinearProgressIndicator(
-            value: controller._progress,
-            backgroundColor: context.colorScheme.surfaceContainer,
-          ).paddingHorizontal(16).paddingVertical(16),
-          actions: [
-            FilledButton(
-              onPressed: allowCancel
-                  ? () {
-                      controller.close();
-                      onCancel?.call();
-                    }
-                  : null,
-              child: Text(cancelButtonText.tl),
-            )
-          ],
-        );
-      });
+      return StatefulBuilder(
+        builder: (context, setState) {
+          controller._serProgress = (value) {
+            setState(() {
+              controller._progress = value;
+            });
+          };
+          controller._setMessage = (message) {
+            setState(() {
+              controller._message = message;
+            });
+          };
+          return ContentDialog(
+            title: controller._message ?? 'Loading',
+            content: LinearProgressIndicator(
+              value: controller._progress,
+              backgroundColor: context.colorScheme.surfaceContainer,
+            ).paddingHorizontal(16).paddingVertical(16),
+            actions: [
+              FilledButton(
+                onPressed: allowCancel
+                    ? () {
+                        controller.close();
+                        onCancel?.call();
+                      }
+                    : null,
+                child: Text(cancelButtonText.tl),
+              ),
+            ],
+          );
+        },
+      );
     },
   );
 
   var navigator = Navigator.of(context, rootNavigator: true);
 
-  navigator.push(loadingDialogRoute).then((value) => controller.closed = true);
+  navigator.push(loadingDialogRoute).then((value) {
+    controller.closed = true;
+    controller._closeDialog = null;
+    controller._serProgress = null;
+    controller._setMessage = null;
+    onClosed?.call();
+  });
 
-  controller._closeDialog = () {
-    navigator.removeRoute(loadingDialogRoute);
-  };
+  controller._attachCloseDialog(() {
+    if (loadingDialogRoute.isActive) {
+      navigator.removeRoute(loadingDialogRoute);
+    }
+  });
 
   return controller;
 }
@@ -297,13 +348,13 @@ class ContentDialog extends StatelessWidget {
         children: [
           title != null
               ? Appbar(
-            leading: IconButton(
-              icon: const Icon(Icons.close),
-              onPressed: dismissible ? context.pop : null,
-            ),
-            title: Text(title!),
-            backgroundColor: Colors.transparent,
-          )
+                  leading: IconButton(
+                    icon: const Icon(Icons.close),
+                    onPressed: dismissible ? context.pop : null,
+                  ),
+                  title: Text(title!),
+                  backgroundColor: Colors.transparent,
+                )
               : const SizedBox.shrink(),
           this.content,
           const SizedBox(height: 16),
@@ -362,71 +413,134 @@ Future<void> showInputDialog({
   String? image,
   Uint8List? imageData,
 }) {
-  var controller = TextEditingController(text: initialValue);
-  bool isLoading = false;
-  String? error;
-
   return showDialog(
     context: context,
-    builder: (context) {
-      return StatefulBuilder(
-        builder: (context, setState) {
-          return ContentDialog(
-            title: title,
-            content: Column(
-              children: [
-                if (image != null)
-                  SizedBox(
-                    height: 108,
-                    child: Image.network(image, fit: BoxFit.none),
-                  ).paddingBottom(8),
-                if (image == null && imageData != null)
-                  SizedBox(
-                    height: 108,
-                    child: Image.memory(imageData, fit: BoxFit.none),
-                  ).paddingBottom(8),
-                TextField(
-                  controller: controller,
-                  decoration: InputDecoration(
-                    hintText: hintText,
-                    border: const OutlineInputBorder(),
-                    errorText: error,
-                  ),
-                ).paddingHorizontal(12),
-              ],
-            ),
-            actions: [
-              Button.filled(
-                isLoading: isLoading,
-                onPressed: () async {
-                  if (inputValidator != null &&
-                      !inputValidator.hasMatch(controller.text)) {
-                    setState(() => error = "Invalid input");
-                    return;
-                  }
-                  var futureOr = onConfirm(controller.text);
-                  Object? result;
-                  if (futureOr is Future) {
-                    setState(() => isLoading = true);
-                    result = await futureOr;
-                    setState(() => isLoading = false);
-                  } else {
-                    result = futureOr;
-                  }
-                  if (result == null) {
-                    context.pop();
-                  } else {
-                    setState(() => error = result.toString());
-                  }
-                },
-                child: Text(confirmText.tl),
-              ),
-            ],
-          );
-        },
-      );
-    },
+    builder: (context) => _InputDialog(
+      title: title,
+      hintText: hintText,
+      onConfirm: onConfirm,
+      initialValue: initialValue,
+      confirmText: confirmText,
+      inputValidator: inputValidator,
+      image: image,
+      imageData: imageData,
+    ),
   );
+}
+
+class _InputDialog extends StatefulWidget {
+  const _InputDialog({
+    required this.title,
+    required this.onConfirm,
+    required this.confirmText,
+    this.hintText,
+    this.initialValue,
+    this.inputValidator,
+    this.image,
+    this.imageData,
+  });
+
+  final String title;
+  final String? hintText;
+  final FutureOr<Object?> Function(String) onConfirm;
+  final String? initialValue;
+  final String confirmText;
+  final RegExp? inputValidator;
+  final String? image;
+  final Uint8List? imageData;
+
+  @override
+  State<_InputDialog> createState() => _InputDialogState();
+}
+
+class _InputDialogState extends State<_InputDialog> {
+  late final TextEditingController _controller;
+  bool _isLoading = false;
+  String? _error;
+
+  @override
+  void initState() {
+    super.initState();
+    _controller = TextEditingController(text: widget.initialValue);
+  }
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  Future<void> _confirm() async {
+    if (_isLoading) return;
+    if (widget.inputValidator != null &&
+        !widget.inputValidator!.hasMatch(_controller.text)) {
+      setState(() => _error = "Invalid input");
+      return;
+    }
+    Object? result;
+    try {
+      final futureOr = widget.onConfirm(_controller.text);
+      if (futureOr is Future) {
+        setState(() => _isLoading = true);
+        result = await futureOr;
+        if (!mounted) return;
+        setState(() => _isLoading = false);
+      } else {
+        result = futureOr;
+      }
+    } catch (e, s) {
+      Log.error("Input Dialog", "Confirm callback failed: $e", s);
+      if (!mounted) return;
+      if (_isLoading) {
+        setState(() => _isLoading = false);
+      }
+      result = "Operation failed";
+    }
+    if (!mounted) {
+      return;
+    }
+    if (result == null) {
+      context.pop();
+    } else {
+      setState(() => _error = result.toString());
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return ContentDialog(
+      title: widget.title,
+      content: Column(
+        children: [
+          if (widget.image != null)
+            SizedBox(
+              height: 108,
+              child: Image.network(widget.image!, fit: BoxFit.none),
+            ).paddingBottom(8),
+          if (widget.image == null && widget.imageData != null)
+            SizedBox(
+              height: 108,
+              child: Image.memory(widget.imageData!, fit: BoxFit.none),
+            ).paddingBottom(8),
+          TextField(
+            controller: _controller,
+            decoration: InputDecoration(
+              hintText: widget.hintText,
+              border: const OutlineInputBorder(),
+              errorText: _error,
+            ),
+          ).paddingHorizontal(12),
+        ],
+      ),
+      actions: [
+        Button.filled(
+          isLoading: _isLoading,
+          onPressed: _confirm,
+          child: Text(widget.confirmText.tl),
+        ),
+      ],
+    );
+  }
 }
 
 void showInfoDialog({
@@ -442,10 +556,7 @@ void showInfoDialog({
         title: title,
         content: Text(content).paddingHorizontal(16).paddingVertical(8),
         actions: [
-          Button.filled(
-            onPressed: context.pop,
-            child: Text(confirmText.tl),
-          ),
+          Button.filled(onPressed: context.pop, child: Text(confirmText.tl)),
         ],
       );
     },
@@ -480,7 +591,7 @@ Future<int?> showSelectDialog({
                         current = i;
                       });
                     },
-                  )
+                  ),
                 ],
               ),
             ),

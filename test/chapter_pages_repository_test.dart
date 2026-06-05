@@ -1,7 +1,9 @@
 import 'dart:io';
+import 'dart:typed_data';
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:sqlite3/open.dart';
+import 'package:sqlite3/sqlite3.dart';
 import 'package:venera/foundation/app.dart';
 import 'package:venera/foundation/chapter_pages_repository.dart';
 import 'package:venera/foundation/comic_source/comic_source.dart';
@@ -128,6 +130,45 @@ void main() {
 
     expect(fallback.success, isTrue);
     expect(fallback.data, ['a', 'b', 'c']);
+  });
+
+  test('force refresh ignores malformed previous payload rows', () async {
+    final repo = ChapterPagesRepository();
+    await repo.init();
+
+    final db = sqlite3.open('${tempDir.path}/comic_details.db');
+    addTearDown(db.dispose);
+    final now = DateTime.now().millisecondsSinceEpoch;
+    db.execute(
+      '''
+      INSERT OR REPLACE INTO chapter_pages_cache (
+        source_key,
+        comic_id,
+        chapter_id,
+        payload,
+        updated_at,
+        fresh_until
+      ) VALUES (?, ?, ?, ?, ?, ?);
+      ''',
+      [
+        'test-source',
+        'comic-1',
+        'ep-1',
+        Uint8List.fromList([1, 2, 3]),
+        now,
+        now,
+      ],
+    );
+
+    final refreshed = await repo.load(
+      'test-source',
+      'comic-1',
+      'ep-1',
+      forceRefresh: true,
+    );
+
+    expect(refreshed.success, isTrue);
+    expect(refreshed.data, ['a', 'b', 'c']);
   });
 }
 

@@ -23,7 +23,17 @@ class HistoryImageProvider
     if (!url.contains('/')) {
       var localComic = LocalManager().find(history.id, history.type);
       if (localComic != null) {
-        return localComic.coverFile.readAsBytes();
+        final coverFile = localComic.coverFile;
+        try {
+          if (await coverFile.exists()) {
+            final data = await coverFile.readAsBytes();
+            if (data.isNotEmpty) {
+              return data;
+            }
+          }
+        } catch (_) {
+          // Fall back to the remote cover path below.
+        }
       }
       var comic = await ComicDetailsRepository().load(
         history.sourceKey,

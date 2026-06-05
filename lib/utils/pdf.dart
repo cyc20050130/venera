@@ -1,7 +1,9 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:isolate';
+import 'package:flutter/foundation.dart' show visibleForTesting;
 import 'package:flutter_saf/flutter_saf.dart';
+import 'package:uuid/uuid.dart';
 import 'package:venera/foundation/app.dart';
 import 'package:venera/foundation/local.dart';
 import 'package:venera/utils/image.dart';
@@ -9,6 +11,37 @@ import 'package:venera/utils/io.dart';
 import 'package:zip_flutter/zip_flutter.dart';
 
 typedef DecodeImage = Future<Image> Function(Uint8List data);
+
+const _pdfImageExtensions = {'jpg', 'jpeg', 'png', 'webp', 'gif', 'bmp'};
+
+@visibleForTesting
+bool isSupportedPdfExportImage(FileSystemEntity entity) {
+  if (entity is! File) {
+    return false;
+  }
+  if (entity.name.toLowerCase().startsWith('cover.')) {
+    return false;
+  }
+  final extension = entity.extension.toLowerCase().replaceFirst('.', '');
+  return _pdfImageExtensions.contains(extension);
+}
+
+@visibleForTesting
+String buildPdfTemporaryOutputPath(String outputPath, String operationId) {
+  final outFile = File(outputPath);
+  return FilePath.join(
+    outFile.parent.path,
+    '.${outFile.name}.$operationId.tmp',
+  );
+}
+
+String _buildPdfBackupOutputPath(String outputPath, String operationId) {
+  final outFile = File(outputPath);
+  return FilePath.join(
+    outFile.parent.path,
+    '.${outFile.name}.$operationId.bak',
+  );
+}
 
 Future<void> _createPdfFromComic({
   required LocalComic comic,
@@ -28,8 +61,7 @@ Future<void> _createPdfFromComic({
   bool multiChapters = comic.chapters != null;
 
   void reorderFiles(List<FileSystemEntity> files) {
-    files.removeWhere(
-        (element) => element is! File || element.path.startsWith('cover'));
+    files.removeWhere((element) => !isSupportedPdfExportImage(element));
     files.sort((a, b) {
       var aName = (a as File).basenameWithoutExt;
       var bName = (b as File).basenameWithoutExt;
@@ -51,7 +83,11 @@ Future<void> _createPdfFromComic({
     }
   } else {
     for (var chapter in comic.downloadedChapters) {
-      var files = Directory(FilePath.join(baseDir, chapter)).listSync();
+      final chapterDir = Directory(FilePath.join(baseDir, chapter));
+      if (!chapterDir.existsSync()) {
+        continue;
+      }
+      var files = chapterDir.listSync();
       reorderFiles(files);
       for (var file in files) {
         images.add(file.path);
@@ -70,73 +106,128 @@ Future<void> _createPdfFromComic({
 }
 
 Future<Isolate> _runIsolate(
-    LocalComic comic, String savePath, SendPort sendPort) {
+  LocalComic comic,
+  String savePath,
+  SendPort sendPort,
+) {
   var localPath = LocalManager().path;
   return Isolate.spawn<SendPort>(
-    (sendPort) => overrideIO(
-      () async {
-        if (App.isAndroid) {
-          await SAFTaskWorker().init();
+    (sendPort) => overrideIO(() async {
+      if (App.isAndroid) {
+        await SAFTaskWorker().init();
+      }
+      var receivePort = ReceivePort();
+      sendPort.send(receivePort.sendPort);
+
+      Completer<Image>? completer;
+
+      Future<Image> decodeImage(Uint8List data) async {
+        if (completer != null) {
+          throw Exception('Another image is being decoded');
         }
-        var receivePort = ReceivePort();
-        sendPort.send(receivePort.sendPort);
+        sendPort.send(data);
+        completer = Completer();
+        return completer!.future;
+      }
 
-        Completer<Image>? completer;
-
-        Future<Image> decodeImage(Uint8List data) async {
-          if (completer != null) {
-            throw Exception('Another image is being decoded');
+      receivePort.listen((message) {
+        if (message is Image) {
+          if (completer == null) {
+            throw Exception('No image is being decoded');
           }
-          sendPort.send(data);
-          completer = Completer();
-          return completer!.future;
+          completer!.complete(message);
+          completer = null;
         }
+      });
 
-        receivePort.listen((message) {
-          if (message is Image) {
-            if (completer == null) {
-              throw Exception('No image is being decoded');
-            }
-            completer!.complete(message);
-            completer = null;
-          }
-        });
-
+      try {
         await _createPdfFromComic(
           comic: comic,
           savePath: savePath,
           localPath: localPath,
           decodeImage: decodeImage,
         );
-
         sendPort.send(null);
-      },
-    ),
+      } catch (e, s) {
+        sendPort.send({'error': e.toString(), 'stackTrace': s.toString()});
+      } finally {
+        receivePort.close();
+      }
+    }),
     sendPort,
   );
 }
 
-Future<File> createPdfFromComicIsolate(LocalComic comic, String savePath) async {
+Future<File> createPdfFromComicIsolate(
+  LocalComic comic,
+  String savePath,
+) async {
+  return runOutputFilePathExclusively(savePath, () {
+    return _createPdfFromComicIsolateLocked(comic, savePath);
+  });
+}
+
+Future<File> _createPdfFromComicIsolateLocked(
+  LocalComic comic,
+  String savePath,
+) async {
   var receivePort = ReceivePort();
   SendPort? sendPort;
   Isolate? isolate;
   var completer = Completer<void>();
   receivePort.listen((message) {
+    if (completer.isCompleted) {
+      return;
+    }
     if (message is SendPort) {
       sendPort = message;
     } else if (message is Uint8List) {
-      Image.decodeImage(message).then((image) {
-        sendPort!.send(image);
-      });
+      Image.decodeImage(message).then(
+        (image) {
+          if (completer.isCompleted) {
+            return;
+          }
+          final port = sendPort;
+          if (port == null) {
+            receivePort.close();
+            isolate?.kill();
+            completer.completeError(StateError('PDF isolate is not ready'));
+            return;
+          }
+          port.send(image);
+        },
+        onError: (Object error, StackTrace stackTrace) {
+          receivePort.close();
+          isolate?.kill();
+          if (!completer.isCompleted) {
+            completer.completeError(error, stackTrace);
+          }
+        },
+      );
     } else if (message == null) {
       receivePort.close();
       completer.complete();
       isolate!.kill();
+    } else if (message is Map && message['error'] is String) {
+      receivePort.close();
+      isolate?.kill(priority: Isolate.immediate);
+      if (!completer.isCompleted) {
+        completer.completeError(
+          StateError(message['error'] as String),
+          StackTrace.fromString((message['stackTrace'] ?? '').toString()),
+        );
+      }
     }
   });
-  isolate = await _runIsolate(comic, savePath, receivePort.sendPort);
-  await completer.future;
-  return File(savePath);
+  try {
+    isolate = await _runIsolate(comic, savePath, receivePort.sendPort);
+    await completer.future;
+    return File(savePath);
+  } catch (_) {
+    receivePort.close();
+    isolate?.kill(priority: Isolate.immediate);
+    rethrow;
+  }
 }
 
 class PdfGenerator {
@@ -164,8 +255,13 @@ class PdfGenerator {
   });
 
   Future<void> generate() async {
-    var file = File(outputPath);
-    final output = file.openWrite();
+    final operationId = const Uuid().v4();
+    final file = File(outputPath);
+    final tempFile = File(buildPdfTemporaryOutputPath(outputPath, operationId));
+    final backupFile = File(_buildPdfBackupOutputPath(outputPath, operationId));
+    await tempFile.deleteIgnoreError();
+    await backupFile.deleteIgnoreError();
+    final output = tempFile.openWrite();
 
     int length = 0;
 
@@ -184,141 +280,166 @@ class PdfGenerator {
       return length;
     }
 
-    // 1. 写入PDF头部
-    write('%PDF-1.7\n%\xFF\xFF\xFF\xFF\n\n');
+    Object? failure;
+    StackTrace? failureStackTrace;
+    try {
+      // 1. 写入PDF头部
+      write('%PDF-1.7\n%\xFF\xFF\xFF\xFF\n\n');
 
-    // 2. 写入Catalog对象
-    _objectOffsets[_objectId] = getCurrentLength();
-    write('$_objectId 0 obj\n');
-    write('<<\n');
-    write('/Type /Catalog\n');
-    write('/Pages ${_objectId + 1} 0 R\n');
-    write('>>\nendobj\n\n');
-
-    final catalogId = _objectId++;
-
-    // 3. 写入Pages对象
-    _objectOffsets[_objectId] = getCurrentLength();
-    write('$_objectId 0 obj\n');
-    write('<<\n');
-    write('/Type /Pages\n');
-    write('/Kids [');
-    final pageIds = <int>[];
-    for (var i = 0; i < imagePaths.length; i++) {
-      pageIds.add(_objectId + 1 + i * 3);
-      write('${_objectId + 1 + i * 3} 0 R ');
-    }
-    write(']\n');
-    write('/Count ${imagePaths.length}\n');
-    write('>>\nendobj\n\n');
-
-    final pagesId = _objectId++;
-
-    // 4. 为每个图片创建Page和Image对象
-    for (var i = 0; i < imagePaths.length; i++) {
-      final imagePath = imagePaths[i];
-      final image = await _getImage(imagePath);
-
-      // 写入Page对象
+      // 2. 写入Catalog对象
       _objectOffsets[_objectId] = getCurrentLength();
       write('$_objectId 0 obj\n');
       write('<<\n');
-      write('/Type /Page\n');
-      write('/Parent $pagesId 0 R\n');
-      write('/Resources <<\n');
-      write('/XObject << /Im${i + 1} ${_objectId + 1} 0 R >>\n');
-      write('>>\n');
-      write('/MediaBox [0 0 $a4Width $a4Height]\n');
-      write('/Contents ${_objectId + 2} 0 R\n');
+      write('/Type /Catalog\n');
+      write('/Pages ${_objectId + 1} 0 R\n');
+      write('>>\nendobj\n\n');
+
+      final catalogId = _objectId++;
+
+      // 3. 写入Pages对象
+      _objectOffsets[_objectId] = getCurrentLength();
+      write('$_objectId 0 obj\n');
+      write('<<\n');
+      write('/Type /Pages\n');
+      write('/Kids [');
+      final pageIds = <int>[];
+      for (var i = 0; i < imagePaths.length; i++) {
+        pageIds.add(_objectId + 1 + i * 3);
+        write('${_objectId + 1 + i * 3} 0 R ');
+      }
+      write(']\n');
+      write('/Count ${imagePaths.length}\n');
+      write('>>\nendobj\n\n');
+
+      final pagesId = _objectId++;
+
+      // 4. 为每个图片创建Page和Image对象
+      for (var i = 0; i < imagePaths.length; i++) {
+        final imagePath = imagePaths[i];
+        final image = await _getImage(imagePath);
+
+        // 写入Page对象
+        _objectOffsets[_objectId] = getCurrentLength();
+        write('$_objectId 0 obj\n');
+        write('<<\n');
+        write('/Type /Page\n');
+        write('/Parent $pagesId 0 R\n');
+        write('/Resources <<\n');
+        write('/XObject << /Im${i + 1} ${_objectId + 1} 0 R >>\n');
+        write('>>\n');
+        write('/MediaBox [0 0 $a4Width $a4Height]\n');
+        write('/Contents ${_objectId + 2} 0 R\n');
+        write('>>\nendobj\n\n');
+
+        _objectId++;
+
+        // 写入Image对象
+        _objectOffsets[_objectId] = getCurrentLength();
+        write('$_objectId 0 obj\n');
+        write('<<\n');
+        write('/Type /XObject\n');
+        write('/Subtype /Image\n');
+        write('/Width ${image.width}\n');
+        write('/Height ${image.height}\n');
+        write('/ColorSpace /DeviceRGB\n');
+        write('/BitsPerComponent 8\n');
+        write('/Filter /FlateDecode\n');
+        write('/Length ${image.data.length}\n');
+        write('>>\nstream\n');
+        writeData(image.data);
+        write('\nendstream\nendobj\n\n');
+
+        _objectId++;
+
+        // 写入Contents对象（绘制图片的指令）
+        _objectOffsets[_objectId] = getCurrentLength();
+        write('$_objectId 0 obj\n');
+        write('<<\n');
+        var stream = '';
+        stream += 'q\n';
+        // Calculate scaling factors
+        var scaleX = a4Width / image.width;
+        var scaleY = a4Height / image.height;
+        var scale = scaleX < scaleY ? scaleX : scaleY;
+        // Calculate centering offsets
+        var offsetX = (a4Width - (image.width * scale)) / 2;
+        var offsetY = (a4Height - (image.height * scale)) / 2;
+        // Apply transformation matrix
+        stream += '1 0 0 1 $offsetX $offsetY cm\n'; // Translate
+        stream += '${scale * image.width} 0 0 ${scale * image.height} 0 0 cm\n';
+        stream += '/Im${i + 1} Do\n';
+        stream += 'Q\n';
+        var streamData = utf8.encode(stream);
+        write('/Length ${streamData.length}\n');
+        write('>>\nstream\n');
+        writeData(streamData);
+        write('endstream\nendobj\n\n');
+
+        _objectId++;
+      }
+
+      // 5. 写入Info对象（元数据）
+      final infoId = _objectId;
+      _objectOffsets[_objectId] = getCurrentLength();
+      write('$_objectId 0 obj\n');
+      write('<<\n');
+      write('/Title <');
+      writeData(_toPdfString(title));
+      write('>\n');
+      write('/Author <');
+      writeData(_toPdfString(author));
+      write('>\n');
+      write('/Producer (venera v${App.version})\n');
+      write('/CreationDate (D:${_formatDateTime(DateTime.now())})\n');
       write('>>\nendobj\n\n');
 
       _objectId++;
 
-      // 写入Image对象
-      _objectOffsets[_objectId] = getCurrentLength();
-      write('$_objectId 0 obj\n');
+      // 6. 写入交叉引用表
+      final xrefOffset = getCurrentLength();
+      write('xref\n');
+      write('0 $_objectId\n');
+      write('0000000000 65535 f\r\n');
+
+      for (var i = 1; i < _objectId; i++) {
+        final offset = _objectOffsets[i]!;
+        write('${offset.toString().padLeft(10, '0')} 00000 n\r\n'); // 使用\r\n
+      }
+
+      // 7. 写入文件尾部
+      write('trailer\n');
       write('<<\n');
-      write('/Type /XObject\n');
-      write('/Subtype /Image\n');
-      write('/Width ${image.width}\n');
-      write('/Height ${image.height}\n');
-      write('/ColorSpace /DeviceRGB\n');
-      write('/BitsPerComponent 8\n');
-      write('/Filter /FlateDecode\n');
-      write('/Length ${image.data.length}\n');
-      write('>>\nstream\n');
-      writeData(image.data);
-      write('\nendstream\nendobj\n\n');
-
-      _objectId++;
-
-      // 写入Contents对象（绘制图片的指令）
-      _objectOffsets[_objectId] = getCurrentLength();
-      write('$_objectId 0 obj\n');
-      write('<<\n');
-      var stream = '';
-      stream += 'q\n';
-      // Calculate scaling factors
-      var scaleX = a4Width / image.width;
-      var scaleY = a4Height / image.height;
-      var scale = scaleX < scaleY ? scaleX : scaleY;
-      // Calculate centering offsets
-      var offsetX = (a4Width - (image.width * scale)) / 2;
-      var offsetY = (a4Height - (image.height * scale)) / 2;
-      // Apply transformation matrix
-      stream += '1 0 0 1 $offsetX $offsetY cm\n'; // Translate
-      stream += '${scale * image.width} 0 0 ${scale * image.height} 0 0 cm\n';
-      stream += '/Im${i + 1} Do\n';
-      stream += 'Q\n';
-      var streamData = utf8.encode(stream);
-      write('/Length ${streamData.length}\n');
-      write('>>\nstream\n');
-      writeData(streamData);
-      write('endstream\nendobj\n\n');
-
-      _objectId++;
+      write('/Size $_objectId\n');
+      write('/Root $catalogId 0 R\n');
+      write('/Info $infoId 0 R\n');
+      write('>>\n');
+      write('startxref\n');
+      write('$xrefOffset\n');
+      write('%%EOF\n');
+    } catch (e, s) {
+      failure = e;
+      failureStackTrace = s;
     }
 
-    // 5. 写入Info对象（元数据）
-    final infoId = _objectId;
-    _objectOffsets[_objectId] = getCurrentLength();
-    write('$_objectId 0 obj\n');
-    write('<<\n');
-    write('/Title <');
-    writeData(_toPdfString(title));
-    write('>\n');
-    write('/Author <');
-    writeData(_toPdfString(author));
-    write('>\n');
-    write('/Producer (venera v${App.version})\n');
-    write('/CreationDate (D:${_formatDateTime(DateTime.now())})\n');
-    write('>>\nendobj\n\n');
-
-    _objectId++;
-
-    // 6. 写入交叉引用表
-    final xrefOffset = getCurrentLength();
-    write('xref\n');
-    write('0 $_objectId\n');
-    write('0000000000 65535 f\r\n');
-
-    for (var i = 1; i < _objectId; i++) {
-      final offset = _objectOffsets[i]!;
-      write('${offset.toString().padLeft(10, '0')} 00000 n\r\n'); // 使用\r\n
+    try {
+      await output.close();
+    } catch (e, s) {
+      failure ??= e;
+      failureStackTrace ??= s;
+    }
+    if (failure != null) {
+      await tempFile.deleteIgnoreError();
+      Error.throwWithStackTrace(
+        failure,
+        failureStackTrace ?? StackTrace.current,
+      );
     }
 
-    // 7. 写入文件尾部
-    write('trailer\n');
-    write('<<\n');
-    write('/Size $_objectId\n');
-    write('/Root $catalogId 0 R\n');
-    write('/Info $infoId 0 R\n');
-    write('>>\n');
-    write('startxref\n');
-    write('$xrefOffset\n');
-    write('%%EOF\n');
-
-    await output.close();
+    await commitTemporaryOutputFile(
+      tempFile: tempFile,
+      outputFile: file,
+      backupFile: backupFile,
+    );
   }
 
   int _codeUnitForDigit(int digit) =>
@@ -366,8 +487,9 @@ class PdfGenerator {
         add(unit);
       } else if (unit > unicodePlaneOneMax && unit <= unicodeValidRangeMax) {
         final base = unit - unicodeUtf16Offset;
-        add(unicodeUtf16SurrogateUnit0Base +
-            ((base & unicodeUtf16HiMask) >> 10));
+        add(
+          unicodeUtf16SurrogateUnit0Base + ((base & unicodeUtf16HiMask) >> 10),
+        );
         add(unicodeUtf16SurrogateUnit1Base + (base & unicodeUtf16LoMask));
       } else {
         add(unicodeReplacementCharacterCodePoint);
@@ -389,8 +511,9 @@ class PdfGenerator {
   }
 
   Future<({int width, int height, Uint8List data})> _getImage(
-      String imagePath) async {
-    var data = await File(imagePath).readAsBytes();
+    String imagePath,
+  ) async {
+    var data = await File(localFilePathFromUri(imagePath)).readAsBytes();
     var image = await decodeImage(data);
     var width = image.width;
     var height = image.height;

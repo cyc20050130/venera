@@ -184,13 +184,17 @@ class ComicDetailsRepository {
     }
     try {
       final row = result.first;
+      final payload = _cachePayload(row);
+      final updatedAt = _cacheTimestamp(row, 'updated_at');
+      final freshUntil = _cacheTimestamp(row, 'fresh_until');
+      if (payload == null || updatedAt == null || freshUntil == null) {
+        throw const FormatException('Invalid cached comic details row');
+      }
       return _CachedComicDetails(
-        ComicDetails.fromJson(
-          Map<String, dynamic>.from(jsonDecode(row['payload'] as String)),
-        ),
-        DateTime.fromMillisecondsSinceEpoch(row['updated_at'] as int),
-        DateTime.fromMillisecondsSinceEpoch(row['fresh_until'] as int),
-        row['payload'] as String,
+        ComicDetails.fromJson(Map<String, dynamic>.from(jsonDecode(payload))),
+        DateTime.fromMillisecondsSinceEpoch(updatedAt),
+        DateTime.fromMillisecondsSinceEpoch(freshUntil),
+        payload,
       );
     } catch (e, s) {
       Log.error(
@@ -317,7 +321,17 @@ class ComicDetailsRepository {
     if (result.isEmpty) {
       return null;
     }
-    return result.first['payload'] as String;
+    return _cachePayload(result.first);
+  }
+
+  String? _cachePayload(Row row) {
+    final payload = row['payload'];
+    return payload is String ? payload : null;
+  }
+
+  int? _cacheTimestamp(Row row, String key) {
+    final timestamp = row[key];
+    return timestamp is int ? timestamp : null;
   }
 
   void _logPerf(

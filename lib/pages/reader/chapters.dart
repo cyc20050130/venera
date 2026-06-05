@@ -59,25 +59,23 @@ class _ChaptersViewState extends State<_ChaptersView> {
             ],
           ),
           SliverList(
-            delegate: SliverChildBuilderDelegate(
-              (context, index) {
-                if (desc) {
-                  index = chapters.length - 1 - index;
-                }
-                var chapter = chapters.titles.elementAt(index);
-                return _ChapterListTile(
-                  onTap: () {
-                    widget.reader.toChapter(index + 1);
-                    Navigator.of(context).pop();
-                  },
-                  title: chapter,
-                  isActive: current == index,
-                  isDownloaded:
-                      downloaded.contains(chapters.ids.elementAt(index)),
-                );
-              },
-              childCount: chapters.length,
-            ),
+            delegate: SliverChildBuilderDelegate((context, index) {
+              if (desc) {
+                index = chapters.length - 1 - index;
+              }
+              var chapter = chapters.titles.elementAt(index);
+              return _ChapterListTile(
+                onTap: () {
+                  widget.reader.toChapter(index + 1);
+                  Navigator.of(context).pop();
+                },
+                title: chapter,
+                isActive: current == index,
+                isDownloaded: downloaded.contains(
+                  chapters.ids.elementAt(index),
+                ),
+              );
+            }, childCount: chapters.length),
           ),
         ],
       ),
@@ -102,29 +100,29 @@ class _GroupedChaptersViewState extends State<_GroupedChaptersView>
 
   late final ScrollController _scrollController;
 
-  late final String initialGroupName;
+  String? initialGroupName;
 
   var downloaded = <String>[];
 
   @override
   void initState() {
     super.initState();
-    int index = 0;
-    int epIndex = widget.reader.chapter - 1;
-    while (epIndex >= 0) {
-      epIndex -= chapters.getGroupByIndex(index).length;
-      index++;
-    }
-    tabController = TabController(
-      length: chapters.groups.length,
-      vsync: this,
-      initialIndex: index - 1,
+    final position = resolveGroupedReaderChapterPosition(
+      chapters: chapters,
+      chapter: widget.reader.chapter,
     );
-    initialGroupName = chapters.groups.elementAt(index - 1);
-    var epIndexAtGroup = widget.reader.chapter - 1;
-    for (var i = 0; i < index - 1; i++) {
-      epIndexAtGroup -= chapters.getGroupByIndex(i).length;
-    }
+    final groupCount = chapters.groupCount;
+    final index = position?.groupIndex ?? 0;
+    final safeIndex = groupCount == 0 ? 0 : index.clamp(0, groupCount - 1);
+    tabController = TabController(
+      length: groupCount,
+      vsync: this,
+      initialIndex: safeIndex,
+    );
+    initialGroupName = groupCount == 0
+        ? null
+        : chapters.groups.elementAt(safeIndex);
+    final epIndexAtGroup = (position?.chapterInGroup ?? 1) - 1;
     _scrollController = ScrollController(
       initialScrollOffset: (epIndexAtGroup * 48.0).clamp(0, double.infinity),
     );
@@ -135,7 +133,22 @@ class _GroupedChaptersViewState extends State<_GroupedChaptersView>
   }
 
   @override
+  void dispose() {
+    tabController.dispose();
+    _scrollController.dispose();
+    super.dispose();
+  }
+
+  @override
   Widget build(BuildContext context) {
+    if (chapters.groupCount == 0) {
+      return Column(
+        children: [
+          Appbar(title: Text("Chapters".tl)),
+          const Expanded(child: SizedBox.shrink()),
+        ],
+      );
+    }
     return Column(
       children: [
         Appbar(title: Text("Chapters".tl)),
@@ -159,29 +172,26 @@ class _GroupedChaptersViewState extends State<_GroupedChaptersView>
       controller: initialGroupName == groupName ? _scrollController : null,
       slivers: [
         SliverList(
-          delegate: SliverChildBuilderDelegate(
-            (context, index) {
-              var name = group.values.elementAt(index);
-              var i = 0;
-              for (var g in chapters.groups) {
-                if (g == groupName) {
-                  break;
-                }
-                i += chapters.getGroup(g).length;
+          delegate: SliverChildBuilderDelegate((context, index) {
+            var name = group.values.elementAt(index);
+            var i = 0;
+            for (var g in chapters.groups) {
+              if (g == groupName) {
+                break;
               }
-              i += index + 1;
-              return _ChapterListTile(
-                onTap: () {
-                  widget.reader.toChapter(i);
-                  context.pop();
-                },
-                title: name,
-                isActive: widget.reader.chapter == i,
-                isDownloaded: downloaded.contains(group.keys.elementAt(index)),
-              );
-            },
-            childCount: group.length,
-          ),
+              i += chapters.getGroup(g).length;
+            }
+            i += index + 1;
+            return _ChapterListTile(
+              onTap: () {
+                widget.reader.toChapter(i);
+                context.pop();
+              },
+              title: name,
+              isActive: widget.reader.chapter == i,
+              isDownloaded: downloaded.contains(group.keys.elementAt(index)),
+            );
+          }, childCount: group.length),
         ),
       ],
     );
@@ -214,8 +224,9 @@ class _ChapterListTile extends StatelessWidget {
         decoration: BoxDecoration(
           border: Border(
             left: BorderSide(
-              color:
-                  isActive ? context.colorScheme.primary : Colors.transparent,
+              color: isActive
+                  ? context.colorScheme.primary
+                  : Colors.transparent,
               width: 4,
             ),
           ),

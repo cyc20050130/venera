@@ -1,5 +1,52 @@
 part of 'comic_page.dart';
 
+@visibleForTesting
+const double comicThumbnailMaxCrossAxisExtent = 200;
+
+@visibleForTesting
+const double comicThumbnailChildAspectRatio = 0.68;
+
+@visibleForTesting
+({String url, ImagePart? part}) parseComicThumbnailSpec(String raw) {
+  final marker = raw.indexOf('@');
+  if (marker <= 0 || marker == raw.length - 1) {
+    return (url: raw, part: null);
+  }
+
+  final url = raw.substring(0, marker);
+  final params = raw.substring(marker + 1).split('&');
+  double? x1, y1, x2, y2;
+
+  for (final param in params) {
+    final separator = param.indexOf('=');
+    if (separator <= 0 || separator == param.length - 1) {
+      continue;
+    }
+    final key = param.substring(0, separator);
+    final range = param.substring(separator + 1).split('-');
+    if (range.length != 2) {
+      continue;
+    }
+    final start = double.tryParse(range[0]);
+    final end = double.tryParse(range[1]);
+    if (start == null || end == null) {
+      continue;
+    }
+    if (key.startsWith('x')) {
+      x1 = start;
+      x2 = end;
+    } else if (key.startsWith('y')) {
+      y1 = start;
+      y2 = end;
+    }
+  }
+
+  final part = x1 == null && y1 == null && x2 == null && y2 == null
+      ? null
+      : ImagePart(x1: x1, y1: y1, x2: x2, y2: y2);
+  return (url: url, part: part);
+}
+
 class _ComicThumbnails extends StatefulWidget {
   const _ComicThumbnails({this.enabled = true});
 
@@ -22,6 +69,13 @@ class _ComicThumbnailsState extends State<_ComicThumbnails> {
 
   bool isLoading = false;
   bool hasRequestedInitialLoad = false;
+  int _loadRequestId = 0;
+
+  @override
+  void dispose() {
+    _loadRequestId++;
+    super.dispose();
+  }
 
   @override
   void didChangeDependencies() {
@@ -40,123 +94,108 @@ class _ComicThumbnailsState extends State<_ComicThumbnails> {
   }
 
   void loadNext() async {
-    if (state.comicSource.loadComicThumbnail == null) return;
+    final source = state.comicSource;
+    final thumbnailLoader = source?.loadComicThumbnail;
+    if (thumbnailLoader == null) return;
     if (!isInitialLoading && next == null) {
       return;
     }
     if (isLoading) return;
+    final requestId = _loadRequestId;
     Future.microtask(() {
+      if (!mounted || requestId != _loadRequestId) return;
       setState(() {
         isLoading = true;
       });
     });
-    var res = await state.comicSource.loadComicThumbnail!(state.comic.id, next);
+    var res = await thumbnailLoader(state.comic.id, next);
+    if (!mounted || requestId != _loadRequestId) return;
     if (res.success) {
       thumbnails.addAll(res.data);
-      next = res.subData;
+      next = normalizeComicPaginationCursor(res.subData);
       isInitialLoading = false;
       state._logPerf('thumbnails load complete');
     } else {
       error = res.errorMessage;
       state._logPerf('thumbnails load failed');
     }
-    if (mounted) {
-      setState(() {
-        isLoading = false;
-      });
-    }
+    setState(() {
+      isLoading = false;
+    });
   }
 
   @override
   Widget build(BuildContext context) {
+    final devicePixelRatio = MediaQuery.devicePixelRatioOf(context);
+    final thumbnailCacheWidth = resolveCoverDecodeDimension(
+      comicThumbnailMaxCrossAxisExtent,
+      devicePixelRatio,
+    );
+    final thumbnailCacheHeight = resolveCoverDecodeDimension(
+      comicThumbnailMaxCrossAxisExtent / comicThumbnailChildAspectRatio,
+      devicePixelRatio,
+    );
     return MultiSliver(
       children: [
-        SliverToBoxAdapter(
-          child: ListTile(
-            title: Text("Preview".tl),
-          ),
-        ),
+        SliverToBoxAdapter(child: ListTile(title: Text("Preview".tl))),
         SliverGrid(
-          delegate: SliverChildBuilderDelegate(
-            childCount: thumbnails.length,
-                (context, index) {
-              if (index == thumbnails.length - 1 && error == null) {
-                loadNext();
-              }
-              var url = thumbnails[index];
-              ImagePart? part;
-              if (url.contains('@')) {
-                var params = url.split('@')[1].split('&');
-                url = url.split('@')[0];
-                double? x1, y1, x2, y2;
-                try {
-                  for (var p in params) {
-                    if (p.startsWith('x')) {
-                      var r = p.split('=')[1];
-                      x1 = double.parse(r.split('-')[0]);
-                      x2 = double.parse(r.split('-')[1]);
-                    }
-                    if (p.startsWith('y')) {
-                      var r = p.split('=')[1];
-                      y1 = double.parse(r.split('-')[0]);
-                      y2 = double.parse(r.split('-')[1]);
-                    }
-                  }
-                } catch (_) {
-                  // ignore
-                }
-                part = ImagePart(x1: x1, y1: y1, x2: x2, y2: y2);
-              }
-              return Padding(
-                padding: context.width < changePoint
-                    ? const EdgeInsets.all(4)
-                    : const EdgeInsets.all(8),
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    Expanded(
-                      child: InkWell(
-                        onTap: () => state.read(null, index + 1),
-                        borderRadius:
-                        const BorderRadius.all(Radius.circular(8)),
-                        child: Container(
-                          foregroundDecoration: BoxDecoration(
-                            borderRadius: BorderRadius.circular(8),
-                            border: Border.all(
-                              color: Theme.of(context).colorScheme.outline,
-                            ),
+          delegate: SliverChildBuilderDelegate(childCount: thumbnails.length, (
+            context,
+            index,
+          ) {
+            if (index == thumbnails.length - 1 && error == null) {
+              loadNext();
+            }
+            final thumbnail = parseComicThumbnailSpec(thumbnails[index]);
+            return Padding(
+              padding: context.width < changePoint
+                  ? const EdgeInsets.all(4)
+                  : const EdgeInsets.all(8),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Expanded(
+                    child: InkWell(
+                      onTap: () => state.read(null, index + 1),
+                      borderRadius: const BorderRadius.all(Radius.circular(8)),
+                      child: Container(
+                        foregroundDecoration: BoxDecoration(
+                          borderRadius: BorderRadius.circular(8),
+                          border: Border.all(
+                            color: Theme.of(context).colorScheme.outline,
                           ),
-                          decoration: BoxDecoration(
-                            borderRadius: BorderRadius.circular(8),
+                        ),
+                        decoration: BoxDecoration(
+                          borderRadius: BorderRadius.circular(8),
+                        ),
+                        width: double.infinity,
+                        height: double.infinity,
+                        clipBehavior: Clip.antiAlias,
+                        child: AnimatedImage(
+                          image: CachedImageProvider(
+                            thumbnail.url,
+                            sourceKey: state.widget.sourceKey,
+                            cid: state.comic.id,
                           ),
+                          fit: BoxFit.contain,
                           width: double.infinity,
                           height: double.infinity,
-                          clipBehavior: Clip.antiAlias,
-                          child: AnimatedImage(
-                            image: CachedImageProvider(
-                              url,
-                              sourceKey: state.widget.sourceKey,
-                            ),
-                            fit: BoxFit.contain,
-                            width: double.infinity,
-                            height: double.infinity,
-                            part: part,
-                          ),
+                          part: thumbnail.part,
+                          cacheWidth: thumbnailCacheWidth,
+                          cacheHeight: thumbnailCacheHeight,
                         ),
                       ),
                     ),
-                    const SizedBox(
-                      height: 4,
-                    ),
-                    Text((index + 1).toString()),
-                  ],
-                ),
-              );
-            },
-          ),
+                  ),
+                  const SizedBox(height: 4),
+                  Text((index + 1).toString()),
+                ],
+              ),
+            );
+          }),
           gridDelegate: const SliverGridDelegateWithMaxCrossAxisExtent(
-            maxCrossAxisExtent: 200,
-            childAspectRatio: 0.68,
+            maxCrossAxisExtent: comicThumbnailMaxCrossAxisExtent,
+            childAspectRatio: comicThumbnailChildAspectRatio,
           ),
         ),
         if (error != null)
@@ -164,18 +203,13 @@ class _ComicThumbnailsState extends State<_ComicThumbnails> {
             child: Column(
               children: [
                 Text(error!),
-                Button.outlined(
-                  onPressed: loadNext,
-                  child: Text("Retry".tl),
-                )
+                Button.outlined(onPressed: loadNext, child: Text("Retry".tl)),
               ],
             ),
           )
         else if (isLoading)
           const SliverListLoadingIndicator(),
-        const SliverToBoxAdapter(
-          child: Divider(),
-        ),
+        const SliverToBoxAdapter(child: Divider()),
       ],
     );
   }

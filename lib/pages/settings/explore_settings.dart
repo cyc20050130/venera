@@ -16,10 +16,7 @@ class _ExploreSettingsState extends State<ExploreSettings> {
         SelectSetting(
           title: "Display mode of comic tile".tl,
           settingKey: "comicDisplayMode",
-          optionTranslation: {
-            "detailed": "Detailed".tl,
-            "brief": "Brief".tl,
-          },
+          optionTranslation: {"detailed": "Detailed".tl, "brief": "Brief".tl},
         ).toSliver(),
         _SliderSetting(
           title: "Size of comic tile".tl,
@@ -69,7 +66,7 @@ class _ExploreSettingsState extends State<ExploreSettings> {
           settingKey: "defaultSearchTarget",
           optionTranslation: {
             '_aggregated_': "Aggregated".tl,
-            ...((){
+            ...(() {
               var map = <String, String>{};
               for (var c in ComicSource.all()) {
                 map[c.key] = c.name;
@@ -120,9 +117,11 @@ class _ManageBlockingWordView extends StatefulWidget {
 }
 
 class _ManageBlockingWordViewState extends State<_ManageBlockingWordView> {
+  List<String> get words => appdata.settings.stringList("blockedWords");
+
   @override
   Widget build(BuildContext context) {
-    assert(appdata.settings["blockedWords"] is List);
+    final blockedWords = words;
     return PopUpWidgetScaffold(
       title: "Keyword blocking".tl,
       tailing: [
@@ -133,15 +132,17 @@ class _ManageBlockingWordViewState extends State<_ManageBlockingWordView> {
         ),
       ],
       body: ListView.builder(
-        itemCount: appdata.settings["blockedWords"].length,
+        itemCount: blockedWords.length,
         itemBuilder: (context, index) {
           return ListTile(
-            title: Text(appdata.settings["blockedWords"][index]),
+            title: Text(blockedWords[index]),
             trailing: IconButton(
               icon: const Icon(Icons.close),
               onPressed: () {
-                appdata.settings["blockedWords"].removeAt(index);
-                appdata.saveData();
+                final updated = words;
+                updated.removeAt(index);
+                appdata.settings["blockedWords"] = updated;
+                appdata.saveDataInBackground();
                 setState(() {});
               },
             ),
@@ -152,49 +153,23 @@ class _ManageBlockingWordViewState extends State<_ManageBlockingWordView> {
   }
 
   void add() {
-    showDialog(
+    showInputDialog(
       context: App.rootContext,
-      builder: (context) {
-        var controller = TextEditingController();
-        String? error;
-        return StatefulBuilder(builder: (context, setState) {
-          return ContentDialog(
-            title: "Add keyword".tl,
-            content: TextField(
-              controller: controller,
-              decoration: InputDecoration(
-                border: const OutlineInputBorder(),
-                label: Text("Keyword".tl),
-                errorText: error,
-              ),
-              onChanged: (s) {
-                if (error != null) {
-                  setState(() {
-                    error = null;
-                  });
-                }
-              },
-            ).paddingHorizontal(12),
-            actions: [
-              Button.filled(
-                onPressed: () {
-                  if (appdata.settings["blockedWords"]
-                      .contains(controller.text)) {
-                    setState(() {
-                      error = "Keyword already exists".tl;
-                    });
-                    return;
-                  }
-                  appdata.settings["blockedWords"].add(controller.text);
-                  appdata.saveData();
-                  this.setState(() {});
-                  context.pop();
-                },
-                child: Text("Add".tl),
-              ),
-            ],
-          );
-        });
+      title: "Add keyword".tl,
+      hintText: "Keyword".tl,
+      confirmText: "Add",
+      onConfirm: (value) {
+        final updated = words;
+        if (updated.contains(value)) {
+          return "Keyword already exists".tl;
+        }
+        updated.add(value);
+        appdata.settings["blockedWords"] = updated;
+        appdata.saveDataInBackground();
+        if (mounted) {
+          setState(() {});
+        }
+        return null;
       },
     );
   }
@@ -264,10 +239,13 @@ class _ManageBlockingCommentWordView extends StatefulWidget {
       _ManageBlockingCommentWordViewState();
 }
 
-class _ManageBlockingCommentWordViewState extends State<_ManageBlockingCommentWordView> {
+class _ManageBlockingCommentWordViewState
+    extends State<_ManageBlockingCommentWordView> {
+  List<String> get words => appdata.settings.stringList("blockedCommentWords");
+
   @override
   Widget build(BuildContext context) {
-    assert(appdata.settings["blockedCommentWords"] is List);
+    final blockedWords = words;
     return PopUpWidgetScaffold(
       title: "Comment keyword blocking".tl,
       tailing: [
@@ -278,15 +256,17 @@ class _ManageBlockingCommentWordViewState extends State<_ManageBlockingCommentWo
         ),
       ],
       body: ListView.builder(
-        itemCount: appdata.settings["blockedCommentWords"].length,
+        itemCount: blockedWords.length,
         itemBuilder: (context, index) {
           return ListTile(
-            title: Text(appdata.settings["blockedCommentWords"][index]),
+            title: Text(blockedWords[index]),
             trailing: IconButton(
               icon: const Icon(Icons.close),
               onPressed: () {
-                appdata.settings["blockedCommentWords"].removeAt(index);
-                appdata.saveData();
+                final updated = words;
+                updated.removeAt(index);
+                appdata.settings["blockedCommentWords"] = updated;
+                appdata.saveDataInBackground();
                 setState(() {});
               },
             ),
@@ -297,49 +277,23 @@ class _ManageBlockingCommentWordViewState extends State<_ManageBlockingCommentWo
   }
 
   void add() {
-    showDialog(
+    showInputDialog(
       context: App.rootContext,
-      builder: (context) {
-        var controller = TextEditingController();
-        String? error;
-        return StatefulBuilder(builder: (context, setState) {
-          return ContentDialog(
-            title: "Add keyword".tl,
-            content: TextField(
-              controller: controller,
-              decoration: InputDecoration(
-                border: const OutlineInputBorder(),
-                label: Text("Keyword".tl),
-                errorText: error,
-              ),
-              onChanged: (s) {
-                if (error != null) {
-                  setState(() {
-                    error = null;
-                  });
-                }
-              },
-            ).paddingHorizontal(12),
-            actions: [
-              Button.filled(
-                onPressed: () {
-                  if (appdata.settings["blockedCommentWords"]
-                      .contains(controller.text)) {
-                    setState(() {
-                      error = "Keyword already exists".tl;
-                    });
-                    return;
-                  }
-                  appdata.settings["blockedCommentWords"].add(controller.text);
-                  appdata.saveData();
-                  this.setState(() {});
-                  context.pop();
-                },
-                child: Text("Add".tl),
-              ),
-            ],
-          );
-        });
+      title: "Add keyword".tl,
+      hintText: "Keyword".tl,
+      confirmText: "Add",
+      onConfirm: (value) {
+        final updated = words;
+        if (updated.contains(value)) {
+          return "Keyword already exists".tl;
+        }
+        updated.add(value);
+        appdata.settings["blockedCommentWords"] = updated;
+        appdata.saveDataInBackground();
+        if (mounted) {
+          setState(() {});
+        }
+        return null;
       },
     );
   }

@@ -10,14 +10,110 @@ import 'package:venera/utils/image.dart';
 
 import 'app_dio.dart';
 
+@visibleForTesting
+Map<String, dynamic> normalizeThumbnailLoadingConfig(Object? value) {
+  return _normalizeImageLoadingConfig(value);
+}
+
+@visibleForTesting
+Map<String, dynamic> normalizeComicImageLoadingConfig(Object? value) {
+  return _normalizeImageLoadingConfig(value);
+}
+
+Map<String, dynamic> _normalizeImageLoadingConfig(Object? value) {
+  final config = <String, dynamic>{};
+  if (value is Map) {
+    for (final entry in value.entries) {
+      final key = entry.key;
+      if (key is String) {
+        config[key] = entry.value;
+      }
+    }
+  }
+  final headers = <String, dynamic>{};
+  final rawHeaders = config['headers'];
+  if (rawHeaders is Map) {
+    for (final entry in rawHeaders.entries) {
+      final key = entry.key;
+      if (key is String) {
+        headers[key] = entry.value;
+      }
+    }
+  }
+  config['headers'] = headers;
+  if (config['url'] is! String) {
+    config.remove('url');
+  }
+  if (config['method'] is! String) {
+    config.remove('method');
+  }
+  return config;
+}
+
+@visibleForTesting
+int? normalizeImageResponseContentLength(int? contentLength) {
+  if (contentLength == null || contentLength < 0) {
+    return null;
+  }
+  return contentLength;
+}
+
+@visibleForTesting
+bool shouldRedirectThumbnailToComicCover({
+  required String requestUrl,
+  required String? sourceKey,
+  required String? cid,
+  required bool hasComicInfoLoader,
+}) {
+  return requestUrl.startsWith('cover.') &&
+      sourceKey != null &&
+      cid != null &&
+      cid.isNotEmpty &&
+      hasComicInfoLoader;
+}
+
+@visibleForTesting
+List<int>? normalizeImageOnResponseBytes(Object? value) {
+  if (value is Uint8List) {
+    return value;
+  }
+  if (value is List<int>) {
+    return value;
+  }
+  if (value is Iterable) {
+    final bytes = value.whereType<int>().toList();
+    return bytes.isEmpty ? null : bytes;
+  }
+  return null;
+}
+
+@visibleForTesting
+Future<List<int>?> runImageOnResponseCallback(
+  FutureOr<Object?> Function() callback, {
+  void Function()? release,
+  String label = 'image',
+}) async {
+  try {
+    final result = await callback();
+    return normalizeImageOnResponseBytes(result);
+  } catch (e, s) {
+    Log.warning("Network", "Ignoring failed $label onResponse: $e\n$s");
+    return null;
+  } finally {
+    release?.call();
+  }
+}
+
 abstract class ImageDownloader {
   static const _kReaderPrefetchPollInterval = Duration(milliseconds: 16);
   static const _kMaxConcurrentReaderPrefetches = 1;
+  static const _kReaderLifecycleResumeQuietWindow = Duration(milliseconds: 900);
 
   static final _readerImagePriorities = <String, ReaderImageLoadPriority>{};
   static final _pendingReaderPrefetchRequests =
       <String, ReaderImageLoadPriority>{};
   static final _activeReaderImageKinds = <String, ReaderImageLoadPriority>{};
+  static DateTime? _readerLifecycleQuietUntil;
 
   static int _activeReaderForegroundLoads = 0;
   static int _activeReaderSameChapterPrefetchLoads = 0;
@@ -33,16 +129,29 @@ abstract class ImageDownloader {
   })?
   debugReaderImageLoader;
 
+  @visibleForTesting
+  static Stream<ImageDownloadProgress> Function(
+    String url,
+    String? sourceKey,
+    String? cid,
+  )?
+  debugThumbnailNetworkLoader;
+
+  @visibleForTesting
+  static Future<void> Function(String cacheKey, List<int> data)?
+  debugThumbnailCacheWriter;
+
+  static final _loadingThumbnails =
+      <String, _StreamWrapper<ImageDownloadProgress>>{};
+
   static Stream<ImageDownloadProgress> loadThumbnail(
     String url,
     String? sourceKey, [
     String? cid,
   ]) async* {
     final cacheKey = "$url@$sourceKey${cid != null ? '@$cid' : ''}";
-    final cache = await CacheManager().findCache(cacheKey);
-
-    if (cache != null) {
-      var data = await cache.readAsBytes();
+    final data = await _readNonEmptyImageCache(cacheKey);
+    if (data != null) {
       yield ImageDownloadProgress(
         currentBytes: data.length,
         totalBytes: data.length,
@@ -50,36 +159,106 @@ abstract class ImageDownloader {
       );
     }
 
-    var configs = <String, dynamic>{};
-    if (sourceKey != null) {
-      var comicSource = ComicSource.find(sourceKey);
-      configs = comicSource?.getThumbnailLoadingConfig?.call(url) ?? {};
+    yield* _thumbnailRefreshStream(cacheKey, url, sourceKey, cid);
+  }
+
+  static Stream<ImageDownloadProgress> _thumbnailRefreshStream(
+    String cacheKey,
+    String url,
+    String? sourceKey,
+    String? cid,
+  ) {
+    var existing = _loadingThumbnails[cacheKey];
+    if (existing != null && existing.isClosed) {
+      _loadingThumbnails.remove(cacheKey);
+      existing = null;
     }
-    configs['headers'] ??= {};
-    if (configs['headers']['user-agent'] == null &&
-        configs['headers']['User-Agent'] == null) {
-      configs['headers']['user-agent'] = webUA;
+    if (existing != null) {
+      return existing.stream;
     }
 
-    if (((configs['url'] as String?) ?? url).startsWith('cover.') &&
-        sourceKey != null) {
+    final stream = _StreamWrapper<ImageDownloadProgress>(
+      _loadThumbnailRefresh(cacheKey, url, sourceKey, cid),
+      (wrapper) {
+        if (_loadingThumbnails[cacheKey] == wrapper) {
+          _loadingThumbnails.remove(cacheKey);
+        }
+      },
+      replayLastValue: true,
+    );
+    _loadingThumbnails[cacheKey] = stream;
+    return stream.stream;
+  }
+
+  static Stream<ImageDownloadProgress> _loadThumbnailRefresh(
+    String cacheKey,
+    String url,
+    String? sourceKey,
+    String? cid,
+  ) async* {
+    final debugLoader = debugThumbnailNetworkLoader;
+    if (debugLoader != null) {
+      Uint8List? imageBytes;
+      await for (final progress in debugLoader(url, sourceKey, cid)) {
+        if (progress.imageBytes != null) {
+          imageBytes = progress.imageBytes;
+        }
+        yield progress;
+      }
+      if (imageBytes != null) {
+        await _writeThumbnailCache(cacheKey, imageBytes);
+      }
+      return;
+    }
+
+    var configs = normalizeThumbnailLoadingConfig(null);
+    if (sourceKey != null) {
       var comicSource = ComicSource.find(sourceKey);
-      if (comicSource != null) {
-        var comicInfo = await comicSource.loadComicInfo!(cid!);
-        yield* loadThumbnail(comicInfo.data.cover, sourceKey);
+      configs = normalizeThumbnailLoadingConfig(
+        comicSource?.getThumbnailLoadingConfig?.call(url),
+      );
+    }
+    final headers = configs['headers'] as Map<String, dynamic>;
+    if (headers['user-agent'] == null && headers['User-Agent'] == null) {
+      headers['user-agent'] = webUA;
+    }
+
+    final requestUrlFromConfig = (configs['url'] as String?) ?? url;
+    if (requestUrlFromConfig.startsWith('cover.') && sourceKey != null) {
+      var comicSource = ComicSource.find(sourceKey);
+      final loadComicInfo = comicSource?.loadComicInfo;
+      final comicId = cid;
+      if (shouldRedirectThumbnailToComicCover(
+            requestUrl: requestUrlFromConfig,
+            sourceKey: sourceKey,
+            cid: comicId,
+            hasComicInfoLoader: loadComicInfo != null,
+          ) &&
+          loadComicInfo != null &&
+          comicId != null) {
+        var comicInfo = await loadComicInfo(comicId);
+        if (comicInfo.error) {
+          throw comicInfo.errorMessage ?? "Failed to load comic cover";
+        }
+        yield* loadThumbnail(comicInfo.data.cover, sourceKey, comicId);
         return;
       }
+      Log.warning(
+        "Network",
+        "Skip thumbnail cover redirect without comic id or loader: $sourceKey",
+      );
+      configs.remove('url');
     }
 
     var dio = AppDio(
       BaseOptions(
-        headers: Map<String, dynamic>.from(configs['headers']),
-        method: configs['method'] ?? 'GET',
+        headers: headers,
+        method: configs['method'] as String? ?? 'GET',
         responseType: ResponseType.stream,
       ),
     );
 
-    String requestUrl = configs['url'] ?? url;
+    String requestUrl = configs['url'] as String? ?? url;
     if (requestUrl.startsWith('//')) {
       requestUrl = 'https:$requestUrl';
     }
@@ -87,11 +266,11 @@ abstract class ImageDownloader {
       requestUrl,
       data: configs['data'],
     );
-    var stream = req.data?.stream ?? (throw "Error: Empty response body.");
-    int? expectedBytes = req.data!.contentLength;
-    if (expectedBytes == -1) {
-      expectedBytes = null;
-    }
+    final body = req.data ?? (throw "Error: Empty response body.");
+    var stream = body.stream;
+    final expectedBytes = normalizeImageResponseContentLength(
+      body.contentLength,
+    );
     var buffer = <int>[];
     await for (var data in stream) {
       buffer.addAll(data);
@@ -105,16 +284,58 @@ abstract class ImageDownloader {
 
     if (configs['onResponse'] is JSInvokable) {
       final uint8List = Uint8List.fromList(buffer);
-      buffer = (configs['onResponse'] as JSInvokable)([uint8List]);
-      (configs['onResponse'] as JSInvokable).free();
+      final onResponse = configs['onResponse'] as JSInvokable;
+      final processedBytes = await runImageOnResponseCallback(
+        () => onResponse([uint8List]),
+        release: onResponse.free,
+        label: 'thumbnail',
+      );
+      if (processedBytes != null) {
+        buffer = processedBytes;
+      } else {
+        Log.warning("Network", "Ignoring invalid thumbnail onResponse result");
+      }
     }
 
-    await CacheManager().writeCache(cacheKey, buffer);
+    if (buffer.isEmpty) {
+      throw "Error: Empty response body.";
+    }
+    await _writeThumbnailCache(cacheKey, buffer);
     yield ImageDownloadProgress(
       currentBytes: buffer.length,
       totalBytes: buffer.length,
       imageBytes: Uint8List.fromList(buffer),
     );
+  }
+
+  static Future<void> _writeThumbnailCache(
+    String cacheKey,
+    List<int> data,
+  ) async {
+    if (data.isEmpty) {
+      Log.warning("Image Cache", "Skip empty thumbnail cache: $cacheKey");
+      return;
+    }
+    final writer = debugThumbnailCacheWriter;
+    if (writer != null) {
+      await writer(cacheKey, data);
+      return;
+    }
+    await CacheManager().writeCache(cacheKey, data);
+  }
+
+  static Future<Uint8List?> _readNonEmptyImageCache(String cacheKey) async {
+    final cache = await CacheManager().findCache(cacheKey);
+    if (cache == null) {
+      return null;
+    }
+    final data = await cache.readAsBytes();
+    if (data.isNotEmpty) {
+      return data;
+    }
+    Log.warning("Image Cache", "Discard empty cache entry: $cacheKey");
+    await CacheManager().delete(cacheKey);
+    return null;
   }
 
   static final _loadingImages =
@@ -135,6 +356,32 @@ abstract class ImageDownloader {
     );
   }
 
+  static void markReaderLifecyclePaused() {
+    _readerLifecycleQuietUntil = null;
+    cancelReaderPrefetches();
+  }
+
+  static void markReaderLifecycleResumed({
+    DateTime? now,
+    Duration quietWindow = _kReaderLifecycleResumeQuietWindow,
+  }) {
+    final currentTime = now ?? DateTime.now();
+    _readerLifecycleQuietUntil = currentTime.add(quietWindow);
+    cancelReaderPrefetches();
+  }
+
+  static Duration get readerLifecycleQuietRemaining {
+    final quietUntil = _readerLifecycleQuietUntil;
+    if (quietUntil == null) {
+      return Duration.zero;
+    }
+    final remaining = quietUntil.difference(DateTime.now());
+    return remaining > Duration.zero ? remaining : Duration.zero;
+  }
+
+  static bool get isReaderLifecycleQuiet =>
+      readerLifecycleQuietRemaining > Duration.zero;
+
   /// Load a comic image from the network or cache.
   /// The function will prevent multiple requests for the same image.
   static Stream<ImageDownloadProgress> loadComicImage(
@@ -152,9 +399,8 @@ abstract class ImageDownloader {
     final requestedPriority = priority;
     if (requestedPriority == ReaderImageLoadPriority.foregroundVisible &&
         cacheStrategy == ComicImageCacheStrategy.cacheHitIsTerminal) {
-      final cache = await CacheManager().findCache(cacheKey);
-      if (cache != null) {
-        final data = await cache.readAsBytes();
+      final data = await _readNonEmptyImageCache(cacheKey);
+      if (data != null) {
         yield ImageDownloadProgress(
           currentBytes: data.length,
           totalBytes: data.length,
@@ -291,12 +537,48 @@ abstract class ImageDownloader {
     String cid,
     String eid,
   ) {
+    final loader = debugReaderImageLoader;
+    if (loader != null) {
+      return loader(imageKey, sourceKey, cid, eid, useCache: false);
+    }
     return _loadComicImage(imageKey, sourceKey, cid, eid, useCache: false);
   }
 
   @visibleForTesting
   static void debugResetReaderImageScheduling() {
+    _resetThumbnailLoadingState(resetDebugLoader: true);
     _resetReaderImageSchedulingState(resetDebugLoader: true);
+  }
+
+  static void _resetThumbnailLoadingState({bool resetDebugLoader = false}) {
+    for (final wrapper in _loadingThumbnails.values) {
+      wrapper.cancel();
+    }
+    _loadingThumbnails.clear();
+    if (resetDebugLoader) {
+      debugThumbnailNetworkLoader = null;
+      debugThumbnailCacheWriter = null;
+    }
+  }
+
+  @visibleForTesting
+  static void debugSetReaderLifecycleQuietUntil(DateTime? quietUntil) {
+    _readerLifecycleQuietUntil = quietUntil;
+  }
+
+  @visibleForTesting
+  static bool shouldDeferReaderImageLoadForLifecycle(
+    ReaderImageLoadPriority priority, {
+    DateTime? now,
+  }) {
+    if (priority == ReaderImageLoadPriority.foregroundVisible) {
+      return false;
+    }
+    final quietUntil = _readerLifecycleQuietUntil;
+    if (quietUntil == null) {
+      return false;
+    }
+    return quietUntil.isAfter(now ?? DateTime.now());
   }
 
   static bool hasQueuedOrActiveReaderLoad(ReaderImageLoadPriority priority) {
@@ -366,6 +648,10 @@ abstract class ImageDownloader {
           priority == ReaderImageLoadPriority.foregroundVisible) {
         return;
       }
+      if (shouldDeferReaderImageLoadForLifecycle(priority)) {
+        await Future.delayed(_kReaderPrefetchPollInterval);
+        continue;
+      }
       final totalPrefetchLoads =
           _activeReaderSameChapterPrefetchLoads +
           _activeReaderNextChapterPrefetchLoads;
@@ -413,6 +699,7 @@ abstract class ImageDownloader {
     _activeReaderForegroundLoads = 0;
     _activeReaderSameChapterPrefetchLoads = 0;
     _activeReaderNextChapterPrefetchLoads = 0;
+    _readerLifecycleQuietUntil = null;
     if (resetDebugLoader) {
       debugReaderImageLoader = null;
     }
@@ -430,9 +717,8 @@ abstract class ImageDownloader {
   }) async* {
     final cacheKey = "$imageKey@$sourceKey@$cid@$eid";
     if (useCache && cacheStrategy != ComicImageCacheStrategy.networkOnly) {
-      final cache = await CacheManager().findCache(cacheKey);
-      if (cache != null) {
-        var data = await cache.readAsBytes();
+      final data = await _readNonEmptyImageCache(cacheKey);
+      if (data != null) {
         yield ImageDownloadProgress(
           currentBytes: data.length,
           totalBytes: data.length,
@@ -447,51 +733,57 @@ abstract class ImageDownloader {
 
     Future<Map<String, dynamic>?> Function()? onLoadFailed;
 
-    var configs = <String, dynamic>{};
+    var configs = normalizeComicImageLoadingConfig(null);
     if (sourceKey != null) {
       var comicSource = ComicSource.find(sourceKey);
-      configs =
-          (await comicSource!.getImageLoadingConfig?.call(
-            imageKey,
-            cid,
-            eid,
-          )) ??
-          {};
+      configs = normalizeComicImageLoadingConfig(
+        await comicSource?.getImageLoadingConfig?.call(imageKey, cid, eid),
+      );
     }
     var retryLimit = 5;
     while (true) {
+      JSInvokable? onLoadFailedInvokable;
       try {
-        configs['headers'] ??= {'user-agent': webUA};
+        final headers = configs['headers'] as Map<String, dynamic>;
+        if (headers['user-agent'] == null && headers['User-Agent'] == null) {
+          headers['user-agent'] = webUA;
+        }
 
-        if (configs['onLoadFailed'] is JSInvokable) {
+        final rawOnLoadFailed = configs['onLoadFailed'];
+        if (rawOnLoadFailed is JSInvokable) {
+          onLoadFailedInvokable = rawOnLoadFailed;
           onLoadFailed = () async {
-            dynamic result = (configs['onLoadFailed'] as JSInvokable)([]);
+            dynamic result = rawOnLoadFailed([]);
             if (result is Future) {
               result = await result;
             }
-            if (result is! Map<String, dynamic>) return null;
-            return result;
+            if (result is! Map) return null;
+            return normalizeComicImageLoadingConfig(result);
           };
         }
 
         var dio = AppDio(
           BaseOptions(
-            headers: configs['headers'],
-            method: configs['method'] ?? 'GET',
+            headers: headers,
+            method: configs['method'] as String? ?? 'GET',
             responseType: ResponseType.stream,
           ),
         );
 
+        String requestUrl = configs['url'] as String? ?? imageKey;
+        if (requestUrl.startsWith('//')) {
+          requestUrl = 'https:$requestUrl';
+        }
         var req = await dio.request<ResponseBody>(
-          configs['url'] ?? imageKey,
+          requestUrl,
           data: configs['data'],
           cancelToken: cancelToken,
         );
-        var stream = req.data?.stream ?? (throw "Error: Empty response body.");
-        int? expectedBytes = req.data!.contentLength;
-        if (expectedBytes == -1) {
-          expectedBytes = null;
-        }
+        final body = req.data ?? (throw "Error: Empty response body.");
+        var stream = body.stream;
+        final expectedBytes = normalizeImageResponseContentLength(
+          body.contentLength,
+        );
         var buffer = <int>[];
         await for (var data in stream) {
           buffer.addAll(data);
@@ -501,19 +793,18 @@ abstract class ImageDownloader {
           );
         }
 
-        if (configs['onResponse'] is JSInvokable) {
-          dynamic result = (configs['onResponse'] as JSInvokable)([
-            Uint8List.fromList(buffer),
-          ]);
-          if (result is Future) {
-            result = await result;
-          }
-          if (result is List<int>) {
-            buffer = result;
+        final rawOnResponse = configs['onResponse'];
+        if (rawOnResponse is JSInvokable) {
+          final processedBytes = await runImageOnResponseCallback(
+            () => rawOnResponse([Uint8List.fromList(buffer)]),
+            release: rawOnResponse.free,
+            label: 'reader',
+          );
+          if (processedBytes != null) {
+            buffer = processedBytes;
           } else {
-            throw "Error: Invalid onResponse result.";
+            Log.warning("Network", "Ignoring invalid reader onResponse result");
           }
-          (configs['onResponse'] as JSInvokable).free();
         }
 
         Uint8List data;
@@ -532,6 +823,9 @@ abstract class ImageDownloader {
           data = newData;
         }
 
+        if (data.isEmpty) {
+          throw "Error: Empty response body.";
+        }
         if (useCache) {
           await CacheManager().writeCache(cacheKey, data);
         }
@@ -545,18 +839,22 @@ abstract class ImageDownloader {
         if (retryLimit < 0 || onLoadFailed == null) {
           rethrow;
         }
-        var newConfig = await onLoadFailed();
-        (configs['onLoadFailed'] as JSInvokable).free();
-        onLoadFailed = null;
+        Map<String, dynamic>? newConfig;
+        try {
+          newConfig = await onLoadFailed();
+        } finally {
+          onLoadFailedInvokable?.free();
+          onLoadFailedInvokable = null;
+          onLoadFailed = null;
+        }
         if (newConfig == null) {
           rethrow;
         }
         configs = newConfig;
         retryLimit--;
       } finally {
-        if (onLoadFailed != null) {
-          (configs['onLoadFailed'] as JSInvokable).free();
-        }
+        onLoadFailedInvokable?.free();
+        onLoadFailed = null;
       }
     }
   }
@@ -703,10 +1001,14 @@ class _StreamWrapper<T> {
   final void Function()? onCancel;
   final void Function()? onNoListeners;
   final bool keepAliveWithoutListeners;
+  final bool replayLastValue;
 
   StreamIterator<T>? _iterator;
+  T? _lastValue;
+  bool _hasLastValue = false;
 
   bool isClosed = false;
+  bool _isListening = false;
 
   _StreamWrapper(
     this._stream,
@@ -717,9 +1019,8 @@ class _StreamWrapper<T> {
     this.onCancel,
     this.onNoListeners,
     this.keepAliveWithoutListeners = false,
-  }) {
-    _listen();
-  }
+    this.replayLastValue = false,
+  });
 
   void _listen() async {
     try {
@@ -731,6 +1032,10 @@ class _StreamWrapper<T> {
       _iterator = StreamIterator(_stream);
       while (!isClosed && await _iterator!.moveNext()) {
         final data = _iterator!.current;
+        if (replayLastValue) {
+          _lastValue = data;
+          _hasLastValue = true;
+        }
         if (isClosed) {
           break;
         }
@@ -747,7 +1052,15 @@ class _StreamWrapper<T> {
         }
       }
     } finally {
-      await _iterator?.cancel();
+      try {
+        await _iterator?.cancel();
+      } catch (e, s) {
+        Log.error(
+          "ImageDownloader",
+          "Failed to cancel shared image stream: $e",
+          s,
+        );
+      }
       _iterator = null;
       onListenFinish?.call();
       for (var controller in controllers) {
@@ -767,6 +1080,13 @@ class _StreamWrapper<T> {
     }
     var controller = StreamController<T>();
     controllers.add(controller);
+    if (replayLastValue && _hasLastValue) {
+      controller.add(_lastValue as T);
+    }
+    if (!_isListening) {
+      _isListening = true;
+      _listen();
+    }
     controller.onCancel = () {
       controllers.remove(controller);
       if (controllers.isEmpty && !keepAliveWithoutListeners && !isClosed) {
@@ -787,7 +1107,18 @@ class _StreamWrapper<T> {
     }
     controllers.clear();
     isClosed = true;
-    unawaited(_iterator?.cancel() ?? Future.value());
+    unawaited(
+      (_iterator?.cancel() ?? Future.value()).catchError((
+        Object error,
+        StackTrace stackTrace,
+      ) {
+        Log.error(
+          "ImageDownloader",
+          "Failed to cancel shared image stream: $error",
+          stackTrace,
+        );
+      }),
+    );
   }
 }
 

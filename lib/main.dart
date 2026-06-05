@@ -1,22 +1,100 @@
 import 'dart:async';
-import 'dart:ui' show PlatformDispatcher;
 import 'package:desktop_webview_window/desktop_webview_window.dart';
 import 'package:dynamic_color/dynamic_color.dart';
 import 'package:flex_seed_scheme/flex_seed_scheme.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_localizations/flutter_localizations.dart';
 import 'package:venera/foundation/bootstrap.dart';
 import 'package:venera/foundation/log.dart';
+import 'package:venera/network/images.dart';
 import 'package:venera/pages/auth_page.dart';
 import 'package:venera/pages/main_page.dart';
 import 'package:venera/utils/io.dart';
+import 'package:venera/utils/overlay_entry.dart';
 import 'package:window_manager/window_manager.dart';
 import 'components/components.dart';
 import 'components/window_frame.dart';
 import 'foundation/app.dart';
 import 'foundation/appdata.dart';
 import 'headless.dart';
+
+const Duration _lifecycleDownloadFlushThrottle = Duration(milliseconds: 700);
+const Duration _lifecycleAuthPromptThrottle = Duration(seconds: 2);
+
+@visibleForTesting
+bool shouldRequireAuthorization(Object? value) {
+  return normalizeBoolSetting(value, false);
+}
+
+@visibleForTesting
+bool shouldFlushDownloadsForLifecycleState({
+  required AppLifecycleState state,
+  required bool appInitialized,
+  required bool phaseAReady,
+  required DateTime now,
+  required DateTime? lastFlushAt,
+  Duration throttle = _lifecycleDownloadFlushThrottle,
+}) {
+  final isLeavingForeground =
+      state == AppLifecycleState.inactive ||
+      state == AppLifecycleState.hidden ||
+      state == AppLifecycleState.paused ||
+      state == AppLifecycleState.detached;
+  if (!isLeavingForeground || !appInitialized || !phaseAReady) {
+    return false;
+  }
+  if (lastFlushAt == null) {
+    return true;
+  }
+  return now.difference(lastFlushAt) >= throttle;
+}
+
+@visibleForTesting
+bool shouldShowLifecyclePrivacyOverlay({
+  required AppLifecycleState state,
+  required bool isMobile,
+  required bool authorizationRequired,
+  required bool hasOverlay,
+}) {
+  return isMobile &&
+      authorizationRequired &&
+      state == AppLifecycleState.inactive &&
+      !hasOverlay;
+}
+
+@visibleForTesting
+bool shouldRemoveLifecyclePrivacyOverlay({
+  required AppLifecycleState state,
+  required bool hasOverlay,
+}) {
+  return state == AppLifecycleState.resumed && hasOverlay;
+}
+
+@visibleForTesting
+bool shouldPushLifecycleAuthPage({
+  required AppLifecycleState state,
+  required bool isMobile,
+  required bool authorizationRequired,
+  required bool isAuthPageActive,
+  required bool isSelectingFiles,
+  required DateTime now,
+  required DateTime? lastAuthPromptAt,
+  Duration throttle = _lifecycleAuthPromptThrottle,
+}) {
+  if (!isMobile ||
+      !authorizationRequired ||
+      state != AppLifecycleState.hidden ||
+      isAuthPageActive ||
+      isSelectingFiles) {
+    return false;
+  }
+  if (lastAuthPromptAt == null) {
+    return true;
+  }
+  return now.difference(lastAuthPromptAt) >= throttle;
+}
 
 void main(List<String> args) {
   if (args.contains('--headless')) {
@@ -69,12 +147,18 @@ class MyApp extends StatefulWidget {
 }
 
 class _MyAppState extends State<MyApp> with WidgetsBindingObserver {
+  late final VoidCallback _forceRebuildCallback;
+
   @override
   void initState() {
-    App.registerForceRebuild(forceRebuild);
+    _forceRebuildCallback = forceRebuild;
+    App.registerForceRebuild(_forceRebuildCallback);
     SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
     WidgetsBinding.instance.addObserver(this);
     WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) {
+        return;
+      }
       logBootstrapEvent('first Flutter frame');
       bootstrapController.schedulePostFrameWork();
     });
@@ -84,55 +168,131 @@ class _MyAppState extends State<MyApp> with WidgetsBindingObserver {
   bool isAuthPageActive = false;
 
   OverlayEntry? hideContentOverlay;
+  DateTime? _lastDownloadFlushAt;
+  DateTime? _lastAuthPromptAt;
+
+  @override
+  void dispose() {
+    App.unregisterForceRebuild(_forceRebuildCallback);
+    WidgetsBinding.instance.removeObserver(this);
+    final overlay = hideContentOverlay;
+    hideContentOverlay = null;
+    if (overlay != null) {
+      removeAndDisposeOverlayEntry(overlay);
+    }
+    super.dispose();
+  }
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    if (state == AppLifecycleState.inactive ||
+    final now = DateTime.now();
+    if (state == AppLifecycleState.resumed) {
+      bootstrapController.markLifecycleResumed(now: now);
+      ImageDownloader.markReaderLifecycleResumed(now: now);
+    } else if (state == AppLifecycleState.inactive ||
         state == AppLifecycleState.hidden ||
         state == AppLifecycleState.paused ||
         state == AppLifecycleState.detached) {
-      if (App.isInitialized && bootstrapController.phaseAReady) {
-        unawaited(App.local.flushCurrentDownloadingTasks());
-      }
+      bootstrapController.markLifecyclePaused();
+      ImageDownloader.markReaderLifecyclePaused();
     }
-    if (!App.isMobile || !appdata.settings['authorizationRequired']) {
+    if (shouldFlushDownloadsForLifecycleState(
+      state: state,
+      appInitialized: App.isInitialized,
+      phaseAReady: bootstrapController.phaseAReady,
+      now: now,
+      lastFlushAt: _lastDownloadFlushAt,
+    )) {
+      _lastDownloadFlushAt = now;
+      App.local.flushCurrentDownloadingTasksInBackground(
+        reason: 'lifecycle $state',
+      );
+    }
+    final authorizationRequired = shouldRequireAuthorization(
+      appdata.settings['authorizationRequired'],
+    );
+    if (!App.isMobile || !authorizationRequired) {
       return;
     }
-    if (state == AppLifecycleState.inactive && hideContentOverlay == null) {
+    final rootContext = App.rootNavigatorKey.currentContext;
+    if (shouldShowLifecyclePrivacyOverlay(
+      state: state,
+      isMobile: App.isMobile,
+      authorizationRequired: authorizationRequired,
+      hasOverlay: hideContentOverlay != null,
+    )) {
+      if (rootContext == null || !rootContext.mounted) {
+        super.didChangeAppLifecycleState(state);
+        return;
+      }
+      final overlayColor = rootContext.colorScheme.surface;
       hideContentOverlay = OverlayEntry(
         builder: (context) {
           return Positioned.fill(
             child: Container(
               width: double.infinity,
               height: double.infinity,
-              color: App.rootContext.colorScheme.surface,
+              color: overlayColor,
             ),
           );
         },
       );
-      Overlay.of(App.rootContext).insert(hideContentOverlay!);
-    } else if (hideContentOverlay != null &&
-        state == AppLifecycleState.resumed) {
-      hideContentOverlay!.remove();
+      Overlay.of(rootContext).insert(hideContentOverlay!);
+    } else if (shouldRemoveLifecyclePrivacyOverlay(
+      state: state,
+      hasOverlay: hideContentOverlay != null,
+    )) {
+      final overlay = hideContentOverlay!;
       hideContentOverlay = null;
+      removeAndDisposeOverlayEntry(overlay);
     }
-    if (state == AppLifecycleState.hidden &&
-        !isAuthPageActive &&
-        !IO.isSelectingFiles) {
+    if (shouldPushLifecycleAuthPage(
+      state: state,
+      isMobile: App.isMobile,
+      authorizationRequired: authorizationRequired,
+      isAuthPageActive: isAuthPageActive,
+      isSelectingFiles: IO.isSelectingFiles,
+      now: now,
+      lastAuthPromptAt: _lastAuthPromptAt,
+    )) {
+      final currentRootContext = App.rootNavigatorKey.currentContext;
+      if (currentRootContext == null || !currentRootContext.mounted) {
+        super.didChangeAppLifecycleState(state);
+        return;
+      }
       isAuthPageActive = true;
-      App.rootContext.to(
-        () => AuthPage(
-          onSuccessfulAuth: () {
-            App.rootContext.pop();
-            isAuthPageActive = false;
-          },
-        ),
+      _lastAuthPromptAt = now;
+      final authFuture = currentRootContext.to(
+        () => AuthPage(onSuccessfulAuth: _closeAuthPage),
+      );
+      unawaited(
+        authFuture
+            .whenComplete(() {
+              isAuthPageActive = false;
+            })
+            .catchError((Object error, StackTrace stackTrace) {
+              Log.error(
+                "Lifecycle",
+                "Lifecycle auth prompt failed: $error\n$stackTrace",
+              );
+            }),
       );
     }
     super.didChangeAppLifecycleState(state);
   }
 
+  void _closeAuthPage() {
+    final rootContext = App.rootNavigatorKey.currentContext;
+    if (rootContext != null && rootContext.mounted) {
+      rootContext.pop();
+    }
+    isAuthPageActive = false;
+  }
+
   void forceRebuild() {
+    if (!mounted) {
+      return;
+    }
     void rebuild(Element el) {
       el.markNeedsBuild();
       el.visitChildren(rebuild);
@@ -303,7 +463,10 @@ class _MyAppState extends State<MyApp> with WidgetsBindingObserver {
                 },
               );
             }
-            final home = appdata.settings['authorizationRequired']
+            final home =
+                shouldRequireAuthorization(
+                  appdata.settings['authorizationRequired'],
+                )
                 ? AuthPage(
                     onSuccessfulAuth: () {
                       App.rootContext.toReplacement(() => const MainPage());

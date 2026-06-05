@@ -36,6 +36,24 @@ const _kLeftBarWidth = 256.0;
 
 const _kTwoPanelChangeWidth = 720.0;
 
+@visibleForTesting
+({String? folder, bool isNetwork}) normalizeFavoriteFolderSelection(
+  Object? value,
+) {
+  if (value is! Map) {
+    return (folder: null, isNetwork: false);
+  }
+  final rawName = value['name'];
+  final folder = rawName is String && rawName.isNotEmpty ? rawName : null;
+  if (folder == null) {
+    return (folder: null, isNetwork: false);
+  }
+  return (
+    folder: folder,
+    isNetwork: normalizeBoolSetting(value['isNetwork'], false),
+  );
+}
+
 class FavoritesPage extends StatefulWidget {
   const FavoritesPage({super.key});
 
@@ -65,11 +83,11 @@ class _FavoritesPageState extends State<FavoritesPage> {
 
   @override
   void initState() {
-    var data = appdata.implicitData['favoriteFolder'];
-    if (data != null) {
-      folder = data['name'];
-      isNetwork = data['isNetwork'] ?? false;
-    }
+    final favoriteFolder = normalizeFavoriteFolderSelection(
+      appdata.implicitData['favoriteFolder'],
+    );
+    folder = favoriteFolder.folder;
+    isNetwork = favoriteFolder.isNetwork;
     if (folder != null &&
         !isNetwork &&
         !LocalFavoritesManager().existsFolder(folder!)) {

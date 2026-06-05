@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 
 import 'package:flutter/foundation.dart';
@@ -8,6 +9,93 @@ import 'package:venera/foundation/log.dart';
 import 'package:venera/utils/data_sync.dart';
 import 'package:venera/utils/init.dart';
 import 'package:venera/utils/io.dart';
+
+@visibleForTesting
+String normalizeDisableSyncFields(Object? value) {
+  return value is String ? value : '';
+}
+
+@visibleForTesting
+String normalizeDeviceId(Object? value) {
+  return value is String ? value : '';
+}
+
+int normalizeDataVersion(Object? value) {
+  final parsed = switch (value) {
+    int() => value,
+    String() => int.tryParse(value),
+    _ => null,
+  };
+  if (parsed == null || parsed < 0) {
+    return 0;
+  }
+  return parsed;
+}
+
+@visibleForTesting
+List<String> normalizeSearchHistory(Object? value) {
+  if (value is! Iterable) {
+    return <String>[];
+  }
+  return value.whereType<String>().where((e) => e.isNotEmpty).take(50).toList();
+}
+
+@visibleForTesting
+Map<String, dynamic> normalizeImplicitData(Object? value) {
+  if (value is! Map) {
+    return <String, dynamic>{};
+  }
+  return value.map((key, value) => MapEntry(key.toString(), value));
+}
+
+@visibleForTesting
+List<String> normalizeStringListSetting(Object? value) {
+  if (value is! Iterable) {
+    return <String>[];
+  }
+  return value
+      .whereType<String>()
+      .where((element) => element.isNotEmpty)
+      .toList();
+}
+
+String normalizeStringSetting(Object? value, String fallback) {
+  if (value is String) {
+    return value;
+  }
+  return fallback;
+}
+
+bool normalizeBoolSetting(Object? value, bool fallback) {
+  if (value is bool) {
+    return value;
+  }
+  if (value is num) {
+    return value != 0;
+  }
+  if (value is String) {
+    switch (value.trim().toLowerCase()) {
+      case 'true':
+      case '1':
+      case 'yes':
+        return true;
+      case 'false':
+      case '0':
+      case 'no':
+        return false;
+    }
+  }
+  return fallback;
+}
+
+num normalizeNumSetting(Object? value, num fallback) {
+  final parsed = switch (value) {
+    num() => value,
+    String() => num.tryParse(value),
+    _ => null,
+  };
+  return parsed ?? fallback;
+}
 
 class Appdata with Init {
   Appdata._create();
@@ -26,11 +114,15 @@ class Appdata with Init {
     try {
       var futures = <Future>[];
       var json = toJson();
+      var disableSyncFields = normalizeDisableSyncFields(
+        json["settings"]["disableSyncFields"],
+      );
+      json["settings"]["disableSyncFields"] = disableSyncFields;
       var data = jsonEncode(json);
       var file = File(FilePath.join(App.dataPath, 'appdata.json'));
       futures.add(file.writeAsString(data));
+      var syncFile = File(FilePath.join(App.dataPath, 'syncdata.json'));
 
-      var disableSyncFields = json["settings"]["disableSyncFields"] as String;
       if (disableSyncFields.isNotEmpty) {
         var json4sync = jsonDecode(data);
         List<String> customDisableSync = splitField(disableSyncFields);
@@ -38,8 +130,9 @@ class Appdata with Init {
           json4sync["settings"].remove(field);
         }
         var data4sync = jsonEncode(json4sync);
-        var file4sync = File(FilePath.join(App.dataPath, 'syncdata.json'));
-        futures.add(file4sync.writeAsString(data4sync));
+        futures.add(syncFile.writeAsString(data4sync));
+      } else {
+        futures.add(syncFile.deleteIgnoreError());
       }
 
       await Future.wait(futures);
@@ -51,6 +144,14 @@ class Appdata with Init {
     }
   }
 
+  void saveDataInBackground([bool sync = true]) {
+    unawaited(
+      saveData(sync).catchError((Object error, StackTrace stackTrace) {
+        Log.error("Appdata", "Failed to save app data: $error\n$stackTrace");
+      }),
+    );
+  }
+
   void addSearchHistory(String keyword) {
     if (searchHistory.contains(keyword)) {
       searchHistory.remove(keyword);
@@ -59,17 +160,17 @@ class Appdata with Init {
     if (searchHistory.length > 50) {
       searchHistory.removeLast();
     }
-    saveData();
+    saveDataInBackground();
   }
 
   void removeSearchHistory(String keyword) {
     searchHistory.remove(keyword);
-    saveData();
+    saveDataInBackground();
   }
 
   void clearSearchHistory() {
     searchHistory.clear();
-    saveData();
+    saveDataInBackground();
   }
 
   Map<String, dynamic> toJson() {
@@ -96,35 +197,42 @@ class Appdata with Init {
 
   /// Sync data from another device
   void syncData(Map<String, dynamic> data) {
-    if (data['settings'] is Map) {
-      var settings = data['settings'] as Map<String, dynamic>;
-
+    final remoteSettings = data['settings'];
+    if (remoteSettings is Map) {
       List<String> customDisableSync = splitField(
-        this.settings["disableSyncFields"] as String,
+        normalizeDisableSyncFields(settings["disableSyncFields"]),
       );
 
-      for (var key in settings.keys) {
+      for (var entry in remoteSettings.entries) {
+        final key = entry.key;
+        if (key is! String) {
+          continue;
+        }
         if (!_disableSync.contains(key) && !customDisableSync.contains(key)) {
-          this.settings[key] = settings[key];
+          settings[key] = entry.value;
         }
       }
     }
-    searchHistory = List.from(data['searchHistory'] ?? []);
-    saveData();
+    searchHistory = normalizeSearchHistory(data['searchHistory']);
+    saveDataInBackground();
   }
 
   var implicitData = <String, dynamic>{};
 
-  void writeImplicitData() async {
-    while (_isSavingData) {
-      await Future.delayed(const Duration(milliseconds: 20));
-    }
-    _isSavingData = true;
+  Future<void> writeImplicitData() async {
     try {
-      var file = File(FilePath.join(App.dataPath, 'implicitData.json'));
-      await file.writeAsString(jsonEncode(implicitData));
-    } finally {
-      _isSavingData = false;
+      while (_isSavingData) {
+        await Future.delayed(const Duration(milliseconds: 20));
+      }
+      _isSavingData = true;
+      try {
+        var file = File(FilePath.join(App.dataPath, 'implicitData.json'));
+        await file.writeAsString(jsonEncode(implicitData));
+      } finally {
+        _isSavingData = false;
+      }
+    } catch (e, s) {
+      Log.error("Appdata", "Failed to save implicit data: $e", s);
     }
   }
 
@@ -137,25 +245,34 @@ class Appdata with Init {
     }
     try {
       var json = jsonDecode(await file.readAsString());
-      for (var key in (json['settings'] as Map<String, dynamic>).keys) {
-        if (json['settings'][key] != null) {
-          settings[key] = json['settings'][key];
+      if (json is! Map) {
+        throw const FormatException('appdata root must be an object');
+      }
+      final storedSettings = json['settings'];
+      if (storedSettings is Map) {
+        for (var entry in storedSettings.entries) {
+          final key = entry.key;
+          if (key is String && entry.value != null) {
+            settings[key] = entry.value;
+          }
         }
       }
-      searchHistory = List.from(json['searchHistory']);
+      searchHistory = normalizeSearchHistory(json['searchHistory']);
     } catch (e) {
       Log.error("Appdata", "Failed to load appdata", e);
       Log.info("Appdata", "Resetting appdata");
       file.deleteIgnoreError();
     }
-    if ((settings["deviceId"] as String).isEmpty) {
+    if (normalizeDeviceId(settings["deviceId"]).isEmpty) {
       settings._data["deviceId"] = const Uuid().v4();
       await saveData(false);
     }
     try {
       var implicitDataFile = File(FilePath.join(dataPath, 'implicitData.json'));
       if (await implicitDataFile.exists()) {
-        implicitData = jsonDecode(await implicitDataFile.readAsString());
+        implicitData = normalizeImplicitData(
+          jsonDecode(await implicitDataFile.readAsString()),
+        );
       }
     } catch (e) {
       Log.error("Appdata", "Failed to load implicit data", e);
@@ -251,6 +368,89 @@ class Settings with ChangeNotifier {
     }
   }
 
+  List<String> stringList(String key) {
+    return normalizeStringListSetting(_data[key]);
+  }
+
+  String stringValue(String key, {required String fallback}) {
+    return normalizeStringSetting(_data[key], fallback);
+  }
+
+  bool boolValue(String key, {required bool fallback}) {
+    return normalizeBoolSetting(_data[key], fallback);
+  }
+
+  Map<String, dynamic> _copyStringDynamicMap(Map value) {
+    final normalized = <String, dynamic>{};
+    for (final entry in value.entries) {
+      final entryKey = entry.key;
+      if (entryKey is String) {
+        normalized[entryKey] = entry.value;
+      }
+    }
+    return normalized;
+  }
+
+  Map<String, dynamic> _stringDynamicMap(String key) {
+    final value = _data[key];
+    var normalized = <String, dynamic>{};
+    if (value is Map) {
+      normalized = _copyStringDynamicMap(value);
+    }
+    _data[key] = normalized;
+    return normalized;
+  }
+
+  Map<String, dynamic>? _nestedStringDynamicMap(String key, String nestedKey) {
+    final value = _stringDynamicMap(key)[nestedKey];
+    if (value is Map) {
+      final normalized = _copyStringDynamicMap(value);
+      _stringDynamicMap(key)[nestedKey] = normalized;
+      return normalized;
+    }
+    return null;
+  }
+
+  Map<String, dynamic> _ensureNestedStringDynamicMap(
+    String key,
+    String nestedKey,
+  ) {
+    final existing = _nestedStringDynamicMap(key, nestedKey);
+    if (existing != null) {
+      return existing;
+    }
+    final created = <String, dynamic>{};
+    _stringDynamicMap(key)[nestedKey] = created;
+    return created;
+  }
+
+  int intValue(String key, {required int fallback, int? min, int? max}) {
+    var value = normalizeNumSetting(_data[key], fallback).toInt();
+    if (min != null && value < min) {
+      value = min;
+    }
+    if (max != null && value > max) {
+      value = max;
+    }
+    return value;
+  }
+
+  double doubleValue(
+    String key, {
+    required double fallback,
+    double? min,
+    double? max,
+  }) {
+    var value = normalizeNumSetting(_data[key], fallback).toDouble();
+    if (min != null && value < min) {
+      value = min;
+    }
+    if (max != null && value > max) {
+      value = max;
+    }
+    return value;
+  }
+
   void setEnabledComicSpecificSettings(
     String comicId,
     String sourceKey,
@@ -263,14 +463,19 @@ class Settings with ChangeNotifier {
     if (comicId == null || sourceKey == null) {
       return false;
     }
-    return _data['comicSpecificSettings']["$comicId@$sourceKey"]?["enabled"] ==
+    return _nestedStringDynamicMap(
+          'comicSpecificSettings',
+          "$comicId@$sourceKey",
+        )?["enabled"] ==
         true;
   }
 
   dynamic getReaderSetting(String comicId, String sourceKey, String key) {
     if (isComicSpecificSettingsEnabled(comicId, sourceKey)) {
-      var comicValue =
-          _data['comicSpecificSettings']["$comicId@$sourceKey"]?[key];
+      var comicValue = _nestedStringDynamicMap(
+        'comicSpecificSettings',
+        "$comicId@$sourceKey",
+      )?[key];
       if (comicValue != null) {
         return comicValue;
       }
@@ -284,15 +489,15 @@ class Settings with ChangeNotifier {
     String key,
     dynamic value,
   ) {
-    (_data['comicSpecificSettings'] as Map<String, dynamic>).putIfAbsent(
+    _ensureNestedStringDynamicMap(
+      'comicSpecificSettings',
       "$comicId@$sourceKey",
-      () => <String, dynamic>{},
     )[key] = value;
     notifyListeners();
   }
 
   void resetComicReaderSettings(String key) {
-    (_data['comicSpecificSettings'] as Map).remove(key);
+    _stringDynamicMap('comicSpecificSettings').remove(key);
     notifyListeners();
   }
 
@@ -301,41 +506,44 @@ class Settings with ChangeNotifier {
   }
 
   bool isDeviceSpecificSettingsEnabled() {
-    var deviceId = _data['deviceId'] as String;
+    var deviceId = normalizeDeviceId(_data['deviceId']);
     if (deviceId.isEmpty) {
       return false;
     }
-    return _data['deviceSpecificSettings'][deviceId]?["enabled"] == true;
+    return _nestedStringDynamicMap(
+          'deviceSpecificSettings',
+          deviceId,
+        )?["enabled"] ==
+        true;
   }
 
   dynamic getDeviceReaderSetting(String key) {
     if (!isDeviceSpecificSettingsEnabled()) {
       return _data[key];
     }
-    var deviceId = _data['deviceId'] as String;
-    return _data['deviceSpecificSettings'][deviceId]?[key] ?? _data[key];
+    var deviceId = normalizeDeviceId(_data['deviceId']);
+    return _nestedStringDynamicMap('deviceSpecificSettings', deviceId)?[key] ??
+        _data[key];
   }
 
   void setDeviceReaderSetting(String key, dynamic value) {
     var deviceId = _getOrCreateDeviceId();
-    (_data['deviceSpecificSettings'] as Map<String, dynamic>).putIfAbsent(
-      deviceId,
-      () => <String, dynamic>{},
-    )[key] = value;
+    _ensureNestedStringDynamicMap('deviceSpecificSettings', deviceId)[key] =
+        value;
     notifyListeners();
   }
 
   void resetDeviceReaderSettings() {
-    var deviceId = _data['deviceId'] as String;
+    var deviceId = normalizeDeviceId(_data['deviceId']);
     if (deviceId.isEmpty) {
       return;
     }
-    (_data['deviceSpecificSettings'] as Map).remove(deviceId);
+    _stringDynamicMap('deviceSpecificSettings').remove(deviceId);
     notifyListeners();
   }
 
   String _getOrCreateDeviceId() {
-    var deviceId = _data['deviceId'] as String;
+    var deviceId = normalizeDeviceId(_data['deviceId']);
     if (deviceId.isNotEmpty) {
       return deviceId;
     }

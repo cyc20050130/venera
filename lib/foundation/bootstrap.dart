@@ -25,6 +25,20 @@ enum BootstrapPhase { idle, phaseA, phaseB, phaseC, ready }
 
 final bootstrapController = BootstrapController();
 
+const Duration _kLifecycleResumeQuietWindow = Duration(milliseconds: 900);
+const int _kDefaultCacheSizeMb = 2048;
+
+@visibleForTesting
+int normalizeCacheSizeMb(Object? value) {
+  final normalized = normalizeNumSetting(value, _kDefaultCacheSizeMb).toInt();
+  return normalized > 0 ? normalized : _kDefaultCacheSizeMb;
+}
+
+@visibleForTesting
+bool shouldCheckUpdateOnStart(Object? value) {
+  return normalizeBoolSetting(value, false);
+}
+
 extension _FutureBootstrapInit<T> on Future<T> {
   Future<void> wait() async {
     try {
@@ -96,6 +110,7 @@ class BootstrapController extends ChangeNotifier {
   Timer? _windowsHeartbeatTimer;
   final Duration _startupInteractionProtectionWindow;
   final Set<String> _scheduledStartupBackgroundTasks = {};
+  DateTime? _lifecycleQuietUntil;
 
   void start() {
     if (_started) {
@@ -104,7 +119,14 @@ class BootstrapController extends ChangeNotifier {
     _started = true;
     _prepareStartupHooks();
     _stopwatch.start();
-    unawaited(_run());
+    unawaited(
+      _run().catchError((Object error, StackTrace stackTrace) {
+        Log.error(
+          "Bootstrap",
+          "Bootstrap failed unexpectedly: $error\n$stackTrace",
+        );
+      }),
+    );
   }
 
   Future<void> waitForPhaseB() async {
@@ -136,6 +158,38 @@ class BootstrapController extends ChangeNotifier {
     }
     logPerf('home interactive');
     notifyListeners();
+  }
+
+  void markLifecyclePaused() {
+    _lifecycleQuietUntil = null;
+  }
+
+  void markLifecycleResumed({
+    DateTime? now,
+    Duration quietWindow = _kLifecycleResumeQuietWindow,
+  }) {
+    final currentTime = now ?? DateTime.now();
+    _lifecycleQuietUntil = currentTime.add(quietWindow);
+    logPerf('lifecycle resumed quiet window');
+  }
+
+  Duration get lifecycleResumeQuietRemaining {
+    final quietUntil = _lifecycleQuietUntil;
+    if (quietUntil == null) {
+      return Duration.zero;
+    }
+    final remaining = quietUntil.difference(DateTime.now());
+    return remaining > Duration.zero ? remaining : Duration.zero;
+  }
+
+  Future<void> waitForInteractionQuiet() async {
+    while (true) {
+      final remaining = lifecycleResumeQuietRemaining;
+      if (remaining <= Duration.zero) {
+        return;
+      }
+      await Future<void>.delayed(remaining);
+    }
   }
 
   Future<void> _run() async {
@@ -183,7 +237,9 @@ class BootstrapController extends ChangeNotifier {
       TagsTranslation.readData().wait(),
       guardBootstrapTask(OpenCC.init()),
     ]);
-    CacheManager().setLimitSize(appdata.settings['cacheSize']);
+    CacheManager().setLimitSize(
+      normalizeCacheSizeMb(appdata.settings['cacheSize']),
+    );
   }
 
   Future<void> _runPhaseC() async {
@@ -212,7 +268,7 @@ class BootstrapController extends ChangeNotifier {
       'cache maintenance',
       const Duration(seconds: 10),
       () async {
-        CacheManager().scheduleMaintenance(Duration.zero);
+        CacheManager().scheduleInitialMaintenance(Duration.zero);
       },
     );
     scheduleStartupBackgroundTask(
@@ -245,6 +301,7 @@ class BootstrapController extends ChangeNotifier {
       await waitForPhaseB();
       await waitForHomeInteractive();
       await Future.delayed(_startupInteractionProtectionWindow + delay);
+      await waitForInteractionQuiet();
       logPerf('startup task start $name');
       try {
         await action();
@@ -302,7 +359,11 @@ Timer? startWindowsHeartbeat({
         await methodChannel.invokeMethod("heartBeat");
       };
   return Timer.periodic(interval, (_) {
-    unawaited(emitHeartbeat());
+    unawaited(
+      emitHeartbeat().catchError((Object e, StackTrace s) {
+        Log.error("Heartbeat", "Failed to emit heartbeat: $e\n$s");
+      }),
+    );
   });
 }
 
@@ -315,7 +376,7 @@ Future<void> _checkAppUpdates() async {
   appdata.implicitData['lastCheckUpdate'] = now;
   appdata.writeImplicitData();
   ComicSourcePage.checkComicSourceUpdate();
-  if (appdata.settings['checkUpdateOnStart']) {
+  if (shouldCheckUpdateOnStart(appdata.settings['checkUpdateOnStart'])) {
     await checkUpdateUi(false, true);
   }
 }
@@ -330,7 +391,11 @@ void checkUpdates() {
     );
     return;
   }
-  _checkAppUpdates();
+  unawaited(
+    _checkAppUpdates().catchError((Object e, StackTrace s) {
+      Log.error("Check Update", "Automatic update checks failed: $e\n$s");
+    }),
+  );
   FollowUpdatesService.initChecker();
 }
 
@@ -359,6 +424,6 @@ void _checkOldConfigs() {
   )) {
     appdata.settings['comicSourceListUrl'] =
         "https://cdn.jsdelivr.net/gh/cyc20050130/venera-configs@main/index.json";
-    appdata.saveData();
+    appdata.saveDataInBackground();
   }
 }

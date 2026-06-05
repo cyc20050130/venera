@@ -112,25 +112,12 @@ class _CoverViewerState extends State<_CoverViewer> {
 
   void _saveCover() async {
     try {
-      final imageStream = widget.imageProvider.resolve(
-        const ImageConfiguration(),
-      );
-      final completer = Completer<Uint8List>();
-
-      imageStream.addListener(
-        ImageStreamListener((ImageInfo info, bool _) async {
-          final byteData = await info.image.toByteData(
-            format: ImageByteFormat.png,
-          );
-          if (byteData != null) {
-            completer.complete(byteData.buffer.asUint8List());
-          }
-        }),
-      );
-
-      final data = await completer.future;
+      final data = await _imageProviderToPngBytes(widget.imageProvider);
       final fileType = detectFileType(data);
-      await saveFile(filename: "cover_${widget.title}${fileType.ext}", data: data);
+      await saveFile(
+        filename: "cover_${widget.title}${fileType.ext}",
+        data: data,
+      );
     } catch (e) {
       if (mounted) {
         context.showMessage(message: "Error".tl);

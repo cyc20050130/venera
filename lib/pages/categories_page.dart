@@ -6,9 +6,21 @@ import 'package:venera/foundation/comic_source/comic_source.dart';
 import 'package:venera/pages/ranking_page.dart';
 import 'package:venera/pages/settings/settings_page.dart';
 import 'package:venera/utils/ext.dart';
+import 'package:venera/utils/tab_controller.dart';
 import 'package:venera/utils/translations.dart';
 
 import 'comic_source_page.dart';
+
+@visibleForTesting
+List<String> normalizeEnabledCategoryPages({
+  required Iterable<String> configuredCategories,
+  required Iterable<String> availableCategories,
+}) {
+  final available = availableCategories.toSet();
+  return configuredCategories
+      .where((category) => available.contains(category))
+      .toList();
+}
 
 class CategoriesPage extends StatefulWidget {
   const CategoriesPage({super.key});
@@ -26,41 +38,44 @@ class _CategoriesPageState extends State<CategoriesPage>
   late TabController controller;
 
   void onSettingsChanged() {
-    var categories = List.from(
-      appdata.settings["categories"],
-    ).whereType<String>().toList();
+    var categories = appdata.settings.stringList("categories");
     var allCategories = ComicSource.all()
         .map((e) => e.categoryData?.key)
         .where((element) => element != null)
         .map((e) => e!)
         .toList();
-    categories = categories
-        .where((element) => allCategories.contains(element))
-        .toList();
+    categories = normalizeEnabledCategoryPages(
+      configuredCategories: categories,
+      availableCategories: allCategories,
+    );
     if (!categories.isEqualTo(this.categories)) {
+      final newController = replaceOwnedTabController(
+        previous: controller,
+        length: categories.length,
+        vsync: this,
+      );
       setState(() {
         this.categories = categories;
+        controller = newController;
       });
-      controller = TabController(length: categories.length, vsync: this);
     }
   }
 
   @override
   void initState() {
     super.initState();
-    var categories = List.from(
-      appdata.settings["categories"],
-    ).whereType<String>().toList();
+    var categories = appdata.settings.stringList("categories");
     var allCategories = ComicSource.all()
         .map((e) => e.categoryData?.key)
         .where((element) => element != null)
         .map((e) => e!)
         .toList();
-    this.categories = categories
-        .where((element) => allCategories.contains(element))
-        .toList();
+    this.categories = normalizeEnabledCategoryPages(
+      configuredCategories: categories,
+      availableCategories: allCategories,
+    );
     appdata.settings.addListener(onSettingsChanged);
-    controller = TabController(length: categories.length, vsync: this);
+    controller = TabController(length: this.categories.length, vsync: this);
   }
 
   void addPage() {
@@ -69,9 +84,9 @@ class _CategoriesPageState extends State<CategoriesPage>
 
   @override
   void dispose() {
-    super.dispose();
     controller.dispose();
     appdata.settings.removeListener(onSettingsChanged);
+    super.dispose();
   }
 
   Widget buildEmpty() {
@@ -247,7 +262,8 @@ class _CategoryPage extends StatelessWidget {
 
   Widget buildCategory(CategoryItem c) {
     return buildTag(c.label, () {
-      var context = App.mainNavigatorKey!.currentContext!;
+      var context = App.mainNavigatorKey?.currentContext;
+      if (context == null || !context.mounted) return;
       c.target.jump(context);
     });
   }

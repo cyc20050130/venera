@@ -102,11 +102,36 @@ class ComicSourceManager with ChangeNotifier, Init {
     notifyListeners();
   }
 
+  void removeAvailableUpdates(Iterable<String> keys) {
+    var changed = false;
+    for (final key in keys) {
+      changed = _availableUpdates.remove(key) != null || changed;
+    }
+    if (changed) {
+      notifyListeners();
+    }
+  }
+
   Map<String, String> get availableUpdates => Map.from(_availableUpdates);
 
   void notifyStateChange() {
     notifyListeners();
   }
+}
+
+@visibleForTesting
+({String username, String password})? normalizeStoredAccountCredentials(
+  Object? value,
+) {
+  if (value is! List || value.length < 2) {
+    return null;
+  }
+  final username = value[0];
+  final password = value[1];
+  if (username is! String || password is! String) {
+    return null;
+  }
+  return (username: username, password: password);
 }
 
 class ComicSource {
@@ -209,7 +234,9 @@ class ComicSource {
     var file = File("${App.dataPath}/comic_source/$key.data");
     if (await file.exists()) {
       try {
-        data = normalizeSourceData(Map.from(jsonDecode(await file.readAsString())));
+        data = normalizeSourceData(
+          Map.from(jsonDecode(await file.readAsString())),
+        );
       } catch (e, s) {
         Log.error("ComicSource", "Failed to load source data for $key: $e", s);
         data = normalizeSourceData({});
@@ -230,21 +257,39 @@ class ComicSource {
       _haveWaitingTask = false;
     }
     _isSaving = true;
-    var file = File("${App.dataPath}/comic_source/$key.data");
-    if (!await file.exists()) {
-      await file.create(recursive: true);
+    try {
+      var file = File("${App.dataPath}/comic_source/$key.data");
+      if (!await file.exists()) {
+        await file.create(recursive: true);
+      }
+      await file.writeAsString(jsonEncode(normalizeSourceData(data)));
+    } finally {
+      _isSaving = false;
     }
-    await file.writeAsString(jsonEncode(normalizeSourceData(data)));
-    _isSaving = false;
     DataSync().uploadData();
   }
 
+  void saveDataInBackground() {
+    unawaited(
+      saveData().catchError((Object error, StackTrace stackTrace) {
+        Log.error(
+          "ComicSource",
+          "Failed to save source data for $key: $error",
+          stackTrace,
+        );
+      }),
+    );
+  }
+
   Future<bool> reLogin() async {
-    if (data["account"] == null) {
+    final accountCredentials = storedAccountCredentials;
+    if (accountCredentials == null || account?.login == null) {
       return false;
     }
-    final List accountData = data["account"];
-    var res = await account!.login!(accountData[0], accountData[1]);
+    var res = await account!.login!(
+      accountCredentials.username,
+      accountCredentials.password,
+    );
     if (res.error) {
       Log.error("Failed to re-login", res.errorMessage ?? "Error");
       markLoginExpired();
@@ -256,8 +301,10 @@ class ComicSource {
 
   bool get isLoginExpired => data["_loginExpired"] == true;
 
-  bool get hasStoredAccountCredentials =>
-      data["account"] is List && (data["account"] as List).length >= 2;
+  ({String username, String password})? get storedAccountCredentials =>
+      normalizeStoredAccountCredentials(data["account"]);
+
+  bool get hasStoredAccountCredentials => storedAccountCredentials != null;
 
   void markLoginExpired() {
     data["_loginExpired"] = true;
@@ -273,25 +320,7 @@ class ComicSource {
     try {
       var value = JsEngine().runCode("ComicSource.sources.$key.settings");
       if (value is Map) {
-        var newMap = <String, Map<String, dynamic>>{};
-        for (var e in value.entries) {
-          if (e.key is! String) {
-            continue;
-          }
-          var v = <String, dynamic>{};
-          for (var e2 in e.value.entries) {
-            if (e2.key is! String) {
-              continue;
-            }
-            var v2 = e2.value;
-            if (v2 is JSInvokable) {
-              v2 = JSAutoFreeFunction(v2);
-            }
-            v[e2.key] = v2;
-          }
-          newMap[e.key] = v;
-        }
-        return newMap;
+        return normalizeSourceSettings(value);
       }
       return null;
     } catch (e) {

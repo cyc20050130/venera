@@ -23,6 +23,38 @@ ImageProvider? _findImageProvider(Comic comic) {
   return image;
 }
 
+int? resolveCoverDecodeDimension(
+  double logicalPixels,
+  double devicePixelRatio,
+) {
+  if (!logicalPixels.isFinite || logicalPixels <= 0) {
+    return null;
+  }
+  if (!devicePixelRatio.isFinite || devicePixelRatio <= 0) {
+    return null;
+  }
+  return (logicalPixels * devicePixelRatio).ceil().clamp(1, 4096);
+}
+
+@visibleForTesting
+bool shouldShowFavoriteStatusOnTile(Object? value) {
+  return normalizeBoolSetting(value, false);
+}
+
+@visibleForTesting
+bool shouldShowHistoryStatusOnTile(Object? value) {
+  return normalizeBoolSetting(value, false);
+}
+
+@visibleForTesting
+String? formatComicTileBadge(String? value) {
+  final badge = value?.trim();
+  if (badge == null || badge.isEmpty) {
+    return null;
+  }
+  return "${badge[0].toUpperCase()}${badge.substring(1).toLowerCase()}";
+}
+
 class ComicTile extends StatelessWidget {
   const ComicTile({
     super.key,
@@ -134,13 +166,19 @@ class ComicTile extends StatelessWidget {
         ? _buildDetailedMode(context)
         : _buildBriefMode(context);
 
-    var isFavorite = appdata.settings['showFavoriteStatusOnTile']
+    var isFavorite =
+        shouldShowFavoriteStatusOnTile(
+          appdata.settings['showFavoriteStatusOnTile'],
+        )
         ? LocalFavoritesManager().isExist(
             comic.id,
             ComicType.fromKey(comic.sourceKey),
           )
         : false;
-    var history = appdata.settings['showHistoryStatusOnTile']
+    var history =
+        shouldShowHistoryStatusOnTile(
+          appdata.settings['showHistoryStatusOnTile'],
+        )
         ? HistoryManager().findBySourceKey(comic.id, comic.sourceKey)
         : null;
     if (history?.page == 0) {
@@ -195,17 +233,28 @@ class ComicTile extends StatelessWidget {
     );
   }
 
-  Widget buildImage(BuildContext context) {
+  Widget buildImage(
+    BuildContext context, {
+    double? logicalWidth,
+    double? logicalHeight,
+  }) {
     var image = _findImageProvider(comic);
     if (image == null) {
       return const SizedBox();
     }
+    final devicePixelRatio = MediaQuery.devicePixelRatioOf(context);
     return AnimatedImage(
       image: image,
       fit: BoxFit.cover,
       width: double.infinity,
       height: double.infinity,
       animateOnFirstFrame: heroTag == null,
+      cacheWidth: logicalWidth == null
+          ? null
+          : resolveCoverDecodeDimension(logicalWidth, devicePixelRatio),
+      cacheHeight: logicalHeight == null
+          ? null
+          : resolveCoverDecodeDimension(logicalHeight, devicePixelRatio),
     );
   }
 
@@ -229,7 +278,11 @@ class ComicTile extends StatelessWidget {
             ],
           ),
           clipBehavior: Clip.antiAlias,
-          child: buildImage(context),
+          child: buildImage(
+            context,
+            logicalWidth: height * 0.68,
+            logicalHeight: height,
+          ),
         );
 
         if (heroTag != null) {
@@ -289,7 +342,11 @@ class ComicTile extends StatelessWidget {
             ],
           ),
           clipBehavior: Clip.antiAlias,
-          child: buildImage(context),
+          child: buildImage(
+            context,
+            logicalWidth: constraints.maxWidth,
+            logicalHeight: constraints.maxHeight,
+          ),
         );
 
         if (heroTag != null) {
@@ -484,14 +541,22 @@ class ComicTile extends StatelessWidget {
                 Button.filled(
                   onPressed: () {
                     context.pop();
+                    final blockedWords = appdata.settings.stringList(
+                      'blockedWords',
+                    );
                     for (var word in words) {
-                      appdata.settings['blockedWords'].add(word);
+                      if (!blockedWords.contains(word)) {
+                        blockedWords.add(word);
+                      }
                     }
-                    appdata.saveData();
+                    appdata.settings['blockedWords'] = blockedWords;
+                    appdata.saveDataInBackground();
                     context.showMessage(message: 'Blocked'.tl);
-                    comicTileContext
-                        .findAncestorStateOfType<_SliverGridComicsState>()!
-                        .update();
+                    if (comicTileContext.mounted) {
+                      comicTileContext
+                          .findAncestorStateOfType<_SliverGridComicsState>()
+                          ?.update();
+                    }
                   },
                   child: Text('Block'.tl),
                 ),
@@ -535,6 +600,7 @@ class _ComicDescription extends StatelessWidget {
     }
     var enableTranslate =
         App.locale.languageCode == 'zh' && this.enableTranslate;
+    final badgeText = formatComicTileBadge(badge);
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: <Widget>[
@@ -628,7 +694,7 @@ class _ComicDescription extends StatelessWidget {
                 ],
               ),
             ),
-            if (badge != null)
+            if (badgeText != null)
               Container(
                 padding: const EdgeInsets.fromLTRB(6, 4, 6, 4),
                 decoration: BoxDecoration(
@@ -636,10 +702,7 @@ class _ComicDescription extends StatelessWidget {
                   borderRadius: const BorderRadius.all(Radius.circular(8)),
                 ),
                 child: Center(
-                  child: Text(
-                    "${badge![0].toUpperCase()}${badge!.substring(1).toLowerCase()}",
-                    style: const TextStyle(fontSize: 12),
-                  ),
+                  child: Text(badgeText, style: const TextStyle(fontSize: 12)),
                 ),
               ),
           ],
@@ -810,6 +873,7 @@ class _SliverGridComicsState extends State<SliverGridComics> {
   }
 
   void update() {
+    if (!mounted) return;
     setState(() {
       comics.clear();
       for (var comic in widget.comics) {
@@ -911,7 +975,7 @@ class _SliverGridComics extends StatelessWidget {
 
 /// return the first blocked keyword, or null if not blocked
 String? isBlocked(Comic item) {
-  for (var word in appdata.settings['blockedWords']) {
+  for (var word in appdata.settings.stringList('blockedWords')) {
     if (item.title.contains(word)) {
       return word;
     }
@@ -972,6 +1036,62 @@ class ComicList extends StatefulWidget {
   State<ComicList> createState() => ComicListState();
 }
 
+@visibleForTesting
+Map<String, dynamic>? normalizeComicListStorageState(Object? value) {
+  if (value is! Map) {
+    return null;
+  }
+  final maxPage = _componentInt(value['maxPage']);
+  final normalizedMaxPage = maxPage != null && maxPage > 0 ? maxPage : null;
+  var page = _componentInt(value['page']) ?? 1;
+  if (page < 1) {
+    page = 1;
+  }
+  if (normalizedMaxPage != null && page > normalizedMaxPage) {
+    page = normalizedMaxPage;
+  }
+  return {
+    'maxPage': normalizedMaxPage,
+    'data': _normalizeComicListPageData(value['data']),
+    'page': page,
+    'error': value['error'] is String ? value['error'] : null,
+    'loading': _normalizeComicListLoadingState(value['loading']),
+    'nextUrl': value['nextUrl'] is String ? value['nextUrl'] : null,
+  };
+}
+
+Map<int, List<Comic>> _normalizeComicListPageData(Object? value) {
+  if (value is! Map) {
+    return <int, List<Comic>>{};
+  }
+  final result = <int, List<Comic>>{};
+  for (final entry in value.entries) {
+    final page = _componentInt(entry.key);
+    final comics = entry.value;
+    if (page == null || page < 1 || comics is! Iterable) {
+      continue;
+    }
+    result[page] = comics.whereType<Comic>().toList();
+  }
+  return result;
+}
+
+Map<int, bool> _normalizeComicListLoadingState(Object? value) {
+  if (value is! Map) {
+    return <int, bool>{};
+  }
+  final result = <int, bool>{};
+  for (final entry in value.entries) {
+    final page = _componentInt(entry.key);
+    final loading = entry.value;
+    if (page == null || page < 1 || loading is! bool) {
+      continue;
+    }
+    result[page] = loading;
+  }
+  return result;
+}
+
 class ComicListState extends State<ComicList> {
   int? _maxPage;
 
@@ -985,6 +1105,8 @@ class ComicListState extends State<ComicList> {
 
   String? _nextUrl;
 
+  int _loadRequestId = 0;
+
   late bool enablePageStorage = widget.enablePageStorage;
 
   Map<String, dynamic> get state => {
@@ -996,18 +1118,19 @@ class ComicListState extends State<ComicList> {
     'nextUrl': _nextUrl,
   };
 
-  void restoreState(Map<String, dynamic>? state) {
-    if (state == null || !enablePageStorage) {
+  void restoreState(Object? state) {
+    final normalized = normalizeComicListStorageState(state);
+    if (normalized == null || !enablePageStorage) {
       return;
     }
-    _maxPage = state['maxPage'];
+    _maxPage = normalized['maxPage'] as int?;
     _data.clear();
-    _data.addAll(state['data']);
-    _page = state['page'];
-    _error = state['error'];
+    _data.addAll(normalized['data'] as Map<int, List<Comic>>);
+    _page = normalized['page'] as int;
+    _error = normalized['error'] as String?;
     _loading.clear();
-    _loading.addAll(state['loading']);
-    _nextUrl = state['nextUrl'];
+    _loading.addAll(normalized['loading'] as Map<int, bool>);
+    _nextUrl = normalized['nextUrl'] as String?;
   }
 
   void storeState() {
@@ -1017,6 +1140,8 @@ class ComicListState extends State<ComicList> {
   }
 
   void refresh() {
+    if (!mounted) return;
+    _loadRequestId++;
     _data.clear();
     _page = 1;
     _maxPage = null;
@@ -1028,6 +1153,12 @@ class ComicListState extends State<ComicList> {
   }
 
   @override
+  void dispose() {
+    _loadRequestId++;
+    super.dispose();
+  }
+
+  @override
   void didChangeDependencies() {
     super.didChangeDependencies();
     restoreState(PageStorage.of(context).readState(context));
@@ -1035,6 +1166,7 @@ class ComicListState extends State<ComicList> {
   }
 
   void remove(Comic c) {
+    if (!mounted) return;
     if (_data[_page] == null || !_data[_page]!.remove(c)) {
       for (var page in _data.values) {
         if (page.remove(c)) {
@@ -1145,17 +1277,21 @@ class ComicListState extends State<ComicList> {
     if (widget.loadPage == null && widget.loadNext == null) {
       _error = "loadPage and loadNext can't be null at the same time";
       Future.microtask(() {
-        setState(() {});
+        if (mounted) {
+          setState(() {});
+        }
       });
+      return;
     }
     if (_data[page] != null || _loading[page] == true) {
       return;
     }
+    final requestId = _loadRequestId;
     _loading[page] = true;
     try {
       if (widget.loadPage != null) {
         var res = await widget.loadPage!(page);
-        if (!mounted) return;
+        if (!mounted || requestId != _loadRequestId) return;
         if (res.success) {
           if (res.data.isEmpty) {
             setState(() {
@@ -1178,7 +1314,8 @@ class ComicListState extends State<ComicList> {
       } else {
         try {
           while (_data[page] == null) {
-            await _fetchNext();
+            await _fetchNext(requestId);
+            if (!mounted || requestId != _loadRequestId) return;
           }
           if (mounted) {
             setState(() {});
@@ -1192,13 +1329,16 @@ class ComicListState extends State<ComicList> {
         }
       }
     } finally {
-      _loading[page] = false;
-      storeState();
+      if (mounted && requestId == _loadRequestId) {
+        _loading[page] = false;
+        storeState();
+      }
     }
   }
 
-  Future<void> _fetchNext() async {
+  Future<void> _fetchNext(int requestId) async {
     var res = await widget.loadNext!(_nextUrl);
+    if (!mounted || requestId != _loadRequestId) return;
     _data[_data.length + 1] = res.data;
     if (res.subData == null) {
       _maxPage = _data.length;

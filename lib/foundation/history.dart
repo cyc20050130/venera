@@ -2,11 +2,9 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:isolate';
 import 'dart:math';
-import 'dart:ffi' as ffi;
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
-import 'package:flutter/widgets.dart' show ChangeNotifier;
 import 'package:sqlite3/sqlite3.dart';
 import 'package:venera/foundation/comic_source/comic_source.dart';
 import 'package:venera/foundation/comic_details_repository.dart';
@@ -24,6 +22,115 @@ import 'consts.dart';
 part "image_favorites.dart";
 
 typedef HistoryType = ComicType;
+
+@visibleForTesting
+int decodeHistoryInt(dynamic value, {int fallback = 0}) {
+  if (value is int) {
+    return value;
+  }
+  if (value is num) {
+    return value.toInt();
+  }
+  if (value is String) {
+    return int.tryParse(value) ?? fallback;
+  }
+  return fallback;
+}
+
+@visibleForTesting
+int? decodeHistoryNullableInt(dynamic value) {
+  if (value == null) {
+    return null;
+  }
+  if (value is int) {
+    return value;
+  }
+  if (value is num) {
+    return value.toInt();
+  }
+  if (value is String) {
+    return int.tryParse(value);
+  }
+  return null;
+}
+
+@visibleForTesting
+String decodeHistoryString(dynamic value) {
+  if (value == null) {
+    return '';
+  }
+  return value.toString();
+}
+
+@visibleForTesting
+bool? decodeHistoryBool(dynamic value) {
+  if (value is bool) {
+    return value;
+  }
+  if (value is num) {
+    return value != 0;
+  }
+  if (value is String) {
+    switch (value.trim().toLowerCase()) {
+      case 'true':
+      case '1':
+      case 'yes':
+        return true;
+      case 'false':
+      case '0':
+      case 'no':
+        return false;
+    }
+  }
+  return null;
+}
+
+@visibleForTesting
+DateTime decodeHistoryTime(dynamic value) {
+  return DateTime.fromMillisecondsSinceEpoch(decodeHistoryInt(value));
+}
+
+@visibleForTesting
+Set<String> decodeHistoryReadEpisode(dynamic value) {
+  if (value == null) {
+    return <String>{};
+  }
+  if (value is String) {
+    final text = value.trim();
+    if (text.isEmpty) {
+      return <String>{};
+    }
+    if (text.startsWith('[')) {
+      try {
+        return decodeHistoryReadEpisode(jsonDecode(text));
+      } catch (_) {
+        return <String>{};
+      }
+    }
+    return text
+        .split(',')
+        .map((element) => element.trim())
+        .where((element) => element.isNotEmpty)
+        .toSet();
+  }
+  if (value is Iterable) {
+    return value
+        .where((element) => element != null)
+        .map((element) => element.toString())
+        .where((element) => element.isNotEmpty)
+        .toSet();
+  }
+  return {value.toString()};
+}
+
+@visibleForTesting
+String decodeHistorySourceKey(dynamic sourceKey, dynamic typeValue) {
+  final explicit = sourceKey?.toString();
+  if (explicit != null && explicit.isNotEmpty) {
+    return explicit;
+  }
+  return sourceKeyFromType(ComicType(decodeHistoryInt(typeValue)));
+}
 
 String sourceKeyFromType(ComicType type) {
   if (type == ComicType.local) {
@@ -103,20 +210,18 @@ class History implements Comic {
        time = time ?? DateTime.now();
 
   History.fromMap(Map<String, dynamic> map)
-    : type = HistoryType(map["type"]),
-      stableSourceKey =
-          map["sourceKey"] ?? sourceKeyFromType(ComicType(map["type"])),
-      time = DateTime.fromMillisecondsSinceEpoch(map["time"]),
-      title = map["title"],
-      subtitle = map["subtitle"],
-      cover = map["cover"],
-      ep = map["ep"],
-      page = map["page"],
-      id = map["id"],
-      readEpisode = Set<String>.from(
-        (map["readEpisode"] as List<dynamic>?)?.toSet() ?? const <String>{},
-      ),
-      maxPage = map["max_page"];
+    : type = HistoryType(decodeHistoryInt(map["type"])),
+      stableSourceKey = decodeHistorySourceKey(map["sourceKey"], map["type"]),
+      time = decodeHistoryTime(map["time"]),
+      title = decodeHistoryString(map["title"]),
+      subtitle = decodeHistoryString(map["subtitle"]),
+      cover = decodeHistoryString(map["cover"]),
+      ep = decodeHistoryInt(map["ep"]),
+      page = decodeHistoryInt(map["page"]),
+      id = decodeHistoryString(map["id"]),
+      readEpisode = decodeHistoryReadEpisode(map["readEpisode"]),
+      maxPage = decodeHistoryNullableInt(map["max_page"]),
+      group = decodeHistoryNullableInt(map["group"] ?? map["chapter_group"]);
 
   @override
   String toString() {
@@ -124,23 +229,18 @@ class History implements Comic {
   }
 
   History.fromRow(Row row)
-    : type = HistoryType(row["type"]),
-      stableSourceKey =
-          row["source_key"] ?? sourceKeyFromType(ComicType(row["type"])),
-      time = DateTime.fromMillisecondsSinceEpoch(row["time"]),
-      title = row["title"],
-      subtitle = row["subtitle"],
-      cover = row["cover"],
-      ep = row["ep"],
-      page = row["page"],
-      id = row["id"],
-      readEpisode = Set<String>.from(
-        (row["readEpisode"] as String)
-            .split(',')
-            .where((element) => element != ""),
-      ),
-      maxPage = row["max_page"],
-      group = row["chapter_group"];
+    : type = HistoryType(decodeHistoryInt(row["type"])),
+      stableSourceKey = decodeHistorySourceKey(row["source_key"], row["type"]),
+      time = decodeHistoryTime(row["time"]),
+      title = decodeHistoryString(row["title"]),
+      subtitle = decodeHistoryString(row["subtitle"]),
+      cover = decodeHistoryString(row["cover"]),
+      ep = decodeHistoryInt(row["ep"]),
+      page = decodeHistoryInt(row["page"]),
+      id = decodeHistoryString(row["id"]),
+      readEpisode = decodeHistoryReadEpisode(row["readEpisode"]),
+      maxPage = decodeHistoryNullableInt(row["max_page"]),
+      group = decodeHistoryNullableInt(row["chapter_group"]);
 
   @override
   bool operator ==(Object other) {
@@ -201,12 +301,14 @@ class HistoryManager with ChangeNotifier {
 
   late Database _db;
 
+  String get _dbPath => "${App.dataPath}/history.db";
+
   String _cacheKey(String id, String sourceKey) => "$id@$sourceKey";
 
   String _cacheKeyForHistory(History history) =>
       _cacheKey(history.id, history.sourceKey);
 
-  int get length => _db.select("select count(*) from history;").first[0] as int;
+  int get length => count();
 
   /// Cache of history ids. Improve the performance of find operation.
   Map<String, bool>? _cachedHistoryIds;
@@ -238,7 +340,7 @@ class HistoryManager with ChangeNotifier {
     if (isInitialized) {
       return;
     }
-    _db = sqlite3.open("${App.dataPath}/history.db");
+    _db = sqlite3.open(_dbPath);
 
     _createHistoryTableIfNeeded();
 
@@ -299,7 +401,7 @@ class HistoryManager with ChangeNotifier {
 
       final legacyRows = _db.select("SELECT * FROM history_legacy;");
       for (final row in legacyRows) {
-        final typeValue = row["type"] as int;
+        final typeValue = decodeHistoryInt(row["type"]);
         final sourceKey = sourceKeyFromType(ComicType(typeValue));
         _db.execute(_insertHistorySql, [
           row["id"],
@@ -330,23 +432,27 @@ class HistoryManager with ChangeNotifier {
         values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
       """;
 
-  static Future<void> _addHistoryAsync(int dbAddr, History newItem) {
+  static Future<void> _addHistoryAsync(String dbPath, History newItem) {
     return Isolate.run(() {
-      var db = sqlite3.fromPointer(ffi.Pointer.fromAddress(dbAddr));
-      db.execute(_insertHistorySql, [
-        newItem.id,
-        newItem.sourceKey,
-        newItem.title,
-        newItem.subtitle,
-        newItem.cover,
-        newItem.time.millisecondsSinceEpoch,
-        newItem.type.value,
-        newItem.ep,
-        newItem.page,
-        newItem.readEpisode.join(','),
-        newItem.maxPage,
-        newItem.group,
-      ]);
+      final db = sqlite3.open(dbPath);
+      try {
+        db.execute(_insertHistorySql, [
+          newItem.id,
+          newItem.sourceKey,
+          newItem.title,
+          newItem.subtitle,
+          newItem.cover,
+          newItem.time.millisecondsSinceEpoch,
+          newItem.type.value,
+          newItem.ep,
+          newItem.page,
+          newItem.readEpisode.join(','),
+          newItem.maxPage,
+          newItem.group,
+        ]);
+      } finally {
+        db.dispose();
+      }
     });
   }
 
@@ -354,13 +460,19 @@ class HistoryManager with ChangeNotifier {
 
   /// Create a isolate to add history to prevent blocking the UI thread.
   Future<void> addHistoryAsync(History newItem, {bool notify = true}) async {
+    if (!isInitialized) {
+      throw StateError('HistoryManager is not initialized');
+    }
     while (_haveAsyncTask) {
       await Future.delayed(Duration(milliseconds: 20));
     }
 
     _haveAsyncTask = true;
-    await _addHistoryAsync(_db.handle.address, newItem);
-    _haveAsyncTask = false;
+    try {
+      await _addHistoryAsync(_dbPath, newItem);
+    } finally {
+      _haveAsyncTask = false;
+    }
     if (_cachedHistoryIds == null) {
       updateCache();
     } else {
@@ -420,9 +532,12 @@ class HistoryManager with ChangeNotifier {
       select id, source_key, type from history;
     """);
       for (var element in idAndTypes) {
-        final id = element["id"] as String;
-        final sourceKey = element["source_key"] as String;
-        final type = ComicType(element["type"] as int);
+        final id = decodeHistoryString(element["id"]);
+        final sourceKey = decodeHistoryString(element["source_key"]);
+        if (id.isEmpty || sourceKey.isEmpty) {
+          continue;
+        }
+        final type = ComicType(decodeHistoryInt(element["type"]));
         if (!LocalFavoritesManager().isExist(id, type)) {
           _db.execute(
             """
@@ -464,11 +579,12 @@ class HistoryManager with ChangeNotifier {
         select id, source_key from history;
       """);
     for (var element in res) {
-      _cachedHistoryIds![_cacheKey(
-            element["id"] as String,
-            element["source_key"] as String,
-          )] =
-          true;
+      final id = decodeHistoryString(element["id"]);
+      final sourceKey = decodeHistoryString(element["source_key"]);
+      if (id.isEmpty || sourceKey.isEmpty) {
+        continue;
+      }
+      _cachedHistoryIds![_cacheKey(id, sourceKey)] = true;
     }
     for (var key in cachedHistories.keys.toList()) {
       if (!_cachedHistoryIds!.containsKey(key)) {
@@ -529,7 +645,7 @@ class HistoryManager with ChangeNotifier {
     var res = _db.select("""
       select count(*) from history;
     """);
-    return res.first[0] as int;
+    return decodeHistoryInt(res.first[0]);
   }
 
   void flush() {

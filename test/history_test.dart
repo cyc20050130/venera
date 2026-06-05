@@ -136,6 +136,207 @@ void main() {
     expect(manager.findBySourceKey('comic-silent', 'source-silent')?.page, 2);
   });
 
+  test('History.fromMap normalizes mixed legacy field types', () {
+    final history = History.fromMap({
+      'type': '0',
+      'sourceKey': '',
+      'id': 123,
+      'title': 456,
+      'subtitle': null,
+      'cover': 789,
+      'time': 'bad',
+      'ep': '3',
+      'page': 4.8,
+      'group': '2',
+      'max_page': '10',
+      'readEpisode': [1, null, '2-3'],
+    });
+
+    expect(history.type, ComicType.local);
+    expect(history.sourceKey, 'local');
+    expect(history.id, '123');
+    expect(history.title, '456');
+    expect(history.subtitle, '');
+    expect(history.cover, '789');
+    expect(history.time.millisecondsSinceEpoch, 0);
+    expect(history.ep, 3);
+    expect(history.page, 4);
+    expect(history.group, 2);
+    expect(history.maxPage, 10);
+    expect(history.readEpisode, {'1', '2-3'});
+  });
+
+  test('History.fromRow tolerates JSON readEpisode and scalar DB values', () {
+    final db = sqlite3.open('${tempDir.path}/history.db');
+    addTearDown(db.dispose);
+    db.execute(
+      '''
+      insert or replace into history
+        (id, source_key, title, subtitle, cover, time, type, ep, page, readEpisode, max_page, chapter_group)
+      values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+      ''',
+      [
+        'legacy-row',
+        '',
+        123,
+        456,
+        789,
+        'bad',
+        '0',
+        '5',
+        6.8,
+        jsonEncode([7, null, '8-9']),
+        '11',
+        '3',
+      ],
+    );
+
+    final history = HistoryManager().getAll().firstWhere(
+      (element) => element.id == 'legacy-row',
+    );
+
+    expect(history.sourceKey, 'local');
+    expect(history.title, '123');
+    expect(history.subtitle, '456');
+    expect(history.cover, '789');
+    expect(history.time.millisecondsSinceEpoch, 0);
+    expect(history.ep, 5);
+    expect(history.page, 6);
+    expect(history.readEpisode, {'7', '8-9'});
+    expect(history.maxPage, 11);
+    expect(history.group, 3);
+  });
+
+  test('ImageFavoriteManager skips corrupt rows without hiding valid rows', () {
+    final db = sqlite3.open('${tempDir.path}/history.db');
+    addTearDown(db.dispose);
+    db.execute(
+      '''
+      insert or replace into image_favorites
+        (id, title, sub_title, author, tags, translated_tags, time, max_page, source_key, image_favorites_ep, other)
+      values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+      ''',
+      [
+        'image-bad',
+        'Bad',
+        '',
+        '',
+        '',
+        '',
+        0,
+        0,
+        'source-image',
+        'not json',
+        '{}',
+      ],
+    );
+    db.execute(
+      '''
+      insert or replace into image_favorites
+        (id, title, sub_title, author, tags, translated_tags, time, max_page, source_key, image_favorites_ep, other)
+      values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+      ''',
+      [
+        'image-valid',
+        123,
+        456,
+        789,
+        'tag:a,,tag:b',
+        null,
+        'bad',
+        '9',
+        'source-image',
+        jsonEncode([
+          {
+            'eid': 100,
+            'ep': '2',
+            'epName': 300,
+            'maxPage': '5',
+            'imageFavorites': [
+              {'page': '1', 'imageKey': 400, 'isAutoFavorite': 'true'},
+              {'page': 0, 'imageKey': 'skip'},
+            ],
+          },
+        ]),
+        jsonEncode({'1': 'numeric key'}),
+      ],
+    );
+
+    final comics = ImageFavoriteManager().getAll();
+
+    expect(comics, hasLength(1));
+    final comic = comics.single;
+    expect(comic.id, 'image-valid');
+    expect(comic.title, '123');
+    expect(comic.subTitle, '456');
+    expect(comic.author, '789');
+    expect(comic.tags, ['tag:a', 'tag:b']);
+    expect(comic.translatedTags, isEmpty);
+    expect(comic.time.millisecondsSinceEpoch, 0);
+    expect(comic.maxPage, 9);
+    expect(comic.other, {'1': 'numeric key'});
+    expect(comic.imageFavoritesEp, hasLength(1));
+    expect(comic.imageFavoritesEp.single.eid, '100');
+    expect(comic.imageFavoritesEp.single.ep, 2);
+    expect(comic.imageFavoritesEp.single.epName, '300');
+    expect(comic.imageFavoritesEp.single.maxPage, 5);
+    expect(comic.imageFavoritesEp.single.isHasFirstPage, isTrue);
+    expect(comic.imageFavoritesEp.single.imageFavorites, hasLength(1));
+    expect(comic.imageFavoritesEp.single.imageFavorites.single.imageKey, '400');
+    expect(
+      comic.imageFavoritesEp.single.imageFavorites.single.isAutoFavorite,
+      isTrue,
+    );
+  });
+
+  test('async history write lock is released after a failed write', () async {
+    final manager = HistoryManager();
+    manager.close();
+
+    await expectLater(
+      manager.addHistoryAsync(
+        History.fromMap({
+          'type': 'picacg'.hashCode,
+          'sourceKey': 'source-async',
+          'id': 'comic-failed-async',
+          'title': 'Failed Async',
+          'subtitle': '',
+          'cover': '',
+          'time': DateTime(2026).millisecondsSinceEpoch,
+          'ep': 1,
+          'page': 1,
+          'max_page': 9,
+          'readEpisode': ['1'],
+        }),
+      ),
+      throwsA(anything),
+    );
+
+    await manager.init();
+    await manager
+        .addHistoryAsync(
+          History.fromMap({
+            'type': 'picacg'.hashCode,
+            'sourceKey': 'source-async',
+            'id': 'comic-after-failed-async',
+            'title': 'After Failed Async',
+            'subtitle': '',
+            'cover': '',
+            'time': DateTime(2026, 2).millisecondsSinceEpoch,
+            'ep': 1,
+            'page': 2,
+            'max_page': 9,
+            'readEpisode': ['1'],
+          }),
+        )
+        .timeout(const Duration(seconds: 2));
+
+    expect(
+      manager.findBySourceKey('comic-after-failed-async', 'source-async')?.page,
+      2,
+    );
+  });
+
   test('reinitializing history opens the existing database again', () async {
     final history = HistoryManager();
     history.close();

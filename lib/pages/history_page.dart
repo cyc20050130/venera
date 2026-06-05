@@ -26,6 +26,7 @@ class _HistoryPageState extends State<HistoryPage> {
   }
 
   void onUpdate() {
+    if (!mounted) return;
     setState(() {
       comics = HistoryManager().getAll();
       if (multiSelectMode) {
@@ -99,19 +100,21 @@ class _HistoryPageState extends State<HistoryPage> {
     int failed = 0;
     int skipped = 0;
 
-    await for (var progress in HistoryManager().refreshAllHistoriesStream()) {
-      if (isCanceled) {
-        return;
+    try {
+      await for (var progress in HistoryManager().refreshAllHistoriesStream()) {
+        if (isCanceled) {
+          return;
+        }
+        if (progress.total > 0) {
+          loadingController.setProgress(progress.current / progress.total);
+        }
+        success = progress.success;
+        failed = progress.failed;
+        skipped = progress.skipped;
       }
-      if (progress.total > 0) {
-        loadingController.setProgress(progress.current / progress.total);
-      }
-      success = progress.success;
-      failed = progress.failed;
-      skipped = progress.skipped;
+    } finally {
+      loadingController.close();
     }
-
-    loadingController.close();
 
     if (mounted) {
       App.rootContext.showMessage(

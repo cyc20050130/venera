@@ -1,11 +1,17 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:venera/foundation/comic_source/comic_source.dart';
 import 'package:venera/foundation/context.dart';
 import 'package:venera/foundation/history.dart';
 import 'package:venera/foundation/comic_type.dart';
 import 'package:venera/pages/reader/reader.dart';
+import 'package:venera/utils/translations.dart';
 
 void main() {
+  setUpAll(() async {
+    await AppTranslation.init();
+  });
+
   tearDown(() {
     ReaderWithLoading.debugReaderBuilder = null;
   });
@@ -72,6 +78,116 @@ void main() {
     expect(
       resolveReaderInitialChapterGroup(requestedGroup: null, historyGroup: 2),
       2,
+    );
+  });
+
+  test('normalizeReaderInitialChapter clamps stale flat chapter history', () {
+    final chapters = ComicChapters({
+      '1': 'Chapter 1',
+      '2': 'Chapter 2',
+      '3': 'Chapter 3',
+    });
+
+    expect(
+      normalizeReaderInitialChapter(
+        requestedChapter: 2,
+        requestedGroup: null,
+        chapters: chapters,
+      ),
+      2,
+    );
+    expect(
+      normalizeReaderInitialChapter(
+        requestedChapter: 99,
+        requestedGroup: null,
+        chapters: chapters,
+      ),
+      3,
+    );
+    expect(
+      normalizeReaderInitialChapter(
+        requestedChapter: -4,
+        requestedGroup: null,
+        chapters: chapters,
+      ),
+      1,
+    );
+    expect(
+      normalizeReaderInitialChapter(
+        requestedChapter: 7,
+        requestedGroup: null,
+        chapters: null,
+      ),
+      1,
+    );
+  });
+
+  test('normalizeReaderInitialChapter resolves grouped chapter safely', () {
+    final chapters = ComicChapters.grouped({
+      'A': {'a1': 'A1', 'a2': 'A2'},
+      'B': {'b1': 'B1', 'b2': 'B2', 'b3': 'B3'},
+    });
+
+    expect(
+      normalizeReaderInitialChapter(
+        requestedChapter: 2,
+        requestedGroup: 2,
+        chapters: chapters,
+      ),
+      4,
+    );
+    expect(
+      normalizeReaderInitialChapter(
+        requestedChapter: 99,
+        requestedGroup: 2,
+        chapters: chapters,
+      ),
+      5,
+    );
+    expect(
+      normalizeReaderInitialChapter(
+        requestedChapter: 1,
+        requestedGroup: 9,
+        chapters: chapters,
+      ),
+      1,
+    );
+    expect(
+      normalizeReaderInitialChapter(
+        requestedChapter: 2,
+        requestedGroup: 2,
+        chapters: ComicChapters({'1': 'Chapter 1', '2': 'Chapter 2'}),
+      ),
+      2,
+    );
+  });
+
+  test('resolveGroupedReaderChapterPosition skips empty groups safely', () {
+    final chapters = ComicChapters.grouped({
+      'Empty': {},
+      'A': {'a1': 'A1', 'a2': 'A2'},
+      'Also Empty': {},
+      'B': {'b1': 'B1'},
+    });
+
+    expect(
+      resolveGroupedReaderChapterPosition(chapters: chapters, chapter: 1),
+      (groupIndex: 1, chapterInGroup: 1),
+    );
+    expect(
+      resolveGroupedReaderChapterPosition(chapters: chapters, chapter: 3),
+      (groupIndex: 3, chapterInGroup: 1),
+    );
+    expect(
+      resolveGroupedReaderChapterPosition(chapters: chapters, chapter: 4),
+      isNull,
+    );
+    expect(
+      resolveGroupedReaderChapterPosition(
+        chapters: ComicChapters.grouped({}),
+        chapter: 1,
+      ),
+      isNull,
     );
   });
 
@@ -184,6 +300,44 @@ void main() {
     expect(find.text('chapter-1'), findsNothing);
     expect(find.text('chapter-2'), findsOneWidget);
   });
+
+  testWidgets('reader image selection overlay is removed when owner disposes', (
+    tester,
+  ) async {
+    Future<Offset?>? selectionFuture;
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Overlay(
+          initialEntries: [
+            OverlayEntry(
+              builder: (context) => _SelectImageOverlayControllerHost(
+                onFuture: (future) {
+                  selectionFuture = future;
+                },
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+
+    await tester.tap(find.text('show-select-overlay'));
+    await tester.pump();
+
+    expect(selectionFuture, isNotNull);
+    expect(
+      find.byWidgetPredicate(_isSelectImageOverlayContent),
+      findsOneWidget,
+    );
+
+    await tester.pumpWidget(const MaterialApp(home: SizedBox.shrink()));
+    await tester.pump();
+
+    await expectLater(selectionFuture, completion(isNull));
+    expect(find.byWidgetPredicate(_isSelectImageOverlayContent), findsNothing);
+    expect(tester.takeException(), isNull);
+  });
 }
 
 class _OverlayHostProbe extends StatefulWidget {
@@ -218,4 +372,44 @@ class _OverlayHostProbeState extends State<_OverlayHostProbe> {
       ],
     );
   }
+}
+
+class _SelectImageOverlayControllerHost extends StatefulWidget {
+  const _SelectImageOverlayControllerHost({required this.onFuture});
+
+  final ValueChanged<Future<Offset?>> onFuture;
+
+  @override
+  State<_SelectImageOverlayControllerHost> createState() =>
+      _SelectImageOverlayControllerHostState();
+}
+
+class _SelectImageOverlayControllerHostState
+    extends State<_SelectImageOverlayControllerHost> {
+  late final ReaderSelectImageOverlayController controller =
+      ReaderSelectImageOverlayController(
+        overlayProvider: () => Overlay.of(context),
+      );
+
+  @override
+  void dispose() {
+    controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Center(
+      child: TextButton(
+        onPressed: () {
+          widget.onFuture(controller.show());
+        },
+        child: const Text('show-select-overlay'),
+      ),
+    );
+  }
+}
+
+bool _isSelectImageOverlayContent(Widget widget) {
+  return widget.runtimeType.toString() == '_SelectImageOverlayContent';
 }

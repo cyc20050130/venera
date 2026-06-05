@@ -3,66 +3,84 @@ part of 'favorites_page.dart';
 /// Open a dialog to create a new favorite folder.
 Future<void> newFolder() async {
   return showDialog(
-      context: App.rootContext,
-      builder: (context) {
-        var controller = TextEditingController();
-        String? error;
+    context: App.rootContext,
+    builder: (context) => const _NewFolderDialog(),
+  );
+}
 
-        return StatefulBuilder(builder: (context, setState) {
-          return ContentDialog(
-            title: "New Folder".tl,
-            content: Column(
-              children: [
-                TextField(
-                  controller: controller,
-                  decoration: InputDecoration(
-                    hintText: "Folder Name".tl,
-                    errorText: error,
-                  ),
-                  onChanged: (s) {
-                    if (error != null) {
-                      setState(() {
-                        error = null;
-                      });
-                    }
-                  },
-                ),
-              ],
-            ).paddingHorizontal(16),
-            actions: [
-              TextButton(
-                child: Text("Import from file".tl),
-                onPressed: () async {
-                  var file = await selectFile(ext: ['json']);
-                  if (file == null) return;
-                  var data = await file.readAsBytes();
-                  try {
-                    LocalFavoritesManager().fromJson(utf8.decode(data));
-                  } catch (e) {
-                    context.showMessage(message: "Failed to import".tl);
-                    return;
-                  }
-                  context.pop();
-                },
-              ).paddingRight(4),
-              FilledButton(
-                onPressed: () {
-                  var e = validateFolderName(controller.text);
-                  if (e != null) {
-                    setState(() {
-                      error = e;
-                    });
-                  } else {
-                    LocalFavoritesManager().createFolder(controller.text);
-                    context.pop();
-                  }
-                },
-                child: Text("Create".tl),
-              ),
-            ],
-          );
-        });
-      });
+class _NewFolderDialog extends StatefulWidget {
+  const _NewFolderDialog();
+
+  @override
+  State<_NewFolderDialog> createState() => _NewFolderDialogState();
+}
+
+class _NewFolderDialogState extends State<_NewFolderDialog> {
+  final _controller = TextEditingController();
+  String? _error;
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return ContentDialog(
+      title: "New Folder".tl,
+      content: Column(
+        children: [
+          TextField(
+            controller: _controller,
+            decoration: InputDecoration(
+              hintText: "Folder Name".tl,
+              errorText: _error,
+            ),
+            onChanged: (s) {
+              if (_error != null) {
+                setState(() {
+                  _error = null;
+                });
+              }
+            },
+          ),
+        ],
+      ).paddingHorizontal(16),
+      actions: [
+        TextButton(
+          child: Text("Import from file".tl),
+          onPressed: () async {
+            var file = await selectFile(ext: ['json']);
+            if (!mounted || file == null) return;
+            var data = await file.readAsBytes();
+            if (!mounted) return;
+            try {
+              LocalFavoritesManager().fromJson(utf8.decode(data));
+            } catch (e) {
+              context.showMessage(message: "Failed to import".tl);
+              return;
+            }
+            context.pop();
+          },
+        ).paddingRight(4),
+        FilledButton(
+          onPressed: () {
+            var e = validateFolderName(_controller.text);
+            if (e != null) {
+              setState(() {
+                _error = e;
+              });
+            } else {
+              LocalFavoritesManager().createFolder(_controller.text);
+              context.pop();
+            }
+          },
+          child: Text("Create".tl),
+        ),
+      ],
+    );
+  }
 }
 
 String? validateFolderName(String newFolderName) {
@@ -77,63 +95,117 @@ String? validateFolderName(String newFolderName) {
   return null;
 }
 
+int normalizeFavoriteUpdatePageNum(Object? value) {
+  final parsed = switch (value) {
+    int() => value,
+    String() => int.tryParse(value),
+    _ => null,
+  };
+  return parsed == null || parsed <= 0 ? 9999999 : parsed;
+}
+
+int firstOldToNewFavoritePage({
+  required int maxPage,
+  required int requestedPages,
+}) {
+  if (maxPage <= 1 || requestedPages <= 0) {
+    return 1;
+  }
+  final start = maxPage - requestedPages + 1;
+  return start < 1 ? 1 : start;
+}
+
+int? _parseFavoriteImportPage(Object? value) {
+  final parsed = switch (value) {
+    int() => value,
+    num() => value.toInt(),
+    String() => int.tryParse(value),
+    _ => null,
+  };
+  return parsed == null || parsed <= 0 ? null : parsed;
+}
+
+@visibleForTesting
+int normalizeFavoriteImportPage(Object? value, {int fallback = 1}) {
+  final normalizedFallback = fallback > 0 ? fallback : 1;
+  return _parseFavoriteImportPage(value) ?? normalizedFallback;
+}
+
+@visibleForTesting
+bool isFavoriteImportLastPage(Object? value, int page) {
+  return _parseFavoriteImportPage(value) == page;
+}
+
+String? normalizeQuickFavoriteFolder(Object? value) {
+  return value is String && value.isNotEmpty ? value : null;
+}
+
 void addFavorite(List<Comic> comics) {
   var folders = LocalFavoritesManager().folderNames;
 
   showDialog(
     context: App.rootContext,
     builder: (context) {
-      String? selectedFolder = appdata.settings['quickFavorite'];
+      String? selectedFolder = normalizeQuickFavoriteFolder(
+        appdata.settings['quickFavorite'],
+      );
 
-      return StatefulBuilder(builder: (context, setState) {
-        return ContentDialog(
-          title: "Select a folder".tl,
-          content: ListTile(
-            title: Text("Folder".tl),
-            trailing: Select(
-              current: selectedFolder,
-              values: folders,
-              minWidth: 112,
-              onTap: (v) {
-                setState(() {
-                  selectedFolder = folders[v];
-                });
-              },
+      return StatefulBuilder(
+        builder: (context, setState) {
+          return ContentDialog(
+            title: "Select a folder".tl,
+            content: ListTile(
+              title: Text("Folder".tl),
+              trailing: Select(
+                current: selectedFolder,
+                values: folders,
+                minWidth: 112,
+                onTap: (v) {
+                  setState(() {
+                    selectedFolder = folders[v];
+                  });
+                },
+              ),
             ),
-          ),
-          actions: [
-            FilledButton(
-              onPressed: () {
-                if (selectedFolder != null) {
-                  for (var comic in comics) {
-                    LocalFavoritesManager().addComic(
-                      selectedFolder!,
-                      FavoriteItem(
-                        id: comic.id,
-                        name: comic.title,
-                        coverPath: comic.cover,
-                        author: comic.subtitle ?? '',
-                        type: ComicType((comic.sourceKey == 'local'
-                            ? 0
-                            : comic.sourceKey.hashCode)),
-                        tags: comic.tags ?? [],
-                      ),
-                    );
+            actions: [
+              FilledButton(
+                onPressed: () {
+                  if (selectedFolder != null) {
+                    for (var comic in comics) {
+                      LocalFavoritesManager().addComic(
+                        selectedFolder!,
+                        FavoriteItem(
+                          id: comic.id,
+                          name: comic.title,
+                          coverPath: comic.cover,
+                          author: comic.subtitle ?? '',
+                          type: ComicType(
+                            (comic.sourceKey == 'local'
+                                ? 0
+                                : comic.sourceKey.hashCode),
+                          ),
+                          tags: comic.tags ?? [],
+                        ),
+                      );
+                    }
+                    context.pop();
                   }
-                  context.pop();
-                }
-              },
-              child: Text("Confirm".tl),
-            ),
-          ],
-        );
-      });
+                },
+                child: Text("Confirm".tl),
+              ),
+            ],
+          );
+        },
+      );
     },
   );
 }
 
 Future<List<FavoriteItem>> updateComicsInfo(String folder) async {
   var comics = LocalFavoritesManager().getFolderComics(folder);
+  if (comics.isEmpty) {
+    return comics;
+  }
 
   Future<void> updateSingleComic(int index) async {
     int retry = 3;
@@ -167,7 +239,8 @@ Future<List<FavoriteItem>> updateComicsInfo(String folder) async {
           id: c.id,
           name: newInfo.title,
           coverPath: newInfo.cover,
-          author: newInfo.subTitle ??
+          author:
+              newInfo.subTitle ??
               newInfo.tags['author']?.firstOrNull ??
               c.author,
           type: c.type,
@@ -193,6 +266,7 @@ Future<List<FavoriteItem>> updateComicsInfo(String folder) async {
   var index = 0;
 
   bool isCanceled = false;
+  bool dialogClosed = false;
 
   showDialog(
     context: App.rootContext,
@@ -208,9 +282,7 @@ Future<List<FavoriteItem>> updateComicsInfo(String folder) async {
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 const SizedBox(height: 4),
-                LinearProgressIndicator(
-                  value: value / comics.length,
-                ),
+                LinearProgressIndicator(value: value / comics.length),
                 const SizedBox(height: 4),
                 Text("$value/${comics.length}"),
                 const SizedBox(height: 4),
@@ -233,6 +305,8 @@ Future<List<FavoriteItem>> updateComicsInfo(String folder) async {
     },
   ).then((_) {
     isCanceled = true;
+    dialogClosed = true;
+    finished.dispose();
   });
 
   while (index < comics.length) {
@@ -245,12 +319,21 @@ Future<List<FavoriteItem>> updateComicsInfo(String folder) async {
 
     for (var i = 0; i < maxConcurrency; i++) {
       if (index + i >= comics.length) break;
-      futures.add(updateSingleComic(index + i).then((v) {
-        finished.value++;
-      }, onError: (_) {
-        errors++;
-        finished.value++;
-      }));
+      futures.add(
+        updateSingleComic(index + i).then(
+          (v) {
+            if (!dialogClosed) {
+              finished.value++;
+            }
+          },
+          onError: (_) {
+            errors++;
+            if (!dialogClosed) {
+              finished.value++;
+            }
+          },
+        ),
+      );
     }
 
     await Future.wait(futures);
@@ -265,44 +348,46 @@ Future<void> sortFolders() async {
 
   await showPopUpWidget(
     App.rootContext,
-    StatefulBuilder(builder: (context, setState) {
-      return PopUpWidgetScaffold(
-        title: "Sort".tl,
-        tailing: [
-          Tooltip(
-            message: "Help".tl,
-            child: IconButton(
-              icon: const Icon(Icons.help_outline),
-              onPressed: () {
-                showInfoDialog(
-                  context: context,
-                  title: "Reorder".tl,
-                  content: "Long press and drag to reorder.".tl,
-                );
-              },
+    StatefulBuilder(
+      builder: (context, setState) {
+        return PopUpWidgetScaffold(
+          title: "Sort".tl,
+          tailing: [
+            Tooltip(
+              message: "Help".tl,
+              child: IconButton(
+                icon: const Icon(Icons.help_outline),
+                onPressed: () {
+                  showInfoDialog(
+                    context: context,
+                    title: "Reorder".tl,
+                    content: "Long press and drag to reorder.".tl,
+                  );
+                },
+              ),
             ),
-          )
-        ],
-        body: ReorderableListView.builder(
-          onReorder: (oldIndex, newIndex) {
-            if (oldIndex < newIndex) {
-              newIndex--;
-            }
-            setState(() {
-              var item = folders.removeAt(oldIndex);
-              folders.insert(newIndex, item);
-            });
-          },
-          itemCount: folders.length,
-          itemBuilder: (context, index) {
-            return ListTile(
-              key: ValueKey(folders[index]),
-              title: Text(folders[index]),
-            );
-          },
-        ),
-      );
-    }),
+          ],
+          body: ReorderableListView.builder(
+            onReorder: (oldIndex, newIndex) {
+              if (oldIndex < newIndex) {
+                newIndex--;
+              }
+              setState(() {
+                var item = folders.removeAt(oldIndex);
+                folders.insert(newIndex, item);
+              });
+            },
+            itemCount: folders.length,
+            itemBuilder: (context, index) {
+              return ListTile(
+                key: ValueKey(folders[index]),
+                title: Text(folders[index]),
+              );
+            },
+          ),
+        );
+      },
+    ),
   );
 
   LocalFavoritesManager().updateOrder(folders);
@@ -324,8 +409,11 @@ Future<void> importNetworkFolder(
   var resultName = folder ?? comicSource.name;
   var exists = LocalFavoritesManager().existsFolder(resultName);
   if (exists) {
-    if (!LocalFavoritesManager()
-        .isLinkedToNetworkFolder(resultName, source, folderID ?? "")) {
+    if (!LocalFavoritesManager().isLinkedToNetworkFolder(
+      resultName,
+      source,
+      folderID ?? "",
+    )) {
       App.rootContext.showMessage(message: "Folder already exists".tl);
       return;
     }
@@ -349,7 +437,7 @@ Future<void> importNetworkFolder(
   // 如果是从旧到新, 先取一下maxPage
   if (isOldToNewSort) {
     var res = await comicSource.favoriteData?.loadComic!(1, folderID);
-    maxPage = res?.subData ?? 1;
+    maxPage = normalizeFavoriteImportPage(res?.subData);
   }
   Future<void> fetchNext() async {
     var retry = 3;
@@ -357,29 +445,38 @@ Future<void> importNetworkFolder(
       try {
         if (comicSource.favoriteData?.loadComic != null) {
           // 从旧到新的情况下, 假设有10页, 更新3页, 则从第8页开始, 8, 9, 10 三页
-          next ??=
-              isOldToNewSort ? (maxPage - updatePageNum + 1).toString() : '1';
-          var page = int.parse(next!);
+          next ??= isOldToNewSort
+              ? firstOldToNewFavoritePage(
+                  maxPage: maxPage,
+                  requestedPages: updatePageNum,
+                ).toString()
+              : '1';
+          var page = normalizeFavoriteImportPage(next);
           var res = await comicSource.favoriteData!.loadComic!(page, folderID);
           var count = 0;
           receivedComics += res.data.length;
           for (var c in res.data) {
-            if (!LocalFavoritesManager()
-                .comicExists(resultName, c.id, ComicType(source.hashCode))) {
+            if (!LocalFavoritesManager().comicExists(
+              resultName,
+              c.id,
+              ComicType(source.hashCode),
+            )) {
               count++;
-              comics.add(FavoriteItem(
-                id: c.id,
-                name: c.title,
-                coverPath: c.cover,
-                type: ComicType(source.hashCode),
-                author: c.subtitle ?? '',
-                tags: c.tags ?? [],
-              ));
+              comics.add(
+                FavoriteItem(
+                  id: c.id,
+                  name: c.title,
+                  coverPath: c.cover,
+                  type: ComicType(source.hashCode),
+                  author: c.subtitle ?? '',
+                  tags: c.tags ?? [],
+                ),
+              );
             }
           }
           requestCount++;
           current += count;
-          if (res.data.isEmpty || res.subData == page) {
+          if (res.data.isEmpty || isFavoriteImportLastPage(res.subData, page)) {
             isFinished = true;
             next = null;
           } else {
@@ -390,17 +487,22 @@ Future<void> importNetworkFolder(
           var count = 0;
           receivedComics += res.data.length;
           for (var c in res.data) {
-            if (!LocalFavoritesManager()
-                .comicExists(resultName, c.id, ComicType(source.hashCode))) {
+            if (!LocalFavoritesManager().comicExists(
+              resultName,
+              c.id,
+              ComicType(source.hashCode),
+            )) {
               count++;
-              comics.add(FavoriteItem(
-                id: c.id,
-                name: c.title,
-                coverPath: c.cover,
-                type: ComicType(source.hashCode),
-                author: c.subtitle ?? '',
-                tags: c.tags ?? [],
-              ));
+              comics.add(
+                FavoriteItem(
+                  id: c.id,
+                  name: c.title,
+                  coverPath: c.cover,
+                  type: ComicType(source.hashCode),
+                  author: c.subtitle ?? '',
+                  tags: c.tags ?? [],
+                ),
+              );
             }
           }
           requestCount++;
@@ -433,35 +535,44 @@ Future<void> importNetworkFolder(
 
   void Function()? updateDialog;
   void Function()? closeDialog;
+  bool dialogClosed = false;
 
   showDialog(
     context: App.rootContext,
     builder: (context) {
       return StatefulBuilder(
         builder: (context, setState) {
-          updateDialog = () => setState(() {});
-          closeDialog = () => Navigator.pop(context);
+          updateDialog = () {
+            if (!dialogClosed && context.mounted) {
+              setState(() {});
+            }
+          };
+          closeDialog = () {
+            if (!dialogClosed && context.mounted) {
+              Navigator.pop(context);
+            }
+          };
           return ContentDialog(
             title: isFinished
                 ? "Finished".tl
                 : isErrored()
-                    ? "Error".tl
-                    : "Importing".tl,
+                ? "Error".tl
+                : "Importing".tl,
             content: Column(
               mainAxisSize: MainAxisSize.min,
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 const SizedBox(height: 4),
-                LinearProgressIndicator(
-                  value: isFinished ? 1 : null,
-                ),
+                LinearProgressIndicator(value: isFinished ? 1 : null),
                 const SizedBox(height: 4),
-                Text("Imported @a comics, loaded @b pages, received @c comics"
-                    .tlParams({
-                  "a": current,
-                  "b": requestCount,
-                  "c": receivedComics,
-                })),
+                Text(
+                  "Imported @a comics, loaded @b pages, received @c comics"
+                      .tlParams({
+                        "a": current,
+                        "b": requestCount,
+                        "c": receivedComics,
+                      }),
+                ),
                 const SizedBox(height: 4),
                 if (isErrored()) Text("Error: $errorMsg"),
               ],
@@ -486,6 +597,9 @@ Future<void> importNetworkFolder(
     },
   ).then((_) {
     isCanceled = true;
+    dialogClosed = true;
+    updateDialog = null;
+    closeDialog = null;
   });
 
   while (!isFinished && !isCanceled) {

@@ -1,5 +1,34 @@
 part of 'reader.dart';
 
+@visibleForTesting
+bool shouldRunReaderLongPressCallback({
+  required bool mounted,
+  required int? lastPointer,
+  required int eventPointer,
+  required int fingers,
+}) {
+  return mounted && lastPointer == eventPointer && fingers == 1;
+}
+
+@visibleForTesting
+bool shouldRunReaderPendingTapCallback({
+  required bool mounted,
+  required Object? currentPendingTap,
+  required Object pendingTap,
+}) {
+  return mounted && currentPendingTap == pendingTap;
+}
+
+@visibleForTesting
+bool shouldTrackReaderPointerDown(Offset position) {
+  return position != Offset.zero;
+}
+
+@visibleForTesting
+int readerPointerCountAfterPointerEnd(int currentCount) {
+  return currentCount <= 0 ? 0 : currentCount - 1;
+}
+
 class _ReaderGestureDetector extends StatefulWidget {
   const _ReaderGestureDetector({required this.child});
 
@@ -24,6 +53,7 @@ class _ReaderGestureDetectorState
   int fingers = 0;
 
   late _ReaderState reader;
+  _ReaderScaffoldState? _readerScaffoldState;
 
   bool ignoreNextTag = false;
 
@@ -43,8 +73,22 @@ class _ReaderGestureDetectorState
         onSecondaryTapUp(details.globalPosition);
       };
     super.initState();
-    context.readerScaffold._gestureDetectorState = this;
+    _readerScaffoldState = context.readerScaffold;
+    _readerScaffoldState!._gestureDetectorState = this;
     reader = context.reader;
+  }
+
+  @override
+  void dispose() {
+    if (_readerScaffoldState?._gestureDetectorState == this) {
+      _readerScaffoldState!._gestureDetectorState = null;
+    }
+    _tapGestureRecognizer.dispose();
+    _dragListeners.clear();
+    _previousEvent = null;
+    _lastTapPointer = null;
+    _lastTapMoveDistance = null;
+    super.dispose();
   }
 
   @override
@@ -52,7 +96,7 @@ class _ReaderGestureDetectorState
     return Listener(
       behavior: HitTestBehavior.translucent,
       onPointerDown: (event) {
-        if (event.position == Offset.zero) {
+        if (!shouldTrackReaderPointerDown(event.position)) {
           _previousEvent = null;
           return;
         }
@@ -71,7 +115,12 @@ class _ReaderGestureDetectorState
           _dragInProgress = false;
         }
         Future.delayed(_kLongPressMinTime, () {
-          if (_lastTapPointer == event.pointer && fingers == 1) {
+          if (shouldRunReaderLongPressCallback(
+            mounted: mounted,
+            lastPointer: _lastTapPointer,
+            eventPointer: event.pointer,
+            fingers: fingers,
+          )) {
             if (_lastTapMoveDistance!.distanceSquared <
                     _kInteractionMoveDistanceSquared &&
                 !_shouldSuppressToolbarTap) {
@@ -103,7 +152,7 @@ class _ReaderGestureDetectorState
         }
       },
       onPointerUp: (event) {
-        fingers--;
+        fingers = readerPointerCountAfterPointerEnd(fingers);
         if (_longPressInProgress) {
           onLongPressedUp(event.position);
         }
@@ -118,7 +167,7 @@ class _ReaderGestureDetectorState
         _lastTapMoveDistance = null;
       },
       onPointerCancel: (event) {
-        fingers--;
+        fingers = readerPointerCountAfterPointerEnd(fingers);
         if (_longPressInProgress) {
           onLongPressedUp(event.position);
         }
@@ -272,7 +321,11 @@ class _ReaderGestureDetectorState
     );
     _previousEvent = pendingTap;
     Future.delayed(kReaderDoubleTapMaxTime, () {
-      if (_previousEvent == pendingTap) {
+      if (shouldRunReaderPendingTapCallback(
+        mounted: mounted,
+        currentPendingTap: _previousEvent,
+        pendingTap: pendingTap,
+      )) {
         onTap(location, suppressToolbar: pendingTap.suppressToolbar);
         _previousEvent = null;
       }
@@ -366,7 +419,13 @@ class _ReaderGestureDetectorState
 
   void copyImage(Offset location) async {
     var controller = reader._imageViewController;
-    var image = await controller!.getImageByOffset(location);
+    if (controller == null) {
+      return;
+    }
+    var image = await controller.getImageByOffset(location);
+    if (!mounted) {
+      return;
+    }
     if (image != null) {
       writeImageToClipboard(image);
     } else {
@@ -376,7 +435,13 @@ class _ReaderGestureDetectorState
 
   void saveImage(Offset location) async {
     var controller = reader._imageViewController;
-    var image = await controller!.getImageByOffset(location);
+    if (controller == null) {
+      return;
+    }
+    var image = await controller.getImageByOffset(location);
+    if (!mounted) {
+      return;
+    }
     if (image != null) {
       var filetype = detectFileType(image);
       saveFile(filename: "image${filetype.ext}", data: image);

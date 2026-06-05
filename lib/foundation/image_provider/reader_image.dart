@@ -9,6 +9,48 @@ import 'base_image_provider.dart';
 import 'reader_image.dart' as image_provider;
 import 'package:venera/foundation/appdata.dart';
 
+@visibleForTesting
+Future<Uint8List?> resolveCustomImageFuture(
+  Future image, {
+  required void Function() checkStop,
+  void Function()? onCancel,
+  Duration pollInterval = const Duration(milliseconds: 50),
+}) async {
+  dynamic futureImage;
+  Object? futureError;
+  StackTrace? futureStackTrace;
+  var futureResolved = false;
+  image.then(
+    (value) {
+      futureImage = value ?? Uint8List(0);
+      futureResolved = true;
+    },
+    onError: (Object error, StackTrace stackTrace) {
+      futureError = error;
+      futureStackTrace = stackTrace;
+    },
+  );
+  while (!futureResolved && futureError == null) {
+    try {
+      checkStop();
+    } catch (_) {
+      onCancel?.call();
+      rethrow;
+    }
+    await Future.delayed(pollInterval);
+  }
+  final error = futureError;
+  if (error != null) {
+    Error.throwWithStackTrace(error, futureStackTrace!);
+  }
+  return futureImage is Uint8List ? futureImage : null;
+}
+
+@visibleForTesting
+bool shouldEnableCustomImageProcessing(Object? value) {
+  return normalizeBoolSetting(value, false);
+}
+
 class ReaderImageProvider
     extends BaseImageProvider<image_provider.ReaderImageProvider> {
   /// Image provider for normal image.
@@ -41,7 +83,7 @@ class ReaderImageProvider
   Future<Uint8List> load(chunkEvents, checkStop) async {
     Uint8List? imageBytes;
     if (imageKey.startsWith('file://')) {
-      var file = File(imageKey);
+      var file = File(localFilePathFromUri(imageKey));
       if (await file.exists()) {
         imageBytes = await file.readAsBytes();
       } else {
@@ -72,7 +114,9 @@ class ReaderImageProvider
     if (imageBytes == null) {
       throw "Error: Empty response body.";
     }
-    if (appdata.settings['enableCustomImageProcessing']) {
+    if (shouldEnableCustomImageProcessing(
+      appdata.settings['enableCustomImageProcessing'],
+    )) {
       var script = appdata.settings['customImageProcessing'].toString();
       if (!script.contains('function processImage')) {
         return imageBytes;
@@ -108,21 +152,13 @@ class ReaderImageProvider
                 imageBytes = futureImage;
               }
             } else {
-              dynamic futureImage;
-              image.then((value) {
-                futureImage = value;
-                futureImage ??= Uint8List(0);
-              });
-              while (futureImage == null) {
-                try {
-                  checkStop();
-                } catch (e) {
-                  onCancel([]);
-                  rethrow;
-                }
-                await Future.delayed(Duration(milliseconds: 50));
-              }
-              if (futureImage is Uint8List) {
+              final cancel = onCancel;
+              final futureImage = await resolveCustomImageFuture(
+                image,
+                checkStop: checkStop,
+                onCancel: () => cancel([]),
+              );
+              if (futureImage != null) {
                 imageBytes = futureImage;
               }
             }
@@ -130,7 +166,7 @@ class ReaderImageProvider
         }
       }
     }
-    return imageBytes!;
+    return imageBytes;
   }
 
   @override

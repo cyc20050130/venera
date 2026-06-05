@@ -3,6 +3,21 @@ import 'package:venera/foundation/app.dart';
 import 'package:venera/utils/ext.dart';
 import 'package:venera/utils/io.dart';
 
+@visibleForTesting
+String resolveLogDirectoryPath({
+  required bool isAndroid,
+  required String dataPath,
+  required String? externalStoragePath,
+}) {
+  if (!isAndroid) {
+    return dataPath;
+  }
+  if (externalStoragePath == null || externalStoragePath.isEmpty) {
+    return dataPath;
+  }
+  return externalStoragePath;
+}
+
 class LogItem {
   final LogLevel level;
   final String title;
@@ -43,14 +58,19 @@ class Log {
   static void addLog(LogLevel level, String title, String content) {
     if (isMuted) return;
     if (_file == null && App.isInitialized) {
-      Directory dir;
-      if (App.isAndroid) {
-        dir = Directory(App.externalStoragePath!);
-      } else {
-        dir = Directory(App.dataPath);
+      try {
+        final dir = Directory(
+          resolveLogDirectoryPath(
+            isAndroid: App.isAndroid,
+            dataPath: App.dataPath,
+            externalStoragePath: App.externalStoragePath,
+          ),
+        );
+        var file = dir.joinFile("logs.txt");
+        _file = file.openWrite();
+      } catch (e) {
+        printWarning('Failed to open log file: $e');
       }
-      var file = dir.joinFile("logs.txt");
-      _file = file.openWrite();
     }
 
     if (!ignoreLimitation && content.length > maxLogLength) {
@@ -63,7 +83,7 @@ class Log {
       case LogLevel.warning:
         printWarning(content);
       case LogLevel.info:
-        if(kDebugMode) {
+        if (kDebugMode) {
           debugPrint(content);
         }
     }
@@ -75,12 +95,13 @@ class Log {
     }
 
     _logs.add(newLog);
-    if(_file != null) {
+    if (_file != null) {
       _file!.write(newLog.toString());
     }
     if (_logs.length > maxLogNumber) {
       var res = _logs.remove(
-          _logs.firstWhereOrNull((element) => element.level == LogLevel.info));
+        _logs.firstWhereOrNull((element) => element.level == LogLevel.info),
+      );
       if (!res) {
         _logs.removeAt(0);
       }
@@ -97,7 +118,7 @@ class Log {
 
   static error(String title, Object content, [Object? stackTrace]) {
     var info = content.toString();
-    if(stackTrace != null) {
+    if (stackTrace != null) {
       info += "\n${stackTrace.toString()}";
     }
     addLog(LogLevel.error, title, info);

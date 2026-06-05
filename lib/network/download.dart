@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:isolate';
 
+import 'package:flutter/foundation.dart' show visibleForTesting;
 import 'package:flutter/widgets.dart' show ChangeNotifier;
 import 'package:flutter_saf/flutter_saf.dart';
 import 'package:venera/foundation/app.dart';
@@ -11,9 +12,9 @@ import 'package:venera/foundation/local.dart';
 import 'package:venera/foundation/log.dart';
 import 'package:venera/foundation/res.dart';
 import 'package:venera/network/images.dart';
-import 'package:venera/utils/ext.dart';
 import 'package:venera/utils/file_type.dart';
 import 'package:venera/utils/io.dart';
+import 'package:uuid/uuid.dart';
 import 'package:zip_flutter/zip_flutter.dart';
 
 import 'file_downloader.dart';
@@ -57,6 +58,8 @@ abstract class DownloadTask with ChangeNotifier {
     switch (json["type"]) {
       case "ImagesDownloadTask":
         return ImagesDownloadTask.fromJson(json);
+      case "ArchiveDownloadTask":
+        return ArchiveDownloadTask.fromJson(json);
       default:
         return null;
     }
@@ -71,6 +74,102 @@ abstract class DownloadTask with ChangeNotifier {
 
   @override
   int get hashCode => Object.hash(id, comicType);
+}
+
+String? _downloadNullableString(dynamic value) {
+  if (value == null) {
+    return null;
+  }
+  return value.toString();
+}
+
+int _downloadInt(dynamic value, [int fallback = 0]) {
+  if (value is int) {
+    return value;
+  }
+  if (value is num) {
+    return value.toInt();
+  }
+  if (value is String) {
+    return int.tryParse(value) ?? fallback;
+  }
+  return fallback;
+}
+
+int _downloadNonNegativeInt(dynamic value, [int fallback = 0]) {
+  final parsed = _downloadInt(value, fallback);
+  return parsed < 0 ? fallback : parsed;
+}
+
+Map<String, dynamic>? _downloadMap(dynamic value) {
+  if (value is! Map) {
+    return null;
+  }
+  final result = <String, dynamic>{};
+  for (final entry in value.entries) {
+    final key = entry.key;
+    if (key == null) {
+      continue;
+    }
+    result[key.toString()] = entry.value;
+  }
+  return result;
+}
+
+List<String>? _downloadStringListOrNull(dynamic value) {
+  if (value == null) {
+    return null;
+  }
+  if (value is! Iterable) {
+    return null;
+  }
+  return value
+      .where((element) => element != null)
+      .map((element) => element.toString())
+      .toList();
+}
+
+Map<String, List<String>>? _downloadImageMap(dynamic value) {
+  final map = _downloadMap(value);
+  if (map == null) {
+    return null;
+  }
+  final result = <String, List<String>>{};
+  for (final entry in map.entries) {
+    final images = _downloadStringListOrNull(entry.value);
+    if (images == null) {
+      continue;
+    }
+    result[entry.key] = images;
+  }
+  return result;
+}
+
+bool _isRestoredDownloadPositionValid(
+  Map<String, List<String>>? images,
+  int chapter,
+  int index,
+) {
+  if (images == null) {
+    return true;
+  }
+  if (chapter > images.length) {
+    return false;
+  }
+  if (chapter == images.length) {
+    return index == 0;
+  }
+  return index <= images.values.elementAt(chapter).length;
+}
+
+@visibleForTesting
+String buildArchiveDownloadFilePath(String dataPath, String operationId) {
+  return FilePath.join(dataPath, 'archive_downloading-$operationId.zip');
+}
+
+@visibleForTesting
+String buildArchiveExtractCacheDirectory(String cachePath, String operationId) {
+  return FilePath.join(cachePath, 'archive_downloading-$operationId');
 }
 
 class ImagesDownloadTask extends DownloadTask with _TransferSpeedMixin {
@@ -103,6 +202,7 @@ class ImagesDownloadTask extends DownloadTask with _TransferSpeedMixin {
   @override
   void cancel() {
     _isRunning = false;
+    stopRecorder();
     LocalManager().removeTask(this);
     var local = LocalManager().find(id, comicType);
     if (path != null) {
@@ -160,7 +260,9 @@ class ImagesDownloadTask extends DownloadTask with _TransferSpeedMixin {
     }
     stopRecorder();
     notifyListeners();
-    unawaited(LocalManager().saveCurrentDownloadingTasksNow());
+    LocalManager().saveCurrentDownloadingTasksInBackground(
+      reason: 'pause images task',
+    );
   }
 
   @override
@@ -196,7 +298,7 @@ class ImagesDownloadTask extends DownloadTask with _TransferSpeedMixin {
   var tasks = <int, _ImageDownloadWrapper>{};
 
   int get _maxConcurrentTasks =>
-      (appdata.settings["downloadThreads"] as num).toInt();
+      appdata.settings.intValue("downloadThreads", fallback: 5, min: 1);
 
   void _scheduleTasks() {
     var images = _images![_images!.keys.elementAt(_chapter)]!;
@@ -248,96 +350,19 @@ class ImagesDownloadTask extends DownloadTask with _TransferSpeedMixin {
 
   @override
   void resume() async {
-    if (_isRunning) return;
-    _isError = false;
-    _message = "Resuming...";
-    _isRunning = true;
-    notifyListeners();
-    runRecorder();
-
-    if (comic == null) {
-      _message = "Fetching comic info...";
+    try {
+      if (_isRunning) return;
+      _isError = false;
+      _message = "Resuming...";
+      _isRunning = true;
       notifyListeners();
-      var res = await _runWithRetry(() async {
-        var r = await source.loadComicInfo!(comicId);
-        if (r.error) {
-          throw r.errorMessage!;
-        } else {
-          return r.data;
-        }
-      });
-      if (!_isRunning) {
-        return;
-      }
-      if (res.error) {
-        _setError("Error: ${res.errorMessage}");
-        return;
-      } else {
-        comic = res.data;
-      }
-    }
+      runRecorder();
 
-    if (path == null) {
-      try {
-        var dir = await LocalManager().findValidDirectory(
-          comicId,
-          comicType,
-          comic!.title,
-        );
-        if (!(await dir.exists())) {
-          await dir.create();
-        }
-        path = dir.path;
-      } catch (e, s) {
-        Log.error("Download", e.toString(), s);
-        _setError("Error: $e");
-        return;
-      }
-    }
-
-    await LocalManager().saveCurrentDownloadingTasksNow();
-
-    if (_cover == null) {
-      _message = "Downloading cover...";
-      notifyListeners();
-      var res = await _runWithRetry(() async {
-        Uint8List? data;
-        await for (var progress in ImageDownloader.loadThumbnail(
-          comic!.cover,
-          source.key,
-        )) {
-          if (progress.imageBytes != null) {
-            data = progress.imageBytes;
-          }
-        }
-        if (data == null) {
-          throw "Failed to download cover";
-        }
-        var fileType = detectFileType(data);
-        var file = File(FilePath.join(path!, "cover${fileType.ext}"));
-        file.writeAsBytesSync(data);
-        return "file://${file.path}";
-      });
-      if (res.error) {
-        Log.error("Download", res.errorMessage!);
-        _setError("Error: ${res.errorMessage}");
-        return;
-      } else {
-        _cover = res.data;
-        notifyListeners();
-      }
-      await LocalManager().upsertPartialComic(
-        _buildLocalComic(_completedChapters),
-      );
-      await LocalManager().saveCurrentDownloadingTasksNow();
-    }
-
-    if (_images == null) {
-      if (comic!.chapters == null) {
-        _message = "Fetching image list...";
+      if (comic == null) {
+        _message = "Fetching comic info...";
         notifyListeners();
         var res = await _runWithRetry(() async {
-          var r = await source.loadComicPages!(comicId, null);
+          var r = await source.loadComicInfo!(comicId);
           if (r.error) {
             throw r.errorMessage!;
           } else {
@@ -348,31 +373,74 @@ class ImagesDownloadTask extends DownloadTask with _TransferSpeedMixin {
           return;
         }
         if (res.error) {
+          _setError("Error: ${res.errorMessage}");
+          return;
+        } else {
+          comic = res.data;
+        }
+      }
+
+      if (path == null) {
+        try {
+          var dir = await LocalManager().findValidDirectory(
+            comicId,
+            comicType,
+            comic!.title,
+          );
+          if (!(await dir.exists())) {
+            await dir.create();
+          }
+          path = dir.path;
+        } catch (e, s) {
+          Log.error("Download", e.toString(), s);
+          _setError("Error: $e");
+          return;
+        }
+      }
+
+      await LocalManager().saveCurrentDownloadingTasksNow();
+
+      if (_cover == null) {
+        _message = "Downloading cover...";
+        notifyListeners();
+        var res = await _runWithRetry(() async {
+          Uint8List? data;
+          await for (var progress in ImageDownloader.loadThumbnail(
+            comic!.cover,
+            source.key,
+          )) {
+            if (progress.imageBytes != null) {
+              data = progress.imageBytes;
+            }
+          }
+          if (data == null) {
+            throw "Failed to download cover";
+          }
+          var fileType = detectFileType(data);
+          var file = File(FilePath.join(path!, "cover${fileType.ext}"));
+          file.writeAsBytesSync(data);
+          return "file://${file.path}";
+        });
+        if (res.error) {
           Log.error("Download", res.errorMessage!);
           _setError("Error: ${res.errorMessage}");
           return;
         } else {
-          _images = {'': res.data};
-          _totalCount = _images!['']!.length;
+          _cover = res.data;
+          notifyListeners();
         }
-      } else {
-        _images = {};
-        _totalCount = 0;
-        int cpCount = 0;
-        int totalCpCount =
-            chapters?.length ?? comic!.chapters!.allChapters.length;
-        for (var i in comic!.chapters!.allChapters.keys) {
-          if (chapters != null && !chapters!.contains(i)) {
-            continue;
-          }
-          if (_images![i] != null) {
-            _totalCount += _images![i]!.length;
-            continue;
-          }
-          _message = "Fetching image list ($cpCount/$totalCpCount)...";
+        await LocalManager().upsertPartialComic(
+          _buildLocalComic(_completedChapters),
+        );
+        await LocalManager().saveCurrentDownloadingTasksNow();
+      }
+
+      if (_images == null) {
+        if (comic!.chapters == null) {
+          _message = "Fetching image list...";
           notifyListeners();
           var res = await _runWithRetry(() async {
-            var r = await source.loadComicPages!(comicId, i);
+            var r = await source.loadComicPages!(comicId, null);
             if (r.error) {
               throw r.errorMessage!;
             } else {
@@ -384,58 +452,104 @@ class ImagesDownloadTask extends DownloadTask with _TransferSpeedMixin {
           }
           if (res.error) {
             Log.error("Download", res.errorMessage!);
-            _failedChapters.add(i);
-            cpCount++;
-            continue;
+            _setError("Error: ${res.errorMessage}");
+            return;
           } else {
-            _images![i] = res.data;
-            _totalCount += _images![i]!.length;
-            cpCount++;
+            _images = {'': res.data};
+            _totalCount = _images!['']!.length;
+          }
+        } else {
+          _images = {};
+          _totalCount = 0;
+          int cpCount = 0;
+          int totalCpCount =
+              chapters?.length ?? comic!.chapters!.allChapters.length;
+          for (var i in comic!.chapters!.allChapters.keys) {
+            if (chapters != null && !chapters!.contains(i)) {
+              continue;
+            }
+            if (_images![i] != null) {
+              _totalCount += _images![i]!.length;
+              continue;
+            }
+            _message = "Fetching image list ($cpCount/$totalCpCount)...";
+            notifyListeners();
+            var res = await _runWithRetry(() async {
+              var r = await source.loadComicPages!(comicId, i);
+              if (r.error) {
+                throw r.errorMessage!;
+              } else {
+                return r.data;
+              }
+            });
+            if (!_isRunning) {
+              return;
+            }
+            if (res.error) {
+              Log.error("Download", res.errorMessage!);
+              _failedChapters.add(i);
+              cpCount++;
+              continue;
+            } else {
+              _images![i] = res.data;
+              _totalCount += _images![i]!.length;
+              cpCount++;
+            }
           }
         }
-      }
-      _message = "$_downloadedCount/$_totalCount";
-      notifyListeners();
-      await LocalManager().saveCurrentDownloadingTasksNow();
-    }
-
-    while (_chapter < _images!.length) {
-      var images = _images![_images!.keys.elementAt(_chapter)]!;
-      tasks.clear();
-      var chapterFailed = false;
-      while (_index < images.length) {
-        _scheduleTasks();
-        var task = tasks[_index]!;
-        await task.wait();
-        if (isPaused) {
-          return;
-        }
-        if (task.error != null) {
-          Log.error("Download", task.error.toString());
-          await _markCurrentChapterFailed();
-          chapterFailed = true;
-          break;
-        }
-        _index++;
-        _downloadedCount++;
         _message = "$_downloadedCount/$_totalCount";
-        await LocalManager().scheduleSaveCurrentDownloadingTasks();
+        notifyListeners();
+        await LocalManager().saveCurrentDownloadingTasksNow();
       }
-      _index = 0;
-      if (!chapterFailed) {
-        _markCurrentChapterDownloaded();
-      }
-      _chapter++;
-    }
 
-    if (_failedChapters.isNotEmpty) {
-      Log.warning(
-        "Download",
-        "Skipped chapters for $comicId: ${_failedChapters.join(', ')}",
+      while (_chapter < _images!.length) {
+        var images = _images![_images!.keys.elementAt(_chapter)]!;
+        tasks.clear();
+        var chapterFailed = false;
+        while (_index < images.length) {
+          _scheduleTasks();
+          var task = tasks[_index]!;
+          await task.wait();
+          if (isPaused) {
+            return;
+          }
+          if (task.error != null) {
+            Log.error("Download", task.error.toString());
+            if (comic?.chapters == null) {
+              _setError("Error: ${task.error}");
+              return;
+            }
+            await _markCurrentChapterFailed();
+            chapterFailed = true;
+            break;
+          }
+          _index++;
+          _downloadedCount++;
+          _message = "$_downloadedCount/$_totalCount";
+          await LocalManager().scheduleSaveCurrentDownloadingTasks();
+        }
+        _index = 0;
+        if (!chapterFailed) {
+          _markCurrentChapterDownloaded();
+        }
+        _chapter++;
+      }
+
+      if (_failedChapters.isNotEmpty) {
+        Log.warning(
+          "Download",
+          "Skipped chapters for $comicId: ${_failedChapters.join(', ')}",
+        );
+      }
+      LocalManager().completeTask(this);
+      stopRecorder();
+    } catch (e, s) {
+      Log.error("Download", "Unhandled images download task failure: $e", s);
+      _setError("Error: $e");
+      LocalManager().saveCurrentDownloadingTasksInBackground(
+        reason: 'images task failure',
       );
     }
-    LocalManager().completeTask(this);
-    stopRecorder();
   }
 
   @override
@@ -450,10 +564,16 @@ class ImagesDownloadTask extends DownloadTask with _TransferSpeedMixin {
     _message = message;
     notifyListeners();
     stopRecorder();
+    LocalManager().saveCurrentDownloadingTasksInBackground(
+      reason: 'images task error',
+    );
   }
 
   @override
   int get speed => currentSpeed;
+
+  @visibleForTesting
+  bool get debugIsRecordingSpeed => isRecordingSpeed;
 
   @override
   String get title => comic?.title ?? comicTitle ?? "Loading...";
@@ -483,33 +603,41 @@ class ImagesDownloadTask extends DownloadTask with _TransferSpeedMixin {
       return null;
     }
 
-    Map<String, List<String>>? images;
-    if (json["images"] != null) {
-      images = {};
-      for (var entry in json["images"].entries) {
-        images[entry.key] = List<String>.from(entry.value);
-      }
+    final sourceKey = _downloadNullableString(json["source"]);
+    final source = sourceKey == null ? null : ComicSource.find(sourceKey);
+    final comicId = _downloadNullableString(json["comicId"]);
+    if (source == null || comicId == null || comicId.isEmpty) {
+      return null;
+    }
+
+    final comicJson = _downloadMap(json["comic"]);
+
+    final images = _downloadImageMap(json["images"]);
+    final index = _downloadNonNegativeInt(json["index"]);
+    final chapter = _downloadNonNegativeInt(json["chapter"]);
+    if (!_isRestoredDownloadPositionValid(images, chapter, index)) {
+      return null;
     }
 
     return ImagesDownloadTask(
-        source: ComicSource.find(json["source"])!,
-        comicId: json["comicId"],
-        comic: json["comic"] == null
-            ? null
-            : ComicDetails.fromJson(json["comic"]),
-        chapters: ListOrNull.from(json["chapters"]),
+        source: source,
+        comicId: comicId,
+        comic: comicJson == null ? null : ComicDetails.fromJson(comicJson),
+        chapters: _downloadStringListOrNull(json["chapters"]),
       )
-      ..path = json["path"]
-      .._cover = json["cover"]
+      ..path = _downloadNullableString(json["path"])
+      .._cover = _downloadNullableString(json["cover"])
       .._images = images
-      .._downloadedCount = json["downloadedCount"]
-      .._totalCount = json["totalCount"]
-      .._index = json["index"]
-      .._chapter = json["chapter"]
+      .._downloadedCount = _downloadNonNegativeInt(json["downloadedCount"])
+      .._totalCount = _downloadNonNegativeInt(json["totalCount"])
+      .._index = index
+      .._chapter = chapter
       .._completedChapters.addAll(
-        ListOrNull.from(json["completedChapters"]) ?? [],
+        _downloadStringListOrNull(json["completedChapters"]) ?? [],
       )
-      .._failedChapters.addAll(ListOrNull.from(json["failedChapters"]) ?? []);
+      .._failedChapters.addAll(
+        _downloadStringListOrNull(json["failedChapters"]) ?? [],
+      );
   }
 
   @override
@@ -534,7 +662,7 @@ class ImagesDownloadTask extends DownloadTask with _TransferSpeedMixin {
       }).toList(),
       directory: Directory(path!).name,
       chapters: comic!.chapters,
-      cover: File(_cover!.split("file://").last).name,
+      cover: File(localFilePathFromUri(_cover!)).name,
       comicType: ComicType(source.key.hashCode),
       downloadedChapters: downloadedChapters,
       createdAt: old?.createdAt ?? DateTime.now(),
@@ -634,11 +762,21 @@ class _ImageDownloadWrapper {
 
   void cancel() {
     isCancelled = true;
+    _completeWaiters();
   }
 
   var completers = <Completer<_ImageDownloadWrapper>>[];
 
   var retry = 3;
+
+  void _completeWaiters() {
+    for (var c in completers) {
+      if (!c.isCompleted) {
+        c.complete(this);
+      }
+    }
+    completers.clear();
+  }
 
   void start() async {
     int lastBytes = 0;
@@ -655,15 +793,18 @@ class _ImageDownloadWrapper {
         task.onData(p.currentBytes - lastBytes);
         lastBytes = p.currentBytes;
         if (p.imageBytes != null) {
+          if (p.imageBytes!.isEmpty) {
+            throw "Failed to download image: empty image data";
+          }
           var fileType = detectFileType(p.imageBytes!);
           var file = saveTo.joinFile("$index${fileType.ext}");
           await file.writeAsBytes(p.imageBytes!);
           isComplete = true;
-          for (var c in completers) {
-            c.complete(this);
-          }
-          completers.clear();
+          _completeWaiters();
         }
+      }
+      if (!isComplete && !isCancelled) {
+        throw "Failed to download image: no image data";
       }
     } catch (e, s) {
       if (isCancelled) {
@@ -676,16 +817,12 @@ class _ImageDownloadWrapper {
         return;
       }
       error = e.toString();
-      for (var c in completers) {
-        if (!c.isCompleted) {
-          c.complete(this);
-        }
-      }
+      _completeWaiters();
     }
   }
 
   Future<_ImageDownloadWrapper> wait() {
-    if (isComplete) {
+    if (isComplete || isCancelled || error != null) {
       return Future.value(this);
     }
     var c = Completer<_ImageDownloadWrapper>();
@@ -700,6 +837,8 @@ abstract mixin class _TransferSpeedMixin {
   int _currentSpeed = 0;
 
   int get currentSpeed => _currentSpeed;
+
+  bool get isRecordingSpeed => timer?.isActive ?? false;
 
   Timer? timer;
 
@@ -737,13 +876,30 @@ class ArchiveDownloadTask extends DownloadTask {
 
   final ComicDetails comic;
 
-  late ComicSource source;
+  final ComicSource source;
 
   /// Download comic by archive url
   ///
   /// Currently only support zip file and comics without chapters
-  ArchiveDownloadTask(this.archiveUrl, this.comic) {
-    source = ComicSource.find(comic.sourceKey)!;
+  factory ArchiveDownloadTask(String archiveUrl, ComicDetails comic) {
+    final task = ArchiveDownloadTask.tryCreate(archiveUrl, comic);
+    if (task == null) {
+      throw StateError('Comic source not found: ${comic.sourceKey}');
+    }
+    return task;
+  }
+
+  ArchiveDownloadTask._(this.archiveUrl, this.comic, this.source);
+
+  static ArchiveDownloadTask? tryCreate(String archiveUrl, ComicDetails comic) {
+    if (archiveUrl.isEmpty) {
+      return null;
+    }
+    final source = ComicSource.find(comic.sourceKey);
+    if (source == null) {
+      return null;
+    }
+    return ArchiveDownloadTask._(archiveUrl, comic, source);
   }
 
   FileDownloader? _downloader;
@@ -760,7 +916,9 @@ class ArchiveDownloadTask extends DownloadTask {
     _message = message;
     notifyListeners();
     Log.error("Download", message);
-    unawaited(LocalManager().saveCurrentDownloadingTasksNow());
+    LocalManager().saveCurrentDownloadingTasksInBackground(
+      reason: 'archive task error',
+    );
   }
 
   @override
@@ -804,7 +962,9 @@ class ArchiveDownloadTask extends DownloadTask {
     _message = "Paused";
     _downloader?.stop();
     notifyListeners();
-    unawaited(LocalManager().saveCurrentDownloadingTasksNow());
+    LocalManager().saveCurrentDownloadingTasksInBackground(
+      reason: 'pause archive task',
+    );
   }
 
   @override
@@ -813,88 +973,109 @@ class ArchiveDownloadTask extends DownloadTask {
 
   @override
   void resume() async {
-    if (_isRunning) {
-      return;
-    }
-    _isError = false;
-    _isRunning = true;
-    notifyListeners();
-    _message = "Downloading...";
+    try {
+      if (_isRunning) {
+        return;
+      }
+      _isError = false;
+      _isRunning = true;
+      notifyListeners();
+      _message = "Downloading...";
 
-    if (path == null) {
-      var dir = await LocalManager().findValidDirectory(
-        comic.id,
-        comicType,
-        comic.title,
+      if (path == null) {
+        var dir = await LocalManager().findValidDirectory(
+          comic.id,
+          comicType,
+          comic.title,
+        );
+        if (!(await dir.exists())) {
+          try {
+            await dir.create();
+          } catch (e) {
+            _setError("Error: $e");
+            return;
+          }
+        }
+        path = dir.path;
+      }
+
+      final operationId = const Uuid().v4();
+      final archiveFile = File(
+        buildArchiveDownloadFilePath(App.dataPath, operationId),
       );
-      if (!(await dir.exists())) {
+      try {
+        Log.info("Download", "Downloading $archiveUrl");
+
+        _downloader = FileDownloader(archiveUrl, archiveFile.path);
+
+        bool isDownloaded = false;
+
         try {
-          await dir.create();
+          await for (var status in _downloader!.start()) {
+            _currentBytes = status.downloadedBytes;
+            _expectedBytes = status.totalBytes;
+            _message =
+                "${bytesToReadableString(_currentBytes)}/${bytesToReadableString(_expectedBytes)}";
+            _speed = status.bytesPerSecond;
+            isDownloaded = status.isFinished;
+            notifyListeners();
+          }
         } catch (e) {
           _setError("Error: $e");
           return;
         }
+
+        if (!_isRunning) {
+          return;
+        }
+
+        if (!isDownloaded) {
+          _setError("Error: Download failed");
+          return;
+        }
+
+        try {
+          await _extractArchive(
+            archiveFile.path,
+            path!,
+            operationId: operationId,
+          );
+        } catch (e) {
+          _setError("Failed to extract archive: $e");
+          return;
+        }
+
+        LocalManager().completeTask(this);
+      } finally {
+        await archiveFile.deleteIgnoreError();
       }
-      path = dir.path;
-    }
-
-    var archiveFile = File(
-      FilePath.join(App.dataPath, "archive_downloading.zip"),
-    );
-
-    Log.info("Download", "Downloading $archiveUrl");
-
-    _downloader = FileDownloader(archiveUrl, archiveFile.path);
-
-    bool isDownloaded = false;
-
-    try {
-      await for (var status in _downloader!.start()) {
-        _currentBytes = status.downloadedBytes;
-        _expectedBytes = status.totalBytes;
-        _message =
-            "${bytesToReadableString(_currentBytes)}/${bytesToReadableString(_expectedBytes)}";
-        _speed = status.bytesPerSecond;
-        isDownloaded = status.isFinished;
-        notifyListeners();
-      }
-    } catch (e) {
+    } catch (e, s) {
+      Log.error("Download", "Unhandled archive download task failure: $e", s);
       _setError("Error: $e");
-      return;
     }
-
-    if (!_isRunning) {
-      return;
-    }
-
-    if (!isDownloaded) {
-      _setError("Error: Download failed");
-      return;
-    }
-
-    try {
-      await _extractArchive(archiveFile.path, path!);
-    } catch (e) {
-      _setError("Failed to extract archive: $e");
-      return;
-    }
-
-    await archiveFile.deleteIgnoreError();
-
-    LocalManager().completeTask(this);
   }
 
-  static Future<void> _extractArchive(String archive, String outDir) async {
+  static Future<void> _extractArchive(
+    String archive,
+    String outDir, {
+    String? operationId,
+  }) async {
     var out = Directory(outDir);
     if (out is AndroidDirectory) {
       // Saf directory can't be accessed by native code.
-      var cacheDir = FilePath.join(App.cachePath, "archive_downloading");
+      var cacheDir = buildArchiveExtractCacheDirectory(
+        App.cachePath,
+        operationId ?? const Uuid().v4(),
+      );
       Directory(cacheDir).forceCreateSync();
-      await Isolate.run(() {
-        ZipFile.openAndExtract(archive, cacheDir);
-      });
-      await copyDirectoryIsolate(Directory(cacheDir), Directory(outDir));
-      await Directory(cacheDir).deleteIgnoreError(recursive: true);
+      try {
+        await Isolate.run(() {
+          ZipFile.openAndExtract(archive, cacheDir);
+        });
+        await copyDirectoryIsolate(Directory(cacheDir), Directory(outDir));
+      } finally {
+        await Directory(cacheDir).deleteIgnoreError(recursive: true);
+      }
     } else {
       await Isolate.run(() {
         ZipFile.openAndExtract(archive, outDir);
@@ -922,14 +1103,24 @@ class ArchiveDownloadTask extends DownloadTask {
     if (json["type"] != "ArchiveDownloadTask") {
       return null;
     }
-    return ArchiveDownloadTask(
-      json["archiveUrl"],
-      ComicDetails.fromJson(json["comic"]),
-    )..path = json["path"];
+    final archiveUrl = _downloadNullableString(json["archiveUrl"]);
+    final comicJson = _downloadMap(json["comic"]);
+    if (archiveUrl == null || archiveUrl.isEmpty || comicJson == null) {
+      return null;
+    }
+    final comic = ComicDetails.fromJson(comicJson);
+    if (comic.id.isEmpty || ComicSource.find(comic.sourceKey) == null) {
+      return null;
+    }
+    return ArchiveDownloadTask.tryCreate(archiveUrl, comic)
+      ?..path = _downloadNullableString(json["path"]);
   }
 
   String _findCover() {
     var files = Directory(path!).listSync();
+    if (files.isEmpty) {
+      throw StateError('Archive download produced no files');
+    }
     for (var f in files) {
       if (f.name.startsWith('cover')) {
         return f.name;

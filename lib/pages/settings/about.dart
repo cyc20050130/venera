@@ -46,14 +46,15 @@ class _AboutSettingsState extends State<AboutSettings> {
           trailing: Button.filled(
             isLoading: isCheckingUpdate,
             child: Text("Check".tl),
-            onPressed: () {
+            onPressed: () async {
+              if (isCheckingUpdate) return;
               setState(() {
                 isCheckingUpdate = true;
               });
-              checkUpdateUi().then((value) {
-                setState(() {
-                  isCheckingUpdate = false;
-                });
+              await checkUpdateUi();
+              if (!mounted) return;
+              setState(() {
+                isCheckingUpdate = false;
               });
             },
           ).fixHeight(32),
@@ -81,7 +82,10 @@ Future<bool> checkUpdate() async {
   if (res.statusCode == 200) {
     var data = loadYaml(res.data);
     if (data["version"] != null) {
-      return _compareVersion(data["version"].split("+")[0], App.version);
+      return isNewerAppVersion(
+        data["version"].toString().split("+")[0],
+        App.version,
+      );
     }
   }
   return false;
@@ -97,8 +101,12 @@ Future<void> checkUpdateUi([
       if (delay) {
         await Future.delayed(const Duration(seconds: 2));
       }
+      final context = App.rootNavigatorKey.currentContext;
+      if (context == null || !context.mounted) {
+        return;
+      }
       showDialog(
-        context: App.rootContext,
+        context: context,
         builder: (context) {
           return ContentDialog(
             title: "New version available".tl,
@@ -120,7 +128,10 @@ Future<void> checkUpdateUi([
         },
       );
     } else if (showMessageIfNoUpdate) {
-      App.rootContext.showMessage(message: "No new version available".tl);
+      final context = App.rootNavigatorKey.currentContext;
+      if (context != null && context.mounted) {
+        context.showMessage(message: "No new version available".tl);
+      }
     }
   } catch (e, s) {
     Log.error("Check Update", e.toString(), s);
@@ -128,14 +139,21 @@ Future<void> checkUpdateUi([
 }
 
 /// return true if version1 > version2
-bool _compareVersion(String version1, String version2) {
+@visibleForTesting
+bool isNewerAppVersion(String version1, String version2) {
   var v1 = version1.split(".");
   var v2 = version2.split(".");
-  for (var i = 0; i < v1.length; i++) {
-    if (int.parse(v1[i]) > int.parse(v2[i])) {
+  final length = v1.length > v2.length ? v1.length : v2.length;
+  for (var i = 0; i < length; i++) {
+    final n1 = i < v1.length ? int.tryParse(v1[i]) : 0;
+    final n2 = i < v2.length ? int.tryParse(v2[i]) : 0;
+    if (n1 == null || n2 == null) {
+      return false;
+    }
+    if (n1 > n2) {
       return true;
     }
-    if (int.parse(v1[i]) < int.parse(v2[i])) {
+    if (n1 < n2) {
       return false;
     }
   }

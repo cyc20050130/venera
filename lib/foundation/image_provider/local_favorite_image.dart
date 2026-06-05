@@ -8,6 +8,26 @@ import 'package:venera/utils/io.dart';
 import 'base_image_provider.dart';
 import 'local_favorite_image.dart' as image_provider;
 
+File _localFavoriteCoverFile(String key) {
+  return File(
+    FilePath.join(App.dataPath, 'favorite_cover', key.hashCode.toString()),
+  );
+}
+
+@visibleForTesting
+Future<Uint8List?> readLocalFavoriteCoverCache(String key) async {
+  final file = _localFavoriteCoverFile(key);
+  if (!await file.exists()) {
+    return null;
+  }
+  final data = await file.readAsBytes();
+  if (data.isNotEmpty) {
+    return data;
+  }
+  await file.deleteIgnoreError();
+  return null;
+}
+
 class LocalFavoriteImageProvider
     extends BaseImageProvider<image_provider.LocalFavoriteImageProvider> {
   /// Image provider for normal image.
@@ -20,8 +40,7 @@ class LocalFavoriteImageProvider
   final int intKey;
 
   static void delete(String id, int intKey) {
-    var fileName = (id + intKey.toString()).hashCode.toString();
-    var file = File(FilePath.join(App.dataPath, 'favorite_cover', fileName));
+    var file = _localFavoriteCoverFile(id + intKey.toString());
     if (file.existsSync()) {
       file.delete();
     }
@@ -30,22 +49,28 @@ class LocalFavoriteImageProvider
   @override
   Future<Uint8List> load(chunkEvents, checkStop) async {
     var sourceKey = ComicSource.fromIntKey(intKey)?.key;
-    var fileName = key.hashCode.toString();
-    var file = File(FilePath.join(App.dataPath, 'favorite_cover', fileName));
-    if (await file.exists()) {
-      return await file.readAsBytes();
-    } else {
-      await file.create(recursive: true);
+    var file = _localFavoriteCoverFile(key);
+    final cached = await readLocalFavoriteCoverCache(key);
+    if (cached != null) {
+      return cached;
     }
     checkStop();
     await for (var progress in ImageDownloader.loadThumbnail(url, sourceKey)) {
       checkStop();
-      chunkEvents.add(ImageChunkEvent(
-        cumulativeBytesLoaded: progress.currentBytes,
-        expectedTotalBytes: progress.totalBytes,
-      ));
+      chunkEvents.add(
+        ImageChunkEvent(
+          cumulativeBytesLoaded: progress.currentBytes,
+          expectedTotalBytes: progress.totalBytes,
+        ),
+      );
       if (progress.imageBytes != null) {
         var data = progress.imageBytes!;
+        if (data.isEmpty) {
+          continue;
+        }
+        if (!await file.parent.exists()) {
+          await file.parent.create(recursive: true);
+        }
         await file.writeAsBytes(data);
         return data;
       }
@@ -55,7 +80,8 @@ class LocalFavoriteImageProvider
 
   @override
   Future<LocalFavoriteImageProvider> obtainKey(
-      ImageConfiguration configuration) {
+    ImageConfiguration configuration,
+  ) {
     return SynchronousFuture(this);
   }
 

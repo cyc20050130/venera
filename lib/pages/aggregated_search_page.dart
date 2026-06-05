@@ -29,7 +29,7 @@ class _AggregatedSearchPageState extends State<AggregatedSearchPage> {
         .where((e) => e.searchPageData != null)
         .map((e) => e.key)
         .toList();
-    var settings = appdata.settings['searchSources'] as List;
+    var settings = appdata.settings.stringList('searchSources');
     var sources = <String>[];
     for (var source in settings) {
       if (all.contains(source)) {
@@ -51,23 +51,22 @@ class _AggregatedSearchPageState extends State<AggregatedSearchPage> {
 
   @override
   Widget build(BuildContext context) {
-    return SmoothCustomScrollView(slivers: [
-      SliverSearchBar(controller: controller),
-      SliverList(
-        key: ValueKey(_keyword),
-        delegate: SliverChildBuilderDelegate(
-          (context, index) {
+    return SmoothCustomScrollView(
+      slivers: [
+        SliverSearchBar(controller: controller),
+        SliverList(
+          key: ValueKey(_keyword),
+          delegate: SliverChildBuilderDelegate((context, index) {
             final source = sources[index];
             return _SliverSearchResult(
               key: ValueKey(source.key),
               source: source,
               keyword: _keyword,
             );
-          },
-          childCount: sources.length,
+          }, childCount: sources.length),
         ),
-      ),
-    ]);
+      ],
+    );
   }
 }
 
@@ -100,43 +99,69 @@ class _SliverSearchResultState extends State<_SliverSearchResult>
 
   String? error;
 
+  int _loadRequestId = 0;
+
   void load() async {
+    final requestId = ++_loadRequestId;
     final data = widget.source.searchPageData!;
-    var options =
-        (data.searchOptions ?? []).map((e) => e.defaultValue).toList();
+    var options = (data.searchOptions ?? [])
+        .map((e) => e.defaultValue)
+        .toList();
+    List<Comic>? nextComics;
+    String? nextError;
     if (data.loadPage != null) {
-      var res = await data.loadPage!(widget.keyword, 1, options);
-      if (!res.error) {
-        setState(() {
-          comics = res.data;
-          isLoading = false;
-        });
-      } else {
-        setState(() {
-          error = res.errorMessage ?? "Unknown error".tl;
-          isLoading = false;
-        });
+      try {
+        var res = await data.loadPage!(widget.keyword, 1, options);
+        if (!res.error) {
+          nextComics = res.data;
+        } else {
+          nextError = res.errorMessage ?? "Unknown error".tl;
+        }
+      } catch (e) {
+        nextError = e.toString();
       }
     } else if (data.loadNext != null) {
-      var res = await data.loadNext!(widget.keyword, null, options);
-      if (!res.error) {
-        setState(() {
-          comics = res.data;
-          isLoading = false;
-        });
-      } else {
-        setState(() {
-          error = res.errorMessage ?? "Unknown error".tl;
-          isLoading = false;
-        });
+      try {
+        var res = await data.loadNext!(widget.keyword, null, options);
+        if (!res.error) {
+          nextComics = res.data;
+        } else {
+          nextError = res.errorMessage ?? "Unknown error".tl;
+        }
+      } catch (e) {
+        nextError = e.toString();
       }
+    } else {
+      nextError = "No search results found".tl;
     }
+    if (!mounted || requestId != _loadRequestId) {
+      return;
+    }
+    setState(() {
+      comics = nextComics;
+      error = nextError;
+      isLoading = false;
+    });
   }
 
   @override
   void initState() {
     super.initState();
     load();
+  }
+
+  @override
+  void didUpdateWidget(covariant _SliverSearchResult oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.keyword != widget.keyword ||
+        oldWidget.source.key != widget.source.key) {
+      setState(() {
+        isLoading = true;
+        comics = null;
+        error = null;
+      });
+      load();
+    }
   }
 
   Widget buildPlaceHolder() {
@@ -152,9 +177,10 @@ class _SliverSearchResultState extends State<_SliverSearchResult>
   }
 
   Widget buildComic(Comic c) {
-    return SimpleComicTile(comic: c, withTitle: true)
-        .paddingLeft(_kLeftPadding)
-        .paddingBottom(2);
+    return SimpleComicTile(
+      comic: c,
+      withTitle: true,
+    ).paddingLeft(_kLeftPadding).paddingBottom(2);
   }
 
   @override
@@ -183,25 +209,27 @@ class _SliverSearchResultState extends State<_SliverSearchResult>
               height: _kComicHeight,
               width: double.infinity,
               child: Shimmer(
-                child: LayoutBuilder(builder: (context, constrains) {
-                  var itemWidth = _comicWidth + _kLeftPadding;
-                  var items = (constrains.maxWidth / itemWidth).ceil();
-                  return Stack(
-                    children: [
-                      Positioned(
-                        left: 0,
-                        top: 0,
-                        bottom: 0,
-                        child: Row(
-                          children: List.generate(
-                            items,
-                            (index) => buildPlaceHolder(),
+                child: LayoutBuilder(
+                  builder: (context, constrains) {
+                    var itemWidth = _comicWidth + _kLeftPadding;
+                    var items = (constrains.maxWidth / itemWidth).ceil();
+                    return Stack(
+                      children: [
+                        Positioned(
+                          left: 0,
+                          top: 0,
+                          bottom: 0,
+                          child: Row(
+                            children: List.generate(
+                              items,
+                              (index) => buildPlaceHolder(),
+                            ),
                           ),
                         ),
-                      )
-                    ],
-                  );
-                }),
+                      ],
+                    );
+                  },
+                ),
               ),
             )
           else if (error != null || comics == null || comics!.isEmpty)
@@ -219,7 +247,7 @@ class _SliverSearchResultState extends State<_SliverSearchResult>
                           maxLines: 1,
                           overflow: TextOverflow.ellipsis,
                         ),
-                      )
+                      ),
                     ],
                   ),
                   const Spacer(),
@@ -231,9 +259,7 @@ class _SliverSearchResultState extends State<_SliverSearchResult>
               height: _kComicHeight,
               child: ListView(
                 scrollDirection: Axis.horizontal,
-                children: [
-                  for (var c in comics!) buildComic(c),
-                ],
+                children: [for (var c in comics!) buildComic(c)],
               ),
             ),
         ],

@@ -28,10 +28,7 @@ class CategoryButtonData {
 
   final void Function() onTap;
 
-  const CategoryButtonData({
-    required this.label,
-    required this.onTap,
-  });
+  const CategoryButtonData({required this.label, required this.onTap});
 }
 
 class CategoryItem {
@@ -40,6 +37,48 @@ class CategoryItem {
   final PageJumpTarget target;
 
   const CategoryItem(this.label, this.target);
+}
+
+@visibleForTesting
+List<CategoryItem> normalizeDynamicCategoryItems(
+  Object? data,
+  String sourceKey,
+) {
+  if (data is! Iterable) {
+    return const [];
+  }
+  final res = <CategoryItem>[];
+  for (final item in data) {
+    final map = comicSourceMapOrNull(item);
+    if (map == null) {
+      continue;
+    }
+    final label = comicSourceNullableString(map['label']);
+    if (label == null) {
+      continue;
+    }
+    res.add(
+      CategoryItem(label, PageJumpTarget.parse(sourceKey, map['target'])),
+    );
+  }
+  return res;
+}
+
+@visibleForTesting
+List<String> normalizeLegacyCategoryTags(Object? data) {
+  if (data is! Iterable) {
+    return const [];
+  }
+  return data
+      .where((item) => item != null)
+      .map((item) => item.toString())
+      .where((item) => item.isNotEmpty)
+      .toList();
+}
+
+@visibleForTesting
+int normalizeCategoryRandomNumber(Object? value) {
+  return comicSourceInt(value) ?? 1;
 }
 
 abstract class BaseCategoryPart {
@@ -67,6 +106,17 @@ class FixedCategoryPart extends BaseCategoryPart {
   const FixedCategoryPart(this.title, this.categories);
 }
 
+@visibleForTesting
+int randomCategoryStartBound({
+  required int itemCount,
+  required int randomNumber,
+}) {
+  if (itemCount <= 0 || randomNumber <= 0 || randomNumber >= itemCount) {
+    return 0;
+  }
+  return itemCount - randomNumber + 1;
+}
+
 class RandomCategoryPart extends BaseCategoryPart {
   final List<CategoryItem> all;
 
@@ -79,10 +129,18 @@ class RandomCategoryPart extends BaseCategoryPart {
   bool get enableRandom => true;
 
   List<CategoryItem> _categories() {
+    if (randomNumber <= 0 || all.isEmpty) {
+      return const [];
+    }
     if (randomNumber >= all.length) {
       return all;
     }
-    var start = math.Random().nextInt(all.length - randomNumber);
+    var start = math.Random().nextInt(
+      randomCategoryStartBound(
+        itemCount: all.length,
+        randomNumber: randomNumber,
+      ),
+    );
     return all.sublist(start, start + randomNumber);
   }
 
@@ -90,11 +148,7 @@ class RandomCategoryPart extends BaseCategoryPart {
   List<CategoryItem> get categories => _categories();
 
   /// A [BaseCategoryPart] that show a part of random tags on category page.
-  const RandomCategoryPart(
-    this.title,
-    this.all,
-    this.randomNumber,
-  );
+  const RandomCategoryPart(this.title, this.all, this.randomNumber);
 }
 
 class DynamicCategoryPart extends BaseCategoryPart {
@@ -104,23 +158,7 @@ class DynamicCategoryPart extends BaseCategoryPart {
 
   @override
   List<CategoryItem> get categories {
-    var data = loader([]);
-    if (data is! List) {
-      throw "DynamicCategoryPart loader must return a List";
-    }
-    var res = <CategoryItem>[];
-    for (var item in data) {
-      if (item is! Map) {
-        throw "DynamicCategoryPart loader must return a List of Map";
-      }
-      var label = item['label'];
-      var target = PageJumpTarget.parse(sourceKey, item['target']);
-      if (label is! String) {
-        throw "Category label must be a String";
-      }
-      res.add(CategoryItem(label, target));
-    }
-    return res;
+    return normalizeDynamicCategoryItems(loader([]), sourceKey);
   }
 
   @override

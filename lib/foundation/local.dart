@@ -18,6 +18,52 @@ import 'package:venera/utils/io.dart';
 import 'app.dart';
 import 'history.dart';
 
+dynamic _decodeLocalComicJson(dynamic value) {
+  if (value is! String) {
+    return value;
+  }
+  try {
+    return jsonDecode(value);
+  } catch (_) {
+    return null;
+  }
+}
+
+@visibleForTesting
+List<String> decodeLocalComicStringList(dynamic value) {
+  final decoded = _decodeLocalComicJson(value);
+  if (decoded is! Iterable) {
+    return <String>[];
+  }
+  return decoded
+      .where((element) => element != null)
+      .map((element) => element.toString())
+      .toList();
+}
+
+@visibleForTesting
+ComicChapters? decodeLocalComicChapters(dynamic value) {
+  return ComicChapters.fromJsonOrNull(_decodeLocalComicJson(value));
+}
+
+int _decodeLocalComicInt(dynamic value, [int fallback = 0]) {
+  if (value is int) {
+    return value;
+  }
+  if (value is num) {
+    return value.toInt();
+  }
+  if (value is String) {
+    return int.tryParse(value) ?? fallback;
+  }
+  return fallback;
+}
+
+@visibleForTesting
+DateTime decodeLocalComicCreatedAt(dynamic value) {
+  return DateTime.fromMillisecondsSinceEpoch(_decodeLocalComicInt(value));
+}
+
 class LocalComic with HistoryMixin implements Comic {
   @override
   final String id;
@@ -65,16 +111,16 @@ class LocalComic with HistoryMixin implements Comic {
   });
 
   LocalComic.fromRow(Row row)
-    : id = row[0] as String,
-      title = row[1] as String,
-      subtitle = row[2] as String,
-      tags = List.from(jsonDecode(row[3] as String)),
-      directory = row[4] as String,
-      chapters = ComicChapters.fromJsonOrNull(jsonDecode(row[5] as String)),
-      cover = row[6] as String,
-      comicType = ComicType(row[7] as int),
-      downloadedChapters = List.from(jsonDecode(row[8] as String)),
-      createdAt = DateTime.fromMillisecondsSinceEpoch(row[9] as int);
+    : id = row[0]?.toString() ?? '',
+      title = row[1]?.toString() ?? '',
+      subtitle = row[2]?.toString() ?? '',
+      tags = decodeLocalComicStringList(row[3]),
+      directory = row[4]?.toString() ?? '',
+      chapters = decodeLocalComicChapters(row[5]),
+      cover = row[6]?.toString() ?? '',
+      comicType = ComicType(_decodeLocalComicInt(row[7])),
+      downloadedChapters = decodeLocalComicStringList(row[8]),
+      createdAt = decodeLocalComicCreatedAt(row[9]);
 
   File get coverFile => File(FilePath.join(baseDir, cover));
 
@@ -189,6 +235,12 @@ class LocalManager with ChangeNotifier {
   Timer? _saveDownloadingTasksTimer;
   Completer<void>? _scheduledDownloadingTasksSave;
   Future<void> _downloadingTasksSaveChain = Future.value();
+  Future<void>? _downloadingTasksFlushFuture;
+  String? _downloadingTasksFlushSnapshot;
+  String? _lastWrittenDownloadingTasksSnapshot;
+
+  @visibleForTesting
+  Future<void> Function()? debugBeforeDownloadingTasksSnapshotWrite;
 
   Directory get directory => Directory(path);
 
@@ -350,7 +402,8 @@ class LocalManager with ChangeNotifier {
     if (res.isEmpty) {
       return '1';
     }
-    return (int.parse((res.first[0])) + 1).toString();
+    final currentMax = int.tryParse(res.first[0]?.toString() ?? '') ?? 0;
+    return (currentMax + 1).toString();
   }
 
   Future<void> add(LocalComic comic, [String? id]) async {
@@ -419,7 +472,7 @@ class LocalManager with ChangeNotifier {
   @override
   void dispose() {
     _saveDownloadingTasksTimer?.cancel();
-    unawaited(_writeDownloadingTasksSnapshot());
+    saveCurrentDownloadingTasksInBackground(reason: 'dispose');
     super.dispose();
     _db.dispose();
   }
@@ -437,7 +490,7 @@ class LocalManager with ChangeNotifier {
     final res = _db.select('''
       SELECT COUNT(*) FROM comics;
     ''');
-    return res.first[0] as int;
+    return _decodeLocalComicInt(res.first[0]);
   }
 
   LocalComic? findByName(String name) {
@@ -474,8 +527,11 @@ class LocalManager with ChangeNotifier {
     var directory = Directory(comic.baseDir);
     if (comic.hasChapters) {
       var cid = ep is int
-          ? comic.chapters!.ids.elementAt(ep - 1)
+          ? comic.chapters!.ids.elementAtOrNull(ep - 1)
           : (ep as String);
+      if (cid == null) {
+        throw "Invalid ep";
+      }
       cid = getChapterDirectoryName(cid);
       directory = Directory(FilePath.join(directory.path, cid));
     }
@@ -625,24 +681,27 @@ class LocalManager with ChangeNotifier {
     add(task.toLocalComic());
     downloadingTasks.remove(task);
     notifyListeners();
-    saveCurrentDownloadingTasks();
+    saveCurrentDownloadingTasksInBackground(reason: 'complete task');
     downloadingTasks.firstOrNull?.resume();
   }
 
   void removeTask(DownloadTask task) {
     downloadingTasks.remove(task);
     notifyListeners();
-    saveCurrentDownloadingTasks();
+    saveCurrentDownloadingTasksInBackground(reason: 'remove task');
   }
 
   void moveToFirst(DownloadTask task) {
+    if (downloadingTasks.isEmpty || !downloadingTasks.contains(task)) {
+      return;
+    }
     if (downloadingTasks.first != task) {
       var shouldResume = !downloadingTasks.first.isPaused;
       downloadingTasks.first.pause();
       downloadingTasks.remove(task);
       downloadingTasks.insert(0, task);
       notifyListeners();
-      saveCurrentDownloadingTasks();
+      saveCurrentDownloadingTasksInBackground(reason: 'move task');
       if (shouldResume) {
         downloadingTasks.first.resume();
       }
@@ -651,6 +710,38 @@ class LocalManager with ChangeNotifier {
 
   Future<void> saveCurrentDownloadingTasks() async {
     await saveCurrentDownloadingTasksNow();
+  }
+
+  void saveCurrentDownloadingTasksInBackground({String reason = 'background'}) {
+    unawaited(
+      saveCurrentDownloadingTasksNow().catchError((
+        Object error,
+        StackTrace stackTrace,
+      ) {
+        Log.error(
+          "LocalManager",
+          "Failed to save downloading task snapshot ($reason): "
+              "$error\n$stackTrace",
+        );
+      }),
+    );
+  }
+
+  void flushCurrentDownloadingTasksInBackground({
+    String reason = 'background flush',
+  }) {
+    unawaited(
+      flushCurrentDownloadingTasks().catchError((
+        Object error,
+        StackTrace stackTrace,
+      ) {
+        Log.error(
+          "LocalManager",
+          "Failed to flush downloading task snapshot ($reason): "
+              "$error\n$stackTrace",
+        );
+      }),
+    );
   }
 
   Future<void> scheduleSaveCurrentDownloadingTasks({
@@ -675,7 +766,47 @@ class LocalManager with ChangeNotifier {
   }
 
   Future<void> flushCurrentDownloadingTasks() {
-    return saveCurrentDownloadingTasksNow();
+    _saveDownloadingTasksTimer?.cancel();
+    _saveDownloadingTasksTimer = null;
+    final snapshot = _encodeDownloadingTasksSnapshot();
+    final pending = _downloadingTasksFlushFuture;
+    if (pending != null) {
+      if (_downloadingTasksFlushSnapshot == snapshot) {
+        _resolveScheduledDownloadingTasksSave(pending);
+        return pending;
+      }
+      final future = pending
+          .catchError((_) {})
+          .then((_) => _writeDownloadingTasksSnapshot(snapshot));
+      _trackDownloadingTasksFlush(future, snapshot);
+      _resolveScheduledDownloadingTasksSave(future);
+      return future;
+    }
+    final future = _writeDownloadingTasksSnapshot(snapshot);
+    _trackDownloadingTasksFlush(future, snapshot);
+    _resolveScheduledDownloadingTasksSave(future);
+    return future;
+  }
+
+  void _trackDownloadingTasksFlush(Future<void> future, String snapshot) {
+    _downloadingTasksFlushFuture = future;
+    _downloadingTasksFlushSnapshot = snapshot;
+    unawaited(
+      future.then(
+        (_) {
+          if (identical(_downloadingTasksFlushFuture, future)) {
+            _downloadingTasksFlushFuture = null;
+            _downloadingTasksFlushSnapshot = null;
+          }
+        },
+        onError: (_) {
+          if (identical(_downloadingTasksFlushFuture, future)) {
+            _downloadingTasksFlushFuture = null;
+            _downloadingTasksFlushSnapshot = null;
+          }
+        },
+      ),
+    );
   }
 
   void _resolveScheduledDownloadingTasksSave(Future<void> future) {
@@ -692,14 +823,23 @@ class LocalManager with ChangeNotifier {
     );
   }
 
-  Future<void> _writeDownloadingTasksSnapshot() {
-    var tasks = downloadingTasks.map((e) => e.toJson()).toList();
+  String _encodeDownloadingTasksSnapshot() {
+    return jsonEncode(downloadingTasks.map((e) => e.toJson()).toList());
+  }
+
+  Future<void> _writeDownloadingTasksSnapshot([String? snapshot]) {
+    final data = snapshot ?? _encodeDownloadingTasksSnapshot();
     _downloadingTasksSaveChain = _downloadingTasksSaveChain
         .catchError((_) {})
         .then((_) async {
+          if (_lastWrittenDownloadingTasksSnapshot == data) {
+            return;
+          }
+          await debugBeforeDownloadingTasksSnapshotWrite?.call();
           await File(
             FilePath.join(App.dataPath, 'downloading_tasks.json'),
-          ).writeAsString(jsonEncode(tasks));
+          ).writeAsString(data);
+          _lastWrittenDownloadingTasksSnapshot = data;
         });
     return _downloadingTasksSaveChain;
   }
@@ -708,15 +848,48 @@ class LocalManager with ChangeNotifier {
     var file = File(FilePath.join(App.dataPath, 'downloading_tasks.json'));
     if (file.existsSync()) {
       try {
-        var tasks = jsonDecode(file.readAsStringSync());
-        for (var e in tasks) {
-          var task = DownloadTask.fromJson(e);
+        final decoded = jsonDecode(file.readAsStringSync());
+        if (decoded is! List) {
+          throw const FormatException(
+            'Downloading task snapshot is not a list',
+          );
+        }
+        var changed = false;
+        for (var e in decoded) {
+          Map<String, dynamic>? map;
+          if (e is Map) {
+            try {
+              map = Map<String, dynamic>.from(e);
+            } catch (_) {
+              changed = true;
+            }
+          }
+          if (map == null) {
+            changed = true;
+            continue;
+          }
+          DownloadTask? task;
+          try {
+            task = DownloadTask.fromJson(map);
+          } catch (e, s) {
+            changed = true;
+            Log.warning(
+              "LocalManager",
+              "Skip invalid downloading task snapshot: $e\n$s",
+            );
+            continue;
+          }
           if (task != null) {
             downloadingTasks.add(task);
+          } else {
+            changed = true;
           }
         }
+        if (changed) {
+          saveCurrentDownloadingTasksInBackground(reason: 'restore cleanup');
+        }
       } catch (e) {
-        file.delete();
+        file.deleteIgnoreError();
         Log.error("LocalManager", "Failed to restore downloading tasks: $e");
       }
     }
@@ -725,7 +898,7 @@ class LocalManager with ChangeNotifier {
   void addTask(DownloadTask task) {
     downloadingTasks.add(task);
     notifyListeners();
-    saveCurrentDownloadingTasks();
+    saveCurrentDownloadingTasksInBackground(reason: 'add task');
     downloadingTasks.first.resume();
   }
 
@@ -937,12 +1110,12 @@ class LocalManager with ChangeNotifier {
           c.comicType.value,
         ]);
       }
+      _db.execute('COMMIT;');
     } catch (e, s) {
       Log.error("LocalManager", "Failed to batch delete comics: $e", s);
       _db.execute('ROLLBACK;');
       return;
     }
-    _db.execute('COMMIT;');
 
     var comicIDs = comics.map((e) => ComicID(e.comicType, e.id)).toList();
 

@@ -44,6 +44,17 @@ class HomeRefreshDebouncer {
   }
 }
 
+@visibleForTesting
+bool shouldRunResumeDataSync({
+  required AppLifecycleState state,
+  required DateTime now,
+  required DateTime lastCheck,
+  Duration interval = const Duration(minutes: 10),
+}) {
+  return state == AppLifecycleState.resumed &&
+      now.difference(lastCheck) > interval;
+}
+
 class HomePage extends StatefulWidget {
   const HomePage({super.key});
 
@@ -81,6 +92,9 @@ class _HomePageState extends State<HomePage> {
         bootstrapController.comicSourceReady) {
       _hasLoggedHomeSectionsReady = true;
       WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted) {
+          return;
+        }
         logBootstrapEvent('home sections ready');
       });
     }
@@ -185,12 +199,15 @@ class _SyncDataWidget extends StatefulWidget {
 
 class _SyncDataWidgetState extends State<_SyncDataWidget>
     with WidgetsBindingObserver {
+  int _dataSyncRequestId = 0;
+
   @override
   void initState() {
     super.initState();
     DataSync().addListener(update);
     WidgetsBinding.instance.addObserver(this);
     lastCheck = DateTime.now();
+    _scheduleDataSyncDownloadAfterInteraction();
   }
 
   void update() {
@@ -201,9 +218,10 @@ class _SyncDataWidgetState extends State<_SyncDataWidget>
 
   @override
   void dispose() {
-    super.dispose();
+    _dataSyncRequestId++;
     DataSync().removeListener(update);
     WidgetsBinding.instance.removeObserver(this);
+    super.dispose();
   }
 
   late DateTime lastCheck;
@@ -211,12 +229,30 @@ class _SyncDataWidgetState extends State<_SyncDataWidget>
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     super.didChangeAppLifecycleState(state);
-    if (state == AppLifecycleState.resumed) {
-      if (DateTime.now().difference(lastCheck) > const Duration(minutes: 10)) {
-        lastCheck = DateTime.now();
-        DataSync().downloadData();
-      }
+    final now = DateTime.now();
+    if (shouldRunResumeDataSync(state: state, now: now, lastCheck: lastCheck)) {
+      lastCheck = now;
+      _scheduleDataSyncDownloadAfterInteraction();
     }
+  }
+
+  void _scheduleDataSyncDownloadAfterInteraction() {
+    final dataSync = DataSync();
+    if (!dataSync.isEnabled) {
+      return;
+    }
+    final requestId = ++_dataSyncRequestId;
+    unawaited(() async {
+      try {
+        await bootstrapController.waitForInteractionQuiet();
+        if (!mounted || requestId != _dataSyncRequestId) {
+          return;
+        }
+        await dataSync.downloadData();
+      } catch (e, s) {
+        Log.error("Data Sync", "Deferred data download failed: $e", s);
+      }
+    }());
   }
 
   @override
@@ -756,7 +792,11 @@ class _ImportComicsWidgetState extends State<_ImportComicsWidget> {
   }
 
   void selectAndImport() async {
-    height = key.currentContext!.size!.height;
+    if (loading) return;
+    final renderObject = key.currentContext?.findRenderObject();
+    if (renderObject is RenderBox && renderObject.hasSize) {
+      height = renderObject.size.height;
+    }
 
     setState(() {
       loading = true;
@@ -774,6 +814,7 @@ class _ImportComicsWidgetState extends State<_ImportComicsWidget> {
       5 => await importer.localDownloads(),
       int() => true,
     };
+    if (!mounted) return;
     if (result) {
       context.pop();
     } else {
@@ -1215,6 +1256,7 @@ class _ImageFavoritesState extends State<ImageFavorites> {
           displayType = type;
         });
         await Future.delayed(const Duration(milliseconds: 20));
+        if (!mounted) return;
         var scrollController = ScrollState.of(context).controller;
         scrollController.animateTo(
           scrollController.position.maxScrollExtent,

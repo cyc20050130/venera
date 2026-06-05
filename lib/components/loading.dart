@@ -1,5 +1,18 @@
 part of 'components.dart';
 
+int? normalizeLoadingMaxPage(Object? value) {
+  if (value is int) {
+    return value;
+  }
+  if (value is num) {
+    return value.toInt();
+  }
+  if (value is String) {
+    return int.tryParse(value);
+  }
+  return null;
+}
+
 class NetworkError extends StatelessWidget {
   const NetworkError({
     super.key,
@@ -129,6 +142,8 @@ abstract class LoadingState<T extends StatefulWidget, S extends Object>
 
   String? error;
 
+  int _loadRequestId = 0;
+
   Future<Res<S>> loadData();
 
   Future<Res<S>> loadDataWithRetry() async {
@@ -144,6 +159,7 @@ abstract class LoadingState<T extends StatefulWidget, S extends Object>
         }
         retry++;
         await Future.delayed(const Duration(milliseconds: 200));
+        if (!mounted) return res;
       }
     }
   }
@@ -165,24 +181,32 @@ abstract class LoadingState<T extends StatefulWidget, S extends Object>
   }
 
   void retry() {
+    if (!mounted) return;
+    final requestId = ++_loadRequestId;
     setState(() {
       isLoading = true;
       error = null;
     });
-    loadDataWithRetry().then((value) async {
-      if (value.success) {
-        data = value.data;
-        await onDataLoaded();
-        setState(() {
-          isLoading = false;
-        });
-      } else {
-        setState(() {
-          isLoading = false;
-          error = value.errorMessage!;
-        });
-      }
-    });
+    _completeLoad(requestId);
+  }
+
+  Future<void> _completeLoad(int requestId) async {
+    final value = await loadDataWithRetry();
+    if (!mounted || requestId != _loadRequestId) return;
+    if (value.success) {
+      data = value.data;
+      await onDataLoaded();
+      if (!mounted || requestId != _loadRequestId) return;
+      setState(() {
+        isLoading = false;
+        error = null;
+      });
+    } else {
+      setState(() {
+        isLoading = false;
+        error = value.errorMessage!;
+      });
+    }
   }
 
   Widget buildError() {
@@ -194,36 +218,29 @@ abstract class LoadingState<T extends StatefulWidget, S extends Object>
   void initState() {
     final seed = initialData;
     if (seed != null) {
+      final requestId = ++_loadRequestId;
       data = seed;
       isLoading = false;
       Future.microtask(() async {
-        if (!mounted) return;
+        if (!mounted || requestId != _loadRequestId) return;
         await onDataLoaded();
-        if (mounted) {
+        if (mounted && requestId == _loadRequestId) {
           setState(() {});
         }
       });
     } else {
+      final requestId = ++_loadRequestId;
       isLoading = true;
-      Future.microtask(() {
-        loadDataWithRetry().then((value) async {
-          if (!mounted) return;
-          if (value.success) {
-            data = value.data;
-            await onDataLoaded();
-            setState(() {
-              isLoading = false;
-            });
-          } else {
-            setState(() {
-              isLoading = false;
-              error = value.errorMessage!;
-            });
-          }
-        });
-      });
+      Future.microtask(() => _completeLoad(requestId));
     }
     super.initState();
+  }
+
+  @override
+  @mustCallSuper
+  void dispose() {
+    _loadRequestId++;
+    super.dispose();
   }
 
   @override
@@ -256,6 +273,8 @@ abstract class MultiPageLoadingState<T extends StatefulWidget, S extends Object>
 
   int? _maxPage;
 
+  int _loadRequestId = 0;
+
   Future<Res<List<S>>> loadData(int page);
 
   Widget? buildFrame(BuildContext context, Widget child) => null;
@@ -269,50 +288,59 @@ abstract class MultiPageLoadingState<T extends StatefulWidget, S extends Object>
   bool get haveNextPage => _maxPage == null || _page <= _maxPage!;
 
   void nextPage() {
+    if (!mounted) return;
     if (_maxPage != null && _page > _maxPage!) return;
     if (_isLoading) return;
+    final requestId = _loadRequestId;
+    final page = _page;
     _isLoading = true;
-    loadData(_page).then((value) {
+    loadData(page).then((value) {
+      if (!mounted || requestId != _loadRequestId) return;
       _isLoading = false;
-      if (mounted) {
-        if (value.success) {
-          _page++;
-          if (value.subData is int) {
-            _maxPage = value.subData as int;
-          }
-          setState(() {
-            data!.addAll(value.data);
-          });
-        } else {
-          var message = value.errorMessage ?? "Network Error";
-          if (message.length > 20) {
-            message = "${message.substring(0, 20)}...";
-          }
-          context.showMessage(message: message);
+      if (value.success) {
+        _page++;
+        final maxPage = normalizeLoadingMaxPage(value.subData);
+        if (maxPage != null) {
+          _maxPage = maxPage;
         }
+        setState(() {
+          data!.addAll(value.data);
+        });
+      } else {
+        var message = value.errorMessage ?? "Network Error";
+        if (message.length > 20) {
+          message = "${message.substring(0, 20)}...";
+        }
+        context.showMessage(message: message);
       }
     });
   }
 
   void reset() {
+    if (!mounted) return;
     setState(() {
       _isFirstLoading = true;
       _isLoading = false;
       data = null;
       _error = null;
       _page = 1;
+      _maxPage = null;
     });
     firstLoad();
   }
 
   void firstLoad() {
+    final requestId = ++_loadRequestId;
+    final page = _page;
     Future.microtask(() {
-      loadData(_page).then((value) {
-        if (!mounted) return;
+      if (!mounted || requestId != _loadRequestId) return;
+      loadData(page).then((value) {
+        if (!mounted || requestId != _loadRequestId) return;
         if (value.success) {
           _page++;
-          if (value.subData is int) {
-            _maxPage = value.subData as int;
+          final maxPage = normalizeLoadingMaxPage(value.subData);
+          if (maxPage != null) {
+            _maxPage = maxPage;
           }
           setState(() {
             _isFirstLoading = false;
@@ -332,6 +360,13 @@ abstract class MultiPageLoadingState<T extends StatefulWidget, S extends Object>
   void initState() {
     firstLoad();
     super.initState();
+  }
+
+  @override
+  @mustCallSuper
+  void dispose() {
+    _loadRequestId++;
+    super.dispose();
   }
 
   Widget buildLoading(BuildContext context) {

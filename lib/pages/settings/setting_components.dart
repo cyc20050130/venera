@@ -1,5 +1,33 @@
 part of 'settings_page.dart';
 
+bool normalizeSettingSwitchValue(Object? value, {bool fallback = false}) {
+  return normalizeBoolSetting(value, fallback);
+}
+
+double normalizeSettingSliderValue(
+  Object? value, {
+  required double fallback,
+  required double min,
+  required double max,
+}) {
+  var normalized = normalizeNumSetting(value, fallback).toDouble();
+  if (normalized < min) {
+    normalized = min;
+  }
+  if (normalized > max) {
+    normalized = max;
+  }
+  return normalized;
+}
+
+@visibleForTesting
+bool shouldApplyMultiPageFilterSelection({
+  required bool mounted,
+  required Iterable<String> selected,
+}) {
+  return mounted && selected.isNotEmpty;
+}
+
 class _SwitchSetting extends StatefulWidget {
   const _SwitchSetting({
     required this.title,
@@ -32,7 +60,7 @@ class _SwitchSetting extends StatefulWidget {
 class _SwitchSettingState extends State<_SwitchSetting> {
   @override
   Widget build(BuildContext context) {
-    var value = widget.comicId != null
+    final rawValue = widget.comicId != null
         ? appdata.settings.getReaderSetting(
             widget.comicId!,
             widget.comicSource!,
@@ -41,8 +69,7 @@ class _SwitchSettingState extends State<_SwitchSetting> {
         : widget.useDeviceSettings
         ? appdata.settings.getDeviceReaderSetting(widget.settingKey)
         : appdata.settings[widget.settingKey];
-
-    assert(value is bool);
+    final value = normalizeSettingSwitchValue(rawValue);
 
     return ListTile(
       title: Text(widget.title),
@@ -64,9 +91,20 @@ class _SwitchSettingState extends State<_SwitchSetting> {
               appdata.settings[widget.settingKey] = value;
             }
           });
-          appdata.saveData().then((_) {
-            widget.onChanged?.call();
-          });
+          appdata
+              .saveData()
+              .then((_) {
+                if (!mounted) {
+                  return;
+                }
+                widget.onChanged?.call();
+              })
+              .catchError((Object error, StackTrace stackTrace) {
+                Log.error(
+                  "Settings",
+                  "Failed to save switch setting: $error\n$stackTrace",
+                );
+              });
         },
       ),
     );
@@ -241,6 +279,7 @@ class _DoubleLineSelectSettingsState extends State<_DoubleLineSelectSettings> {
               )
               .toList(),
         ).then((value) {
+          if (!mounted) return;
           if (value != null) {
             setState(() {
               if (widget.comicId != null) {
@@ -259,7 +298,7 @@ class _DoubleLineSelectSettingsState extends State<_DoubleLineSelectSettings> {
                 appdata.settings[widget.settingKey] = value;
               }
             });
-            appdata.saveData();
+            appdata.saveDataInBackground();
             widget.onChanged?.call();
           }
         });
@@ -365,7 +404,7 @@ class _EndSelectorSelectSettingState extends State<_EndSelectorSelectSetting> {
               appdata.settings[widget.settingKey] = value;
             }
           });
-          appdata.saveData();
+          appdata.saveDataInBackground();
           widget.onChanged?.call();
         },
       ),
@@ -411,17 +450,21 @@ class _SliderSetting extends StatefulWidget {
 class _SliderSettingState extends State<_SliderSetting> {
   @override
   Widget build(BuildContext context) {
-    var value =
-        (widget.comicId != null
-                ? appdata.settings.getReaderSetting(
-                    widget.comicId!,
-                    widget.comicSource!,
-                    widget.settingsIndex,
-                  )
-                : widget.useDeviceSettings
-                ? appdata.settings.getDeviceReaderSetting(widget.settingsIndex)
-                : appdata.settings[widget.settingsIndex])
-            .toDouble();
+    final rawValue = widget.comicId != null
+        ? appdata.settings.getReaderSetting(
+            widget.comicId!,
+            widget.comicSource!,
+            widget.settingsIndex,
+          )
+        : widget.useDeviceSettings
+        ? appdata.settings.getDeviceReaderSetting(widget.settingsIndex)
+        : appdata.settings[widget.settingsIndex];
+    var value = normalizeSettingSliderValue(
+      rawValue,
+      fallback: widget.min,
+      min: widget.min,
+      max: widget.max,
+    );
     return ListTile(
       title: Text(widget.title, softWrap: true, maxLines: 2),
       trailing: Text(value.toString(), style: ts.s12),
@@ -445,7 +488,7 @@ class _SliderSettingState extends State<_SliderSetting> {
               } else {
                 appdata.settings[widget.settingsIndex] = value.toInt();
               }
-              appdata.saveData();
+              appdata.saveDataInBackground();
             });
           } else {
             setState(() {
@@ -464,7 +507,7 @@ class _SliderSettingState extends State<_SliderSetting> {
               } else {
                 appdata.settings[widget.settingsIndex] = value;
               }
-              appdata.saveData();
+              appdata.saveDataInBackground();
             });
           }
           widget.onChanged?.call();
@@ -519,17 +562,15 @@ class _MultiPagesFilterState extends State<_MultiPagesFilter> {
 
   @override
   void initState() {
-    keys = List.from(appdata.settings[widget.settingsIndex]);
-    keys.remove("");
+    keys = appdata.settings.stringList(widget.settingsIndex);
     super.initState();
   }
 
   @override
   void dispose() {
+    updateSetting();
+    scrollController.dispose();
     super.dispose();
-    Future.microtask(() {
-      updateSetting();
-    });
   }
 
   var reorderWidgetKey = UniqueKey();
@@ -672,9 +713,14 @@ class _MultiPagesFilterState extends State<_MultiPagesFilter> {
                 FilledButton(
                   onPressed: selected.isNotEmpty
                       ? () {
-                          this.setState(() {
-                            keys.addAll(selected);
-                          });
+                          if (shouldApplyMultiPageFilterSelection(
+                            mounted: mounted,
+                            selected: selected,
+                          )) {
+                            this.setState(() {
+                              keys.addAll(selected);
+                            });
+                          }
                           Navigator.pop(context);
                         }
                       : null,
@@ -690,7 +736,7 @@ class _MultiPagesFilterState extends State<_MultiPagesFilter> {
 
   void updateSetting() {
     appdata.settings[widget.settingsIndex] = keys;
-    appdata.saveData();
+    appdata.saveDataInBackground();
   }
 }
 

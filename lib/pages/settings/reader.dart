@@ -1,5 +1,10 @@
 part of 'settings_page.dart';
 
+@visibleForTesting
+String normalizeCustomImageProcessingScript(Object? value) {
+  return value is String ? value : defaultCustomImageProcessing;
+}
+
 class ReaderSettings extends StatefulWidget {
   const ReaderSettings({
     super.key,
@@ -27,19 +32,31 @@ class _ReaderSettingsState extends State<ReaderSettings> {
           widget.comicId,
           widget.comicSource,
         )) {
-      readerMode = appdata.settings.getReaderSetting(
-        widget.comicId!,
-        widget.comicSource!,
-        'readerMode',
+      readerMode = normalizeStringSetting(
+        appdata.settings.getReaderSetting(
+          widget.comicId!,
+          widget.comicSource!,
+          'readerMode',
+        ),
+        'galleryLeftToRight',
       );
-      showChapterComments = appdata.settings.getReaderSetting(
-        widget.comicId!,
-        widget.comicSource!,
-        'showChapterComments',
+      showChapterComments = normalizeBoolSetting(
+        appdata.settings.getReaderSetting(
+          widget.comicId!,
+          widget.comicSource!,
+          'showChapterComments',
+        ),
+        true,
       );
     } else {
-      readerMode = appdata.settings['readerMode'] as String?;
-      showChapterComments = appdata.settings['showChapterComments'] as bool?;
+      readerMode = appdata.settings.stringValue(
+        'readerMode',
+        fallback: 'galleryLeftToRight',
+      );
+      showChapterComments = appdata.settings.boolValue(
+        'showChapterComments',
+        fallback: true,
+      );
     }
 
     // Must have showChapterComments enabled and be in gallery mode
@@ -59,10 +76,13 @@ class _ReaderSettingsState extends State<ReaderSettings> {
           widget.comicId,
           widget.comicSource,
         )) {
-      showChapterComments = appdata.settings.getReaderSetting(
-        widget.comicId!,
-        widget.comicSource!,
-        'showChapterComments',
+      showChapterComments = normalizeBoolSetting(
+        appdata.settings.getReaderSetting(
+          widget.comicId!,
+          widget.comicSource!,
+          'showChapterComments',
+        ),
+        true,
       );
       if (showChapterComments != true) {
         appdata.settings.setReaderSetting(
@@ -73,7 +93,10 @@ class _ReaderSettingsState extends State<ReaderSettings> {
         );
       }
     } else {
-      showChapterComments = appdata.settings['showChapterComments'] as bool?;
+      showChapterComments = appdata.settings.boolValue(
+        'showChapterComments',
+        fallback: true,
+      );
       if (showChapterComments != true) {
         appdata.settings['showChapterCommentsAtEnd'] = false;
       }
@@ -95,6 +118,12 @@ class _ReaderSettingsState extends State<ReaderSettings> {
     bool useDeviceSpecificSettings =
         !isEnabledSpecificSettings &&
         appdata.settings.isDeviceSpecificSettingsEnabled();
+    final readerMode = appdata.settings.stringValue(
+      'readerMode',
+      fallback: 'galleryLeftToRight',
+    );
+    final isGalleryMode = readerMode.startsWith('gallery');
+    final isContinuousMode = readerMode.startsWith('continuous');
 
     return SmoothCustomScrollView(
       slivers: [
@@ -141,7 +170,7 @@ class _ReaderSettingsState extends State<ReaderSettings> {
                   setState(() {
                     appdata.settings.setEnabledDeviceSpecificSettings(b);
                   });
-                  appdata.saveData();
+                  appdata.saveDataInBackground();
                 },
               ).toSliver(),
               if (useDeviceSpecificSettings)
@@ -151,7 +180,7 @@ class _ReaderSettingsState extends State<ReaderSettings> {
                       setState(() {
                         appdata.settings.resetDeviceReaderSettings();
                       });
-                      appdata.saveData();
+                      appdata.saveDataInBackground();
                     },
                     child: Text(
                       "Clear specific reader settings for this device".tl,
@@ -204,8 +233,11 @@ class _ReaderSettingsState extends State<ReaderSettings> {
           },
           onChanged: () {
             setState(() {});
-            var readerMode = appdata.settings['readerMode'];
-            if (readerMode?.toLowerCase().startsWith('continuous') ?? false) {
+            var readerMode = appdata.settings.stringValue(
+              'readerMode',
+              fallback: 'galleryLeftToRight',
+            );
+            if (readerMode.toLowerCase().startsWith('continuous')) {
               appdata.settings['readerScreenPicNumberForLandscape'] = 1;
               widget.onChanged?.call('readerScreenPicNumberForLandscape');
               appdata.settings['readerScreenPicNumberForPortrait'] = 1;
@@ -232,7 +264,7 @@ class _ReaderSettingsState extends State<ReaderSettings> {
           useDeviceSettings: useDeviceSpecificSettings,
         ).toSliver(),
         SliverAnimatedVisibility(
-          visible: appdata.settings['readerMode']!.startsWith('gallery'),
+          visible: isGalleryMode,
           child: _SliderSetting(
             title:
                 "The number of pic in screen for landscape (Only Gallery Mode)"
@@ -251,7 +283,7 @@ class _ReaderSettingsState extends State<ReaderSettings> {
           ),
         ),
         SliverAnimatedVisibility(
-          visible: appdata.settings['readerMode']!.startsWith('gallery'),
+          visible: isGalleryMode,
           child: _SliderSetting(
             title:
                 "The number of pic in screen for portrait (Only Gallery Mode)"
@@ -270,9 +302,19 @@ class _ReaderSettingsState extends State<ReaderSettings> {
         ),
         SliverAnimatedVisibility(
           visible:
-              appdata.settings['readerMode']!.startsWith('gallery') &&
-              (appdata.settings['readerScreenPicNumberForLandscape'] > 1 ||
-                  appdata.settings['readerScreenPicNumberForPortrait'] > 1),
+              isGalleryMode &&
+              (appdata.settings.intValue(
+                        'readerScreenPicNumberForLandscape',
+                        fallback: 1,
+                        min: 1,
+                      ) >
+                      1 ||
+                  appdata.settings.intValue(
+                        'readerScreenPicNumberForPortrait',
+                        fallback: 1,
+                        min: 1,
+                      ) >
+                      1),
           child: _SwitchSetting(
             title: "Show single image on first page".tl,
             settingKey: "showSingleImageOnFirstPage",
@@ -285,7 +327,7 @@ class _ReaderSettingsState extends State<ReaderSettings> {
           ),
         ),
         SliverAnimatedVisibility(
-          visible: appdata.settings['readerMode']!.startsWith('continuous'),
+          visible: isContinuousMode,
           child: _SliderSetting(
             title: "Mouse scroll speed".tl,
             settingsIndex: "readerScrollSpeed",
@@ -469,13 +511,15 @@ class __CustomImageProcessingState extends State<_CustomImageProcessing> {
   @override
   void initState() {
     super.initState();
-    current = appdata.settings['customImageProcessing'];
+    current = normalizeCustomImageProcessingScript(
+      appdata.settings['customImageProcessing'],
+    );
   }
 
   @override
   void dispose() {
     appdata.settings['customImageProcessing'] = current;
-    appdata.saveData();
+    appdata.saveDataInBackground();
     super.dispose();
   }
 
@@ -514,7 +558,7 @@ class __CustomImageProcessingState extends State<_CustomImageProcessing> {
               child: SizedBox.expand(
                 child: CodeEditor(
                   key: ValueKey(resetKey),
-                  initialValue: appdata.settings['customImageProcessing'],
+                  initialValue: current,
                   onChanged: (value) {
                     current = value;
                   },

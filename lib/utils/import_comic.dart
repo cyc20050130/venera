@@ -14,6 +14,65 @@ import 'package:venera/utils/translations.dart';
 import 'cbz.dart';
 import 'io.dart';
 
+const _supportedImportedComicImageExtensions = {
+  'jpg',
+  'jpeg',
+  'png',
+  'webp',
+  'gif',
+  'jpe',
+};
+
+const _ehViewerCategoryTags = [
+  "MISC",
+  "DOUJINSHI",
+  "MANGA",
+  "ARTISTCG",
+  "GAMECG",
+  "IMAGE SET",
+  "COSPLAY",
+  "ASIAN PORN",
+  "NON-H",
+  "WESTERN",
+];
+
+@visibleForTesting
+bool isSupportedImportedComicImageExtension(String extension) {
+  final normalized = extension.startsWith('.')
+      ? extension.substring(1)
+      : extension;
+  return _supportedImportedComicImageExtensions.contains(
+    normalized.toLowerCase(),
+  );
+}
+
+@visibleForTesting
+String buildImportBackupDirectoryPath(Directory destination) {
+  final backupName = findValidDirectoryName(
+    destination.parent.path,
+    '${destination.name}_old',
+  );
+  return FilePath.join(destination.parent.path, backupName);
+}
+
+@visibleForTesting
+String? safeEhViewerCategoryTag(Object? category) {
+  final value = switch (category) {
+    int() => category,
+    num() => category.toInt(),
+    String() => int.tryParse(category),
+    _ => null,
+  };
+  if (value == null || value <= 0) {
+    return null;
+  }
+  final index = (log(value) / ln2).floor();
+  if (index < 0 || index >= _ehViewerCategoryTags.length) {
+    return null;
+  }
+  return _ehViewerCategoryTags[index];
+}
+
 class ImportComic {
   final String? selectedFolder;
   final bool copyToLocal;
@@ -33,8 +92,9 @@ class ImportComic {
     } catch (e, s) {
       Log.error("Import Comic", e.toString(), s);
       App.rootContext.showMessage(message: e.toString());
+    } finally {
+      controller.close();
     }
-    controller.close();
     return registerComics(imported, false);
   }
 
@@ -44,23 +104,28 @@ class ImportComic {
     if (dir != null) {
       var files = (await dir.list().toList()).whereType<File>().toList();
       const supportedExtensions = ['cbz', 'zip', '7z', 'cb7'];
-      files.removeWhere((e) => !supportedExtensions.contains(e.extension));
+      files.removeWhere(
+        (e) => !supportedExtensions.contains(e.extension.toLowerCase()),
+      );
       Map<String?, List<LocalComic>> imported = {};
       var controller = showLoadingDialog(App.rootContext, allowCancel: false);
       var comics = <LocalComic>[];
-      for (var file in files) {
-        try {
-          var comic = await CBZ.import(file);
-          comics.add(comic);
-        } catch (e, s) {
-          Log.error("Import Comic", e.toString(), s);
+      try {
+        for (var file in files) {
+          try {
+            var comic = await CBZ.import(file);
+            comics.add(comic);
+          } catch (e, s) {
+            Log.error("Import Comic", e.toString(), s);
+          }
         }
+        if (comics.isEmpty) {
+          App.rootContext.showMessage(message: "No valid comics found".tl);
+        }
+        imported[selectedFolder] = comics;
+      } finally {
+        controller.close();
       }
-      if (comics.isEmpty) {
-        App.rootContext.showMessage(message: "No valid comics found".tl);
-      }
-      imported[selectedFolder] = comics;
-      controller.close();
       return registerComics(imported, false);
     }
     return false;
@@ -76,12 +141,16 @@ class ImportComic {
     }
 
     bool cancelled = false;
-    var controller = showLoadingDialog(App.rootContext, onCancel: () {
-      cancelled = true;
-    });
+    var controller = showLoadingDialog(
+      App.rootContext,
+      onCancel: () {
+        cancelled = true;
+      },
+    );
 
+    sql.Database? db;
     try {
-      var db = sql.sqlite3.open(dbFile.path);
+      db = sql.sqlite3.open(dbFile.path);
 
       Future<List<LocalComic>> validateComics(List<sql.Row> comics) async {
         List<LocalComic> imported = [];
@@ -89,33 +158,30 @@ class ImportComic {
           if (cancelled) {
             return imported;
           }
-          var comicDir = Directory(
-              FilePath.join(comicSrc.path, comic['DIRNAME'] as String));
-          String titleJP =
-              comic['TITLE_JPN'] == null ? "" : comic['TITLE_JPN'] as String;
-          String title = titleJP == "" ? comic['TITLE'] as String : titleJP;
-          int timeStamp = comic['TIME'] as int;
+          final dirName = comic['DIRNAME']?.toString();
+          if (dirName == null || dirName.isEmpty) {
+            continue;
+          }
+          var comicDir = Directory(FilePath.join(comicSrc.path, dirName));
+          String titleJP = comic['TITLE_JPN']?.toString() ?? "";
+          String title = titleJP == ""
+              ? (comic['TITLE']?.toString() ?? dirName)
+              : titleJP;
+          int timeStamp = switch (comic['TIME']) {
+            int value => value,
+            String value => int.tryParse(value) ?? 0,
+            _ => 0,
+          };
           DateTime downloadTime = timeStamp != 0
               ? DateTime.fromMillisecondsSinceEpoch(timeStamp)
               : DateTime.now();
-          var comicObj = await _checkSingleComic(comicDir,
-              title: title,
-              tags: [
-                //1 >> x
-                [
-                  "MISC",
-                  "DOUJINSHI",
-                  "MANGA",
-                  "ARTISTCG",
-                  "GAMECG",
-                  "IMAGE SET",
-                  "COSPLAY",
-                  "ASIAN PORN",
-                  "NON-H",
-                  "WESTERN",
-                ][(log(comic['CATEGORY'] as int) / ln2).floor()]
-              ],
-              createTime: downloadTime);
+          final categoryTag = safeEhViewerCategoryTag(comic['CATEGORY']);
+          var comicObj = await _checkSingleComic(
+            comicDir,
+            title: title,
+            tags: categoryTag == null ? const [] : [categoryTag],
+            createTime: downloadTime,
+          );
           if (comicObj == null) {
             continue;
           }
@@ -125,10 +191,16 @@ class ImportComic {
       }
 
       var tags = <String>[""];
-      tags.addAll(db.select("""
+      tags.addAll(
+        db
+            .select("""
             SELECT * FROM DOWNLOAD_LABELS LB
             ORDER BY  LB.TIME DESC;
-          """).map((r) => r['LABEL'] as String).toList());
+          """)
+            .map((r) => r['LABEL'])
+            .whereType<String>()
+            .toList(),
+      );
 
       for (var tag in tags) {
         if (cancelled) {
@@ -140,9 +212,9 @@ class ImportComic {
               FROM DOWNLOAD_DIRNAME DN
               LEFT JOIN DOWNLOADS DL
               ON DL.GID = DN.GID
-              WHERE DL.LABEL ${tag == '' ? 'IS NULL' : '= \'$tag\''} AND DL.STATE = 3
+              WHERE DL.LABEL ${tag == '' ? 'IS NULL' : '= ?'} AND DL.STATE = 3
               ORDER BY DL.TIME DESC
-            """).toList();
+            """, tag == '' ? const [] : [tag]).toList();
 
         var validComics = await validateComics(comicList);
         imported[folderName] = validComics;
@@ -151,16 +223,18 @@ class ImportComic {
           LocalFavoritesManager().createFolder(folderName);
         }
       }
-      db.dispose();
-
       //Android specific
       var cache = FilePath.join(App.cachePath, dbFile.name);
       await File(cache).deleteIgnoreError();
     } catch (e, s) {
       Log.error("Import Comic", e.toString(), s);
       App.rootContext.showMessage(message: e.toString());
+    } finally {
+      // Keep the local SQLite handle scoped to the import operation. Import can
+      // be cancelled or fail on malformed external data.
+      db?.dispose();
+      controller.close();
     }
-    controller.close();
     if (cancelled) return false;
     return registerComics(imported, copyToLocal);
   }
@@ -202,13 +276,15 @@ class ImportComic {
     var localDir = LocalManager().directory;
     Map<String?, List<LocalComic>> imported = {null: []};
     bool cancelled = false;
-    var controller = showLoadingDialog(App.rootContext, onCancel: () {
-      cancelled = true;
-    });
+    var controller = showLoadingDialog(
+      App.rootContext,
+      onCancel: () {
+        cancelled = true;
+      },
+    );
     try {
       if (!await localDir.exists()) {
         App.rootContext.showMessage(message: "Local path not found".tl);
-        controller.close();
         return false;
       }
       await for (var entry in localDir.list()) {
@@ -233,20 +309,23 @@ class ImportComic {
     } catch (e, s) {
       Log.error("Import Comic", e.toString(), s);
       App.rootContext.showMessage(message: e.toString());
+    } finally {
+      controller.close();
     }
-    controller.close();
     if (cancelled) return false;
     return registerComics(imported, false);
   }
 
   //Automatically search for cover image and chapters
-  Future<LocalComic?> _checkSingleComic(Directory directory,
-      {String? id,
-      String? title,
-      String? subtitle,
-      List<String>? tags,
-      DateTime? createTime,
-      bool useRelativePath = false}) async {
+  Future<LocalComic?> _checkSingleComic(
+    Directory directory, {
+    String? id,
+    String? title,
+    String? subtitle,
+    List<String>? tags,
+    DateTime? createTime,
+    bool useRelativePath = false,
+  }) async {
     if (!(await directory.exists())) return null;
     var name = title ?? directory.name;
     if (LocalManager().findByName(name) != null) {
@@ -257,42 +336,60 @@ class ImportComic {
     var chapters = <String>[];
     var coverPath = ''; // relative path to the cover image
     var fileList = <String>[];
+    final chapterImages = <String, List<String>>{};
     await for (var entry in directory.list()) {
       if (entry is Directory) {
-        hasChapters = true;
-        chapters.add(entry.name);
+        final images = <String>[];
         await for (var file in entry.list()) {
           if (file is Directory) {
-            Log.info("Import Comic",
-                "Invalid Chapter: ${entry.name}\nA directory is found in the chapter directory.");
+            Log.info(
+              "Import Comic",
+              "Invalid Chapter: ${entry.name}\nA directory is found in the chapter directory.",
+            );
             return null;
+          } else if (file is File &&
+              isSupportedImportedComicImageExtension(file.extension)) {
+            images.add(file.name);
           }
         }
+        if (images.isNotEmpty) {
+          hasChapters = true;
+          images.sort();
+          chapters.add(entry.name);
+          chapterImages[entry.name] = images;
+        }
       } else if (entry is File) {
-        const imageExtensions = ['jpg', 'jpeg', 'png', 'webp', 'gif', 'jpe'];
-        if (imageExtensions.contains(entry.extension)) {
+        if (isSupportedImportedComicImageExtension(entry.extension)) {
           fileList.add(entry.name);
         }
       }
     }
 
-    if (fileList.isEmpty) {
+    if (fileList.isEmpty && !hasChapters) {
       return null;
     }
 
     fileList.sort();
-    coverPath = fileList.firstWhereOrNull((l) => l.startsWith('cover')) ??
-        fileList.first;
+    if (fileList.isNotEmpty) {
+      coverPath =
+          fileList.firstWhereOrNull(
+            (l) => l.toLowerCase().startsWith('cover'),
+          ) ??
+          fileList.first;
+    }
 
     chapters.sort();
-    if (hasChapters && coverPath == '') {
+    if (hasChapters && fileList.isEmpty) {
       // use the first image in the first chapter as the cover
-      var firstChapter = Directory('${directory.path}/${chapters.first}');
-      await for (var entry in firstChapter.list()) {
-        if (entry is File) {
-          coverPath = entry.name;
-          break;
-        }
+      var firstChapterName = chapters.first;
+      final firstChapterImages = chapterImages[firstChapterName] ?? const [];
+      final chapterCover =
+          firstChapterImages.firstWhereOrNull(
+            (l) => l.toLowerCase().startsWith('cover'),
+          ) ??
+          firstChapterImages.firstOrNull;
+      if (chapterCover != null) {
+        coverPath = FilePath.join(firstChapterName, chapterCover);
       }
     }
     if (coverPath == '') {
@@ -316,41 +413,85 @@ class ImportComic {
     );
   }
 
+  @visibleForTesting
+  Future<LocalComic?> debugCheckSingleComic(Directory directory) {
+    return _checkSingleComic(directory);
+  }
+
   static Future<Map<String, String>> _copyDirectories(
-      Map<String, dynamic> data) async {
+    Map<String, dynamic> data,
+  ) async {
     return overrideIO(() async {
-      var toBeCopied = data['toBeCopied'] as List<String>;
-      var destination = data['destination'] as String;
+      final rawToBeCopied = data['toBeCopied'];
+      final destination = data['destination'];
+      if (rawToBeCopied is! Iterable || destination is! String) {
+        return <String, String>{};
+      }
+      var toBeCopied = rawToBeCopied
+          .whereType<String>()
+          .where((path) => path.isNotEmpty)
+          .toList();
       Map<String, String> result = {};
+      final copiedDestinations = <String>{};
       for (var dir in toBeCopied) {
         var source = Directory(dir);
-        var dest = Directory("$destination/${source.name}");
-        if (dest.existsSync()) {
+        var dest = Directory(FilePath.join(destination, source.name));
+        Directory? backup;
+        if (dest.existsSync() &&
+            copiedDestinations.contains(
+              normalizeOutputFilePathForLock(dest.path),
+            )) {
+          dest = Directory(
+            FilePath.join(
+              destination,
+              findValidDirectoryName(destination, source.name),
+            ),
+          );
+        } else if (dest.existsSync()) {
           // The destination directory already exists, and it is not managed by the app.
           // Rename the old directory to avoid conflicts.
-          Log.info("Import Comic",
-              "Directory already exists: ${source.name}\nRenaming the old directory.");
-          dest.renameSync(
-              findValidDirectoryName(dest.parent.path, "${dest.path}_old"));
+          Log.info(
+            "Import Comic",
+            "Directory already exists: ${source.name}\nRenaming the old directory.",
+          );
+          backup = dest.renameSync(buildImportBackupDirectoryPath(dest));
         }
-        dest.createSync();
-        await copyDirectory(source, dest);
-        result[source.path] = dest.path;
+        try {
+          dest.createSync();
+          await copyDirectory(source, dest);
+          copiedDestinations.add(normalizeOutputFilePathForLock(dest.path));
+          result[source.path] = dest.path;
+        } catch (_) {
+          await dest.deleteIgnoreError(recursive: true);
+          if (backup != null && backup.existsSync() && !dest.existsSync()) {
+            backup.renameSync(dest.path);
+          }
+          rethrow;
+        }
       }
       return result;
     });
   }
 
+  @visibleForTesting
+  static Future<Map<String, String>> debugCopyDirectories(
+    Map<String, dynamic> data,
+  ) {
+    return _copyDirectories(data);
+  }
+
   Future<Map<String?, List<LocalComic>>> _copyComicsToLocalDir(
-      Map<String?, List<LocalComic>> comics) async {
+    Map<String?, List<LocalComic>> comics,
+  ) async {
     var destPath = LocalManager().path;
     Map<String?, List<LocalComic>> result = {};
     for (var favoriteFolder in comics.keys) {
       result[favoriteFolder] = comics[favoriteFolder]!
           .where((c) => c.directory.startsWith(destPath))
           .toList();
-      comics[favoriteFolder]!
-          .removeWhere((c) => c.directory.startsWith(destPath));
+      comics[favoriteFolder]!.removeWhere(
+        (c) => c.directory.startsWith(destPath),
+      );
 
       if (comics[favoriteFolder]!.isEmpty) {
         continue;
@@ -359,25 +500,30 @@ class ImportComic {
       try {
         // copy the comics to the local directory
         var pathMap = await compute<Map<String, dynamic>, Map<String, String>>(
-            _copyDirectories, {
-          'toBeCopied':
-              comics[favoriteFolder]!.map((e) => e.directory).toList(),
-          'destination': destPath,
-        });
+          _copyDirectories,
+          {
+            'toBeCopied': comics[favoriteFolder]!
+                .map((e) => e.directory)
+                .toList(),
+            'destination': destPath,
+          },
+        );
         //Construct a new object since LocalComic.directory is a final String
         for (var c in comics[favoriteFolder]!) {
-          result[favoriteFolder]!.add(LocalComic(
-            id: c.id,
-            title: c.title,
-            subtitle: c.subtitle,
-            tags: c.tags,
-            directory: pathMap[c.directory]!,
-            chapters: c.chapters,
-            cover: c.cover,
-            comicType: c.comicType,
-            downloadedChapters: c.downloadedChapters,
-            createdAt: c.createdAt,
-          ));
+          result[favoriteFolder]!.add(
+            LocalComic(
+              id: c.id,
+              title: c.title,
+              subtitle: c.subtitle,
+              tags: c.tags,
+              directory: pathMap[c.directory]!,
+              chapters: c.chapters,
+              cover: c.cover,
+              comicType: c.comicType,
+              downloadedChapters: c.downloadedChapters,
+              createdAt: c.createdAt,
+            ),
+          );
         }
       } catch (e, s) {
         App.rootContext.showMessage(message: "Failed to copy comics".tl);
@@ -389,7 +535,9 @@ class ImportComic {
   }
 
   Future<bool> registerComics(
-      Map<String?, List<LocalComic>> importedComics, bool copy) async {
+    Map<String?, List<LocalComic>> importedComics,
+    bool copy,
+  ) async {
     try {
       if (copy) {
         importedComics = await _copyComicsToLocalDir(importedComics);
@@ -402,22 +550,23 @@ class ImportComic {
           importedCount++;
           if (folder != null) {
             LocalFavoritesManager().addComic(
-                folder,
-                FavoriteItem(
-                    id: id,
-                    name: comic.title,
-                    coverPath: comic.cover,
-                    author: comic.subtitle,
-                    type: comic.comicType,
-                    tags: comic.tags,
-                    favoriteTime: comic.createdAt));
+              folder,
+              FavoriteItem(
+                id: id,
+                name: comic.title,
+                coverPath: comic.cover,
+                author: comic.subtitle,
+                type: comic.comicType,
+                tags: comic.tags,
+                favoriteTime: comic.createdAt,
+              ),
+            );
           }
         }
       }
       App.rootContext.showMessage(
-          message: "Imported @a comics".tlParams({
-        'a': importedCount,
-      }));
+        message: "Imported @a comics".tlParams({'a': importedCount}),
+      );
     } catch (e, s) {
       App.rootContext.showMessage(message: "Failed to register comics".tl);
       Log.error("Import Comic", e.toString(), s);

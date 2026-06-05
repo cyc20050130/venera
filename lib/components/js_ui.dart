@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
@@ -5,8 +6,89 @@ import 'package:flutter_qjs/flutter_qjs.dart';
 import 'package:url_launcher/url_launcher_string.dart';
 import 'package:venera/foundation/app.dart';
 import 'package:venera/foundation/js_engine.dart';
+import 'package:venera/foundation/log.dart';
 
 import 'components.dart';
+
+@visibleForTesting
+List<Map<String, dynamic>> normalizeJsDialogActions(Object? value) {
+  if (value is! Iterable) {
+    return <Map<String, dynamic>>[];
+  }
+  final result = <Map<String, dynamic>>[];
+  for (final item in value) {
+    if (item is! Map) {
+      continue;
+    }
+    final action = <String, dynamic>{};
+    for (final entry in item.entries) {
+      final key = entry.key;
+      if (key is String) {
+        action[key] = entry.value;
+      }
+    }
+    if (action.isNotEmpty) {
+      result.add(action);
+    }
+  }
+  return result;
+}
+
+@visibleForTesting
+String? normalizeJsLaunchUrl(Object? value) {
+  if (value is! String) {
+    return null;
+  }
+  final url = value.trim();
+  return url.isEmpty ? null : url;
+}
+
+@visibleForTesting
+Object? runJsUiCallbackSafely(
+  Object? Function() callback, {
+  required String label,
+}) {
+  try {
+    final result = callback();
+    if (result is Future) {
+      return result.catchError((Object e, StackTrace s) {
+        Log.error("JsUi", "Failed to run $label: $e", s);
+        return null;
+      });
+    }
+    return result;
+  } catch (e, s) {
+    Log.error("JsUi", "Failed to run $label: $e", s);
+    return null;
+  }
+}
+
+@visibleForTesting
+FutureOr<String?> runJsInputValidatorSafely(
+  Object? Function() validator, {
+  String failureMessage = 'Validation failed',
+}) {
+  String? normalizeResult(Object? result) {
+    return result?.toString();
+  }
+
+  try {
+    final result = validator();
+    if (result is Future) {
+      return result.then<String?>(normalizeResult).catchError((
+        Object e,
+        StackTrace s,
+      ) {
+        Log.error("JsUi", "Failed to run input validator: $e", s);
+        return failureMessage;
+      });
+    }
+    return normalizeResult(result);
+  } catch (e, s) {
+    Log.error("JsUi", "Failed to run input validator: $e", s);
+    return failureMessage;
+  }
+}
 
 mixin class JsUiApi {
   final Map<int, LoadingDialogController> _loadingDialogControllers = {};
@@ -21,9 +103,14 @@ mixin class JsUiApi {
       case 'showDialog':
         return _showDialog(message);
       case 'launchUrl':
-        var url = message['url'];
-        if (url.toString().isNotEmpty) {
-          launchUrlString(url.toString());
+        final url = normalizeJsLaunchUrl(message['url']);
+        if (url != null) {
+          unawaited(
+            launchUrlString(url).catchError((Object e, StackTrace s) {
+              Log.error("JsUi", "Failed to launch URL: $url\n$e", s);
+              return false;
+            }),
+          );
         }
       case 'showLoading':
         var onCancel = message['onCancel'];
@@ -60,32 +147,36 @@ mixin class JsUiApi {
 
   Future<void> _showDialog(Map<String, dynamic> message) {
     BuildContext? dialogContext;
-    var title = message['title'];
-    var content = message['content'];
+    final title = message['title']?.toString();
+    final content = message['content']?.toString() ?? '';
     var actions = <Widget>[];
-    for (var action in message['actions']) {
+    for (var action in normalizeJsDialogActions(message['actions'])) {
       if (action['callback'] is! JSInvokable) {
         continue;
       }
       var callback = action['callback'] as JSInvokable;
       var text = action['text'].toString();
       var style = (action['style'] ?? 'text').toString();
-      actions.add(_JSCallbackButton(
-        text: text,
-        callback: JSAutoFreeFunction(callback),
-        style: style,
-        onCallbackFinished: () {
-          dialogContext?.pop();
-        },
-      ));
+      actions.add(
+        _JSCallbackButton(
+          text: text,
+          callback: JSAutoFreeFunction(callback),
+          style: style,
+          onCallbackFinished: () {
+            dialogContext?.pop();
+          },
+        ),
+      );
     }
     if (actions.isEmpty) {
-      actions.add(TextButton(
-        onPressed: () {
-          dialogContext?.pop();
-        },
-        child: Text('OK'),
-      ));
+      actions.add(
+        TextButton(
+          onPressed: () {
+            dialogContext?.pop();
+          },
+          child: Text('OK'),
+        ),
+      );
     }
     return showDialog(
       context: App.rootContext,
@@ -104,6 +195,10 @@ mixin class JsUiApi {
 
   int _showLoading(JSInvokable? onCancel) {
     var func = onCancel == null ? null : JSAutoFreeFunction(onCancel);
+    var i = 0;
+    while (_loadingDialogControllers.containsKey(i)) {
+      i++;
+    }
     var controller = showLoadingDialog(
       App.rootContext,
       barrierDismissible: onCancel != null,
@@ -111,13 +206,15 @@ mixin class JsUiApi {
       onCancel: onCancel == null
           ? null
           : () {
-              func?.call([]);
+              runJsUiCallbackSafely(
+                () => func?.call([]),
+                label: "loading cancel callback",
+              );
             },
+      onClosed: () {
+        _loadingDialogControllers.remove(i);
+      },
     );
-    var i = 0;
-    while (_loadingDialogControllers.containsKey(i)) {
-      i++;
-    }
     _loadingDialogControllers[i] = controller;
     return i;
   }
@@ -127,7 +224,11 @@ mixin class JsUiApi {
     controller?.close();
   }
 
-  Future<String?> _showInputDialog(String title, JSInvokable? validator, dynamic image) async {
+  Future<String?> _showInputDialog(
+    String title,
+    JSInvokable? validator,
+    dynamic image,
+  ) async {
     String? result;
     var func = validator == null ? null : JSAutoFreeFunction(validator);
     String? imageUrl;
@@ -148,12 +249,20 @@ mixin class JsUiApi {
       imageData: imageData,
       onConfirm: (v) {
         if (func != null) {
-          var res = func.call([v]);
-          if (res != null) {
-            return res.toString();
-          } else {
+          final res = runJsInputValidatorSafely(() => func.call([v]));
+          if (res is Future) {
+            final future = res as Future<String?>;
+            return future.then<Object?>((error) {
+              if (error == null) {
+                result = v;
+              }
+              return error;
+            });
+          }
+          if (res == null) {
             result = v;
           }
+          return res;
         } else {
           result = v;
         }
@@ -210,16 +319,26 @@ class _JSCallbackButtonState extends State<_JSCallbackButton> {
     if (isLoading) {
       return;
     }
-    var res = widget.callback.call([]);
-    if (res is Future) {
-      setState(() {
-        isLoading = true;
-      });
-      await res;
-      setState(() {
-        isLoading = false;
-      });
+    Object? res;
+    try {
+      res = widget.callback.call([]);
+      if (res is Future) {
+        setState(() {
+          isLoading = true;
+        });
+        await res;
+      }
+    } catch (e, s) {
+      Log.error("JsUi", "Failed to run dialog action: $e", s);
+      return;
+    } finally {
+      if (mounted && isLoading) {
+        setState(() {
+          isLoading = false;
+        });
+      }
     }
+    if (!mounted) return;
     widget.onCallbackFinished?.call();
   }
 
@@ -227,32 +346,32 @@ class _JSCallbackButtonState extends State<_JSCallbackButton> {
   Widget build(BuildContext context) {
     return switch (widget.style) {
       "filled" => FilledButton(
-          onPressed: onClick,
-          child: isLoading
-              ? CircularProgressIndicator(strokeWidth: 1.4)
-                  .fixWidth(18)
-                  .fixHeight(18)
-              : Text(widget.text),
-        ),
+        onPressed: onClick,
+        child: isLoading
+            ? CircularProgressIndicator(
+                strokeWidth: 1.4,
+              ).fixWidth(18).fixHeight(18)
+            : Text(widget.text),
+      ),
       "danger" => FilledButton(
-          onPressed: onClick,
-          style: ButtonStyle(
-            backgroundColor: WidgetStateProperty.all(context.colorScheme.error),
-          ),
-          child: isLoading
-              ? CircularProgressIndicator(strokeWidth: 1.4)
-                  .fixWidth(18)
-                  .fixHeight(18)
-              : Text(widget.text),
+        onPressed: onClick,
+        style: ButtonStyle(
+          backgroundColor: WidgetStateProperty.all(context.colorScheme.error),
         ),
+        child: isLoading
+            ? CircularProgressIndicator(
+                strokeWidth: 1.4,
+              ).fixWidth(18).fixHeight(18)
+            : Text(widget.text),
+      ),
       _ => TextButton(
-          onPressed: onClick,
-          child: isLoading
-              ? CircularProgressIndicator(strokeWidth: 1.4)
-                  .fixWidth(18)
-                  .fixHeight(18)
-              : Text(widget.text),
-        ),
+        onPressed: onClick,
+        child: isLoading
+            ? CircularProgressIndicator(
+                strokeWidth: 1.4,
+              ).fixWidth(18).fixHeight(18)
+            : Text(widget.text),
+      ),
     };
   }
 }

@@ -44,6 +44,10 @@ class _LocalFavoritesPageState extends State<_LocalFavoritesPage> {
 
   bool isLoading = false;
 
+  int _comicsLoadRequestId = 0;
+
+  bool _reloadAfterCurrentLoad = false;
+
   late String readFilterSelect;
 
   var searchResults = <FavoriteItem>[];
@@ -66,45 +70,57 @@ class _LocalFavoritesPageState extends State<_LocalFavoritesPage> {
   }
 
   void updateComics() {
-    if (isLoading) return;
+    if (!mounted) return;
+    if (isLoading) {
+      _reloadAfterCurrentLoad = true;
+      return;
+    }
     if (isAllFolder) {
       var totalComics = manager.totalComics;
       if (totalComics < _asyncDataFetchLimit) {
-        comics = manager.getAllComics();
+        setState(() {
+          comics = manager.getAllComics();
+        });
       } else {
-        isLoading = true;
-        manager
-            .getAllComicsAsync()
-            .minTime(const Duration(milliseconds: 200))
-            .then((value) {
-              if (mounted) {
-                setState(() {
-                  isLoading = false;
-                  comics = value;
-                });
-              }
-            });
+        _loadComicsAsync(manager.getAllComicsAsync());
       }
     } else {
       var folderComics = manager.folderComics(widget.folder);
       if (folderComics < _asyncDataFetchLimit) {
-        comics = manager.getFolderComics(widget.folder);
+        setState(() {
+          comics = manager.getFolderComics(widget.folder);
+        });
       } else {
-        isLoading = true;
-        manager
-            .getFolderComicsAsync(widget.folder)
-            .minTime(const Duration(milliseconds: 200))
-            .then((value) {
-              if (mounted) {
-                setState(() {
-                  isLoading = false;
-                  comics = value;
-                });
-              }
-            });
+        _loadComicsAsync(manager.getFolderComicsAsync(widget.folder));
       }
     }
-    setState(() {});
+  }
+
+  void _loadComicsAsync(Future<List<FavoriteItem>> loadFuture) async {
+    final requestId = ++_comicsLoadRequestId;
+    _reloadAfterCurrentLoad = false;
+    setState(() {
+      isLoading = true;
+    });
+    try {
+      final value = await loadFuture.minTime(const Duration(milliseconds: 200));
+      if (!mounted || requestId != _comicsLoadRequestId) return;
+      setState(() {
+        isLoading = false;
+        comics = value;
+      });
+    } catch (e, stackTrace) {
+      Log.error("Load local favorite comics failed", e.toString(), stackTrace);
+      if (!mounted || requestId != _comicsLoadRequestId) return;
+      setState(() {
+        isLoading = false;
+      });
+    }
+    if (mounted &&
+        requestId == _comicsLoadRequestId &&
+        _reloadAfterCurrentLoad) {
+      updateComics();
+    }
   }
 
   List<FavoriteItem> filterComics(List<FavoriteItem> curComics) {
@@ -181,9 +197,10 @@ class _LocalFavoritesPageState extends State<_LocalFavoritesPage> {
 
   @override
   void initState() {
-    readFilterSelect =
-        appdata.implicitData["local_favorites_read_filter"] ??
-        readFilterList[0];
+    super.initState();
+    readFilterSelect = normalizeLocalFavoritesReadFilter(
+      appdata.implicitData["local_favorites_read_filter"],
+    );
     favPage = context.findAncestorStateOfType<_FavoritesPageState>()!;
     if (!isAllFolder) {
       var (a, b) = LocalFavoritesManager().findLinked(widget.folder);
@@ -196,13 +213,14 @@ class _LocalFavoritesPageState extends State<_LocalFavoritesPage> {
     comics = [];
     updateComics();
     LocalFavoritesManager().addListener(updateComics);
-    super.initState();
   }
 
   @override
   void dispose() {
-    super.dispose();
+    _comicsLoadRequestId++;
     LocalFavoritesManager().removeListener(updateComics);
+    scrollController.dispose();
+    super.dispose();
   }
 
   void selectAll() {
@@ -321,14 +339,17 @@ class _LocalFavoritesPageState extends State<_LocalFavoritesPage> {
                             child: Text("Update".tl),
                             onPressed: () {
                               context.pop();
+                              final updatePageNum = selectUpdatePageNumKey
+                                  .currentState
+                                  ?.updatePageNum;
+                              if (updatePageNum == null) return;
                               importNetworkFolder(
                                 networkSource!,
-                                selectUpdatePageNumKey
-                                    .currentState!
-                                    .updatePageNum,
+                                updatePageNum,
                                 widget.folder,
                                 networkFolder!,
                               ).then((value) {
+                                if (!mounted) return;
                                 updateComics();
                               });
                             },
@@ -784,8 +805,11 @@ class _LocalFavoritesPageState extends State<_LocalFavoritesPage> {
   }
 
   void favoriteOption(String option) {
+    if (option == 'move' && isAllFolder) {
+      return;
+    }
     var targetFolders = LocalFavoritesManager().folderNames
-        .where((folder) => folder != favPage.folder)
+        .where((folder) => folder != widget.folder)
         .toList();
 
     showPopUpWidget(
@@ -814,12 +838,15 @@ class _LocalFavoritesPageState extends State<_LocalFavoritesPage> {
                                 child: TextButton(
                                   onPressed: () {
                                     newFolder().then((v) {
+                                      if (!mounted) {
+                                        return;
+                                      }
                                       setState(() {
                                         targetFolders = LocalFavoritesManager()
                                             .folderNames
                                             .where(
                                               (folder) =>
-                                                  folder != favPage.folder,
+                                                  folder != widget.folder,
                                             )
                                             .toList();
                                       });
@@ -883,7 +910,7 @@ class _LocalFavoritesPageState extends State<_LocalFavoritesPage> {
                                 .toList();
                             for (var f in selectedLocalFolders) {
                               LocalFavoritesManager().batchMoveFavorites(
-                                favPage.folder as String,
+                                widget.folder,
                                 f,
                                 comics,
                               );
@@ -894,7 +921,7 @@ class _LocalFavoritesPageState extends State<_LocalFavoritesPage> {
                                 .toList();
                             for (var f in selectedLocalFolders) {
                               LocalFavoritesManager().batchCopyFavorites(
-                                favPage.folder as String,
+                                widget.folder,
                                 f,
                                 comics,
                               );
@@ -982,6 +1009,7 @@ class _ReorderComicsPageState extends State<_ReorderComicsPage> {
         LocalFavoritesManager().reorder(comics, widget.name);
       });
     }
+    _scrollController.dispose();
     super.dispose();
   }
 
@@ -1107,8 +1135,9 @@ class _SelectUpdatePageNumState extends State<_SelectUpdatePageNum> {
 
   @override
   void initState() {
-    updatePageNum =
-        appdata.implicitData["local_favorites_update_page_num"] ?? 9999999;
+    updatePageNum = normalizeFavoriteUpdatePageNum(
+      appdata.implicitData["local_favorites_update_page_num"],
+    );
     super.initState();
   }
 
@@ -1172,6 +1201,13 @@ class _LocalFavoritesFilterDialog extends StatefulWidget {
 
 const readFilterList = ['All', 'UnCompleted', 'Completed'];
 
+String normalizeLocalFavoritesReadFilter(Object? value) {
+  if (value is String && readFilterList.contains(value)) {
+    return value;
+  }
+  return readFilterList[0];
+}
+
 class _LocalFavoritesFilterDialogState
     extends State<_LocalFavoritesFilterDialog> {
   List<String> optionTypes = ['Filter'];
@@ -1187,7 +1223,7 @@ class _LocalFavoritesFilterDialogState
     ).paddingTop(context.padding.top);
     return ContentDialog(
       content: DefaultTabController(
-        length: 2,
+        length: optionTypes.length,
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [

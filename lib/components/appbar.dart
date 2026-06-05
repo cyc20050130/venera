@@ -49,6 +49,7 @@ class _AppbarState extends State<Appbar> {
   }
 
   void _handleScrollNotification(ScrollNotification notification) {
+    if (!mounted) return;
     if (notification is ScrollUpdateNotification &&
         defaultScrollNotificationPredicate(notification)) {
       final bool oldScrolledUnder = _scrolledUnder;
@@ -79,7 +80,8 @@ class _AppbarState extends State<Appbar> {
   Widget build(BuildContext context) {
     var content = Container(
       decoration: BoxDecoration(
-        color: widget.backgroundColor ??
+        color:
+            widget.backgroundColor ??
             context.colorScheme.surface.toOpacity(0.86),
       ),
       height: _kAppBarHeight + context.padding.top,
@@ -94,9 +96,7 @@ class _AppbarState extends State<Appbar> {
                   onPressed: () => Navigator.maybePop(context),
                 ),
               ),
-          const SizedBox(
-            width: 16,
-          ),
+          const SizedBox(width: 16),
           Expanded(
             child: DefaultTextStyle(
               style: DefaultTextStyle.of(context).style.copyWith(fontSize: 20),
@@ -106,9 +106,7 @@ class _AppbarState extends State<Appbar> {
             ),
           ),
           ...?widget.actions,
-          const SizedBox(
-            width: 8,
-          )
+          const SizedBox(width: 8),
         ],
       ).paddingTop(context.padding.top),
     );
@@ -119,18 +117,12 @@ class _AppbarState extends State<Appbar> {
         child: content,
       );
     } else {
-      return BlurEffect(
-        blur: _scrolledUnder ? 15 : 0,
-        child: content,
-      );
+      return BlurEffect(blur: _scrolledUnder ? 15 : 0, child: content);
     }
   }
 }
 
-enum AppbarStyle {
-  blur,
-  shadow,
-}
+enum AppbarStyle { blur, shadow }
 
 class SliverAppbar extends StatelessWidget {
   const SliverAppbar({
@@ -194,7 +186,10 @@ class _MySliverAppBarDelegate extends SliverPersistentHeaderDelegate {
 
   @override
   Widget build(
-      BuildContext context, double shrinkOffset, bool overlapsContent) {
+    BuildContext context,
+    double shrinkOffset,
+    bool overlapsContent,
+  ) {
     var body = Row(
       children: [
         const SizedBox(width: 8),
@@ -208,9 +203,7 @@ class _MySliverAppBarDelegate extends SliverPersistentHeaderDelegate {
                     ),
                   )
                 : const SizedBox()),
-        const SizedBox(
-          width: 16,
-        ),
+        const SizedBox(width: 16),
         Expanded(
           child: DefaultTextStyle(
             style: DefaultTextStyle.of(context).style.copyWith(fontSize: 20),
@@ -220,9 +213,7 @@ class _MySliverAppBarDelegate extends SliverPersistentHeaderDelegate {
           ),
         ),
         ...?actions,
-        const SizedBox(
-          width: 8,
-        )
+        const SizedBox(width: 8),
       ],
     ).paddingTop(topPadding);
 
@@ -290,7 +281,7 @@ class AppTabBar extends StatefulWidget {
 }
 
 class _AppTabBarState extends State<AppTabBar> {
-  late TabController _controller;
+  TabController? _controller;
 
   late List<GlobalKey> keys;
 
@@ -316,6 +307,8 @@ class _AppTabBarState extends State<AppTabBar> {
 
   @override
   void dispose() {
+    _removeControllerListener();
+    scrollController.dispose();
     super.dispose();
   }
 
@@ -323,33 +316,46 @@ class _AppTabBarState extends State<AppTabBar> {
 
   @override
   void didChangeDependencies() {
-    _controller = widget.controller ?? DefaultTabController.of(context);
-    initPainter();
     super.didChangeDependencies();
-    var prevIndex = bucket.readState(context) as int?;
+    _attachController(widget.controller ?? DefaultTabController.of(context));
+    var prevIndex = normalizeAppTabBarStorageIndex(bucket.readState(context));
+    final controller = _controller!;
     if (prevIndex != null &&
-        prevIndex != _controller.index &&
+        prevIndex != controller.index &&
         prevIndex >= 0 &&
         prevIndex < widget.tabs.length) {
-      _controller.index = prevIndex;
+      controller.index = prevIndex;
     }
-    _controller.animation!.addListener(onTabChanged);
   }
 
   @override
   void didUpdateWidget(covariant AppTabBar oldWidget) {
-    if (widget.controller != oldWidget.controller) {
-      _controller = widget.controller ?? DefaultTabController.of(context);
-      _controller.animation!.addListener(onTabChanged);
-      initPainter();
-    }
     super.didUpdateWidget(oldWidget);
+    if (widget.tabs.length != oldWidget.tabs.length) {
+      keys = resizeAppTabBarKeys(keys, widget.tabs.length);
+    }
+    if (widget.controller != oldWidget.controller) {
+      _attachController(widget.controller ?? DefaultTabController.of(context));
+    }
+  }
+
+  void _removeControllerListener() {
+    _controller?.animation?.removeListener(onTabChanged);
+  }
+
+  void _attachController(TabController controller) {
+    if (_controller != controller) {
+      _removeControllerListener();
+      _controller = controller;
+      _controller?.animation?.addListener(onTabChanged);
+    }
+    initPainter();
   }
 
   void initPainter() {
     var old = painter;
     painter = _IndicatorPainter(
-      controller: _controller,
+      controller: _controller!,
       color: context.colorScheme.primary,
       padding: tabPadding,
       radius: tabRadius,
@@ -361,13 +367,15 @@ class _AppTabBarState extends State<AppTabBar> {
 
   @override
   Widget build(BuildContext context) {
+    final controller = _controller!;
     return AnimatedBuilder(
-      animation: _controller.animation ?? _controller,
+      animation: controller.animation ?? controller,
       builder: buildTabBar,
     );
   }
 
   void _tabLayoutCallback(List<double> offsets, double itemHeight) {
+    if (!mounted || painter == null) return;
     painter!.update(offsets, itemHeight);
     this.offsets = offsets;
   }
@@ -416,7 +424,10 @@ class _AppTabBarState extends State<AppTabBar> {
   int? previousIndex;
 
   void onTabChanged() {
-    final int i = _controller.index;
+    if (!mounted) return;
+    final controller = _controller;
+    if (controller == null) return;
+    final int i = controller.index;
     if (i == previousIndex) {
       return;
     }
@@ -427,8 +438,13 @@ class _AppTabBarState extends State<AppTabBar> {
 
   void updateScrollOffset(int i) {
     // try to scroll to center the tab
-    final RenderBox tabBarBox =
-        tabBarKey.currentContext!.findRenderObject() as RenderBox;
+    final tabBarContext = tabBarKey.currentContext;
+    if (tabBarContext == null ||
+        !scrollController.hasClients ||
+        offsets.length <= i + 1) {
+      return;
+    }
+    final RenderBox tabBarBox = tabBarContext.findRenderObject() as RenderBox;
     final double tabLeft = offsets[i];
     final double tabRight = offsets[i + 1];
     final double tabWidth = tabRight - tabLeft;
@@ -450,10 +466,11 @@ class _AppTabBarState extends State<AppTabBar> {
   }
 
   void onTabClicked(int i) {
-    _controller.animateTo(i);
+    _controller?.animateTo(i);
   }
 
   Widget buildTab(int i) {
+    final controller = _controller!;
     return InkWell(
       onTap: () => onTabClicked(i),
       borderRadius: BorderRadius.circular(tabRadius),
@@ -463,11 +480,11 @@ class _AppTabBarState extends State<AppTabBar> {
           padding: const EdgeInsets.symmetric(horizontal: 16),
           child: DefaultTextStyle(
             style: DefaultTextStyle.of(context).style.copyWith(
-                  color: i == _controller.animation?.value.round()
-                      ? context.colorScheme.primary
-                      : context.colorScheme.onSurface,
-                  fontWeight: FontWeight.w500,
-                ),
+              color: i == controller.animation?.value.round()
+                  ? context.colorScheme.primary
+                  : context.colorScheme.onSurface,
+              fontWeight: FontWeight.w500,
+            ),
             child: widget.tabs[i],
           ),
         ),
@@ -476,10 +493,41 @@ class _AppTabBarState extends State<AppTabBar> {
   }
 }
 
-typedef _TabRenderCallback = void Function(
-  List<double> offsets,
-  double itemHeight,
-);
+@visibleForTesting
+List<GlobalKey> resizeAppTabBarKeys(List<GlobalKey> keys, int length) {
+  if (length == keys.length) {
+    return keys;
+  }
+  if (length < keys.length) {
+    return keys.take(length).toList();
+  }
+  return [...keys, for (var i = keys.length; i < length; i++) GlobalKey()];
+}
+
+@visibleForTesting
+int? normalizeAppTabBarStorageIndex(Object? value) {
+  final index = _componentInt(value);
+  if (index == null || index < 0) {
+    return null;
+  }
+  return index;
+}
+
+int? _componentInt(Object? value) {
+  if (value is int) {
+    return value;
+  }
+  if (value is num) {
+    return value.toInt();
+  }
+  if (value is String) {
+    return int.tryParse(value);
+  }
+  return null;
+}
+
+typedef _TabRenderCallback =
+    void Function(List<double> offsets, double itemHeight);
 
 class _TabRow extends Row {
   const _TabRow({required this.callback, required super.children});
@@ -489,13 +537,14 @@ class _TabRow extends Row {
   @override
   RenderFlex createRenderObject(BuildContext context) {
     return _RenderTabFlex(
-        direction: Axis.horizontal,
-        mainAxisSize: MainAxisSize.min,
-        mainAxisAlignment: MainAxisAlignment.start,
-        crossAxisAlignment: CrossAxisAlignment.center,
-        textDirection: Directionality.of(context),
-        verticalDirection: VerticalDirection.down,
-        callback: callback);
+      direction: Axis.horizontal,
+      mainAxisSize: MainAxisSize.min,
+      mainAxisAlignment: MainAxisAlignment.start,
+      crossAxisAlignment: CrossAxisAlignment.center,
+      textDirection: Directionality.of(context),
+      verticalDirection: VerticalDirection.down,
+      callback: callback,
+    );
   }
 
   @override
@@ -592,8 +641,11 @@ class _IndicatorPainter extends CustomPainter {
     final Rect toRect = indicatorRect(size, to);
     _currentRect = Rect.lerp(fromRect, toRect, (value - from).abs());
     final Paint paint = Paint()..color = color;
-    final RRect rrect = RRect.fromRectAndCorners(_currentRect!,
-        topLeft: Radius.circular(radius), topRight: Radius.circular(radius));
+    final RRect rrect = RRect.fromRectAndCorners(
+      _currentRect!,
+      topLeft: Radius.circular(radius),
+      topRight: Radius.circular(radius),
+    );
     canvas.drawRRect(rrect, paint);
   }
 
@@ -616,14 +668,17 @@ class TabViewBody extends StatefulWidget {
 }
 
 class _TabViewBodyState extends State<TabViewBody> {
-  late TabController _controller;
+  TabController? _controller;
 
   int _currentIndex = 0;
 
   void updateIndex() {
-    if (_controller.index != _currentIndex) {
+    final controller = _controller;
+    if (controller == null || !mounted) return;
+    final index = _clampIndex(controller.index);
+    if (index != _currentIndex) {
       setState(() {
-        _currentIndex = _controller.index;
+        _currentIndex = index;
       });
     }
   }
@@ -631,19 +686,51 @@ class _TabViewBodyState extends State<TabViewBody> {
   @override
   void didChangeDependencies() {
     super.didChangeDependencies();
-    _controller = widget.controller ?? DefaultTabController.of(context);
-    _currentIndex = _controller.index;
-    _controller.addListener(updateIndex);
+    _attachController(widget.controller ?? DefaultTabController.of(context));
+  }
+
+  @override
+  void didUpdateWidget(covariant TabViewBody oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.controller != widget.controller) {
+      _attachController(widget.controller ?? DefaultTabController.of(context));
+    } else {
+      final clamped = _clampIndex(_currentIndex);
+      if (clamped != _currentIndex) {
+        _currentIndex = clamped;
+      }
+    }
   }
 
   @override
   void dispose() {
+    _controller?.removeListener(updateIndex);
     super.dispose();
-    _controller.removeListener(updateIndex);
+  }
+
+  int _clampIndex(int index) {
+    if (widget.children.isEmpty || index < 0) {
+      return 0;
+    }
+    final maxIndex = widget.children.length - 1;
+    return index > maxIndex ? maxIndex : index;
+  }
+
+  void _attachController(TabController controller) {
+    if (_controller == controller) {
+      return;
+    }
+    _controller?.removeListener(updateIndex);
+    _controller = controller;
+    _currentIndex = _clampIndex(controller.index);
+    controller.addListener(updateIndex);
   }
 
   @override
   Widget build(BuildContext context) {
+    if (widget.children.isEmpty) {
+      return const SizedBox.shrink();
+    }
     return widget.children[_currentIndex];
   }
 }
@@ -656,16 +743,28 @@ class SearchBarController {
   String currentText;
 
   void setText(String text) {
+    currentText = text;
     _state?.setText(text);
   }
 
-  String get text => _state?.getText() ?? '';
+  String get text => _state?.getText() ?? currentText;
 
   set text(String text) {
     setText(text);
   }
 
   SearchBarController({this.onSearch, this.currentText = ''});
+
+  void _attach(_SearchBarMixin state) {
+    _state = state;
+  }
+
+  void _detach(_SearchBarMixin state, String text) {
+    if (_state == state) {
+      currentText = text;
+      _state = null;
+    }
+  }
 }
 
 abstract mixin class _SearchBarMixin {
@@ -704,9 +803,27 @@ class _SliverSearchBarState extends State<SliverSearchBar>
   @override
   void initState() {
     _controller = widget.controller;
-    _controller._state = this;
+    _controller._attach(this);
     _editingController = TextEditingController(text: _controller.currentText);
     super.initState();
+  }
+
+  @override
+  void didUpdateWidget(covariant SliverSearchBar oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.controller != widget.controller) {
+      _controller._detach(this, _editingController.text);
+      _controller = widget.controller;
+      _controller._attach(this);
+      _editingController.text = _controller.currentText;
+    }
+  }
+
+  @override
+  void dispose() {
+    _controller._detach(this, _editingController.text);
+    _editingController.dispose();
+    super.dispose();
   }
 
   @override
@@ -761,7 +878,10 @@ class _SliverSearchBarDelegate extends SliverPersistentHeaderDelegate {
 
   @override
   Widget build(
-      BuildContext context, double shrinkOffset, bool overlapsContent) {
+    BuildContext context,
+    double shrinkOffset,
+    bool overlapsContent,
+  ) {
     return Container(
       height: _kAppBarHeight + topPadding,
       width: double.infinity,
@@ -861,9 +981,27 @@ class _SearchBarState extends State<AppSearchBar> with _SearchBarMixin {
   @override
   void initState() {
     _controller = widget.controller;
-    _controller._state = this;
+    _controller._attach(this);
     _editingController = TextEditingController(text: _controller.currentText);
     super.initState();
+  }
+
+  @override
+  void didUpdateWidget(covariant AppSearchBar oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.controller != widget.controller) {
+      _controller._detach(this, _editingController.text);
+      _controller = widget.controller;
+      _controller._attach(this);
+      _editingController.text = _controller.currentText;
+    }
+  }
+
+  @override
+  void dispose() {
+    _controller._detach(this, _editingController.text);
+    _editingController.dispose();
+    super.dispose();
   }
 
   @override

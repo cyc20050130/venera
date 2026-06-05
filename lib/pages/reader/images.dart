@@ -25,8 +25,8 @@ class _ReaderImagesState extends State<_ReaderImages> {
 
   @override
   void dispose() {
-    super.dispose();
     ImageDownloader.cancelAllLoadingImages();
+    super.dispose();
   }
 
   /// Handle jumping to last page when _jumpToLastPageOnLoad is true
@@ -34,6 +34,11 @@ class _ReaderImagesState extends State<_ReaderImages> {
     if (reader._jumpToLastPageOnLoad) {
       reader._page = math.max(1, reader.maxPage);
       reader._jumpToLastPageOnLoad = false;
+    } else {
+      reader._page = normalizeReaderPageForLoadedImages(
+        page: reader._page,
+        maxPage: reader.maxPage,
+      );
     }
   }
 
@@ -343,9 +348,11 @@ class _GalleryModeState extends State<_GalleryMode>
     implements _ImageViewController {
   late PageController controller;
 
-  int get preCacheCount => appdata.settings["preloadImageCount"];
+  int get preCacheCount =>
+      appdata.settings.intValue("preloadImageCount", fallback: 4, min: 0);
 
   var photoViewControllers = <int, PhotoViewController>{};
+  final Map<int, bool> _cachedPageWithDecode = {};
 
   late _ReaderState reader;
 
@@ -400,6 +407,21 @@ class _GalleryModeState extends State<_GalleryMode>
     super.initState();
   }
 
+  @override
+  void dispose() {
+    keyRepeatTimer?.cancel();
+    keyRepeatTimer = null;
+    controller.dispose();
+    for (final controller in photoViewControllers.values) {
+      controller.dispose();
+    }
+    photoViewControllers.clear();
+    if (reader._imageViewController == this) {
+      reader._imageViewController = null;
+    }
+    super.dispose();
+  }
+
   /// Get the range of images for the given page. [page] is 1-based.
   (int start, int end) getPageImagesRange(int page) {
     var imagesPerPage = reader.imagesPerPage;
@@ -443,6 +465,7 @@ class _GalleryModeState extends State<_GalleryMode>
   }
 
   void _scheduleCache(int startPage) {
+    final actions = <VoidCallback>[];
     for (int i = startPage - 1; i <= startPage + preCacheCount; i++) {
       if (i == startPage ||
           i <= 0 ||
@@ -450,17 +473,27 @@ class _GalleryModeState extends State<_GalleryMode>
           isChapterCommentsPage(i)) {
         continue;
       }
-      _cachePage(i, i == startPage + 1 || i == startPage - 1);
+      _cachePage(i, i == startPage + 1 || i == startPage - 1, actions);
     }
+    _scheduleReaderCacheActions(context, actions);
   }
 
-  void _cachePage(int page, bool shouldPreCache) {
+  void _cachePage(int page, bool shouldPreCache, List<VoidCallback> actions) {
     if (isChapterCommentsPage(page)) return;
+    final hasDecodedCache = _cachedPageWithDecode[page];
+    if (hasDecodedCache == true ||
+        (hasDecodedCache == false && !shouldPreCache)) {
+      return;
+    }
+    _cachedPageWithDecode[page] = shouldPreCache || hasDecodedCache == true;
     var (startIndex, endIndex) = getPageImagesRange(page);
     for (int i = startIndex; i < endIndex; i++) {
-      shouldPreCache
-          ? _precacheImage(i + 1, context)
-          : _preDownloadImage(i + 1, context);
+      final imagePage = i + 1;
+      actions.add(
+        () => shouldPreCache
+            ? _precacheImage(imagePage, context)
+            : _preDownloadImage(imagePage, context),
+      );
     }
   }
 
@@ -485,14 +518,17 @@ class _GalleryModeState extends State<_GalleryMode>
         fingers++;
       },
       onPointerUp: (event) {
-        fingers--;
+        fingers = readerPointerCountAfterPointerEnd(fingers);
       },
       onPointerCancel: (event) {
-        fingers--;
+        fingers = readerPointerCountAfterPointerEnd(fingers);
       },
       onPointerMove: (event) {
         if (isLongPressing) {
-          var controller = photoViewControllers[reader.page]!;
+          var controller = photoViewControllers[reader.page];
+          if (controller == null) {
+            return;
+          }
           Offset value = event.delta;
           if (isLongPressing) {
             controller.updateMultiple(position: controller.position + value);
@@ -600,7 +636,7 @@ class _GalleryModeState extends State<_GalleryMode>
           var keys = photoViewControllers.keys.toList();
           for (var key in keys) {
             if (key != i) {
-              photoViewControllers.remove(key);
+              photoViewControllers.remove(key)?.dispose();
             }
           }
         },
@@ -683,8 +719,12 @@ class _GalleryModeState extends State<_GalleryMode>
 
   @override
   Future<void> animateToPage(int page) {
-    if ((page - controller.page!.round()).abs() > 1) {
-      controller.jumpToPage(page > controller.page! ? page - 1 : page + 1);
+    if (!mounted || !controller.hasClients) {
+      return Future.value();
+    }
+    final currentPage = controller.page ?? controller.initialPage.toDouble();
+    if ((page - currentPage.round()).abs() > 1) {
+      controller.jumpToPage(page > currentPage ? page - 1 : page + 1);
     }
     return controller.animateToPage(
       page,
@@ -695,6 +735,9 @@ class _GalleryModeState extends State<_GalleryMode>
 
   @override
   void toPage(int page) {
+    if (!mounted || !controller.hasClients) {
+      return;
+    }
     controller.jumpToPage(page);
   }
 
@@ -704,17 +747,28 @@ class _GalleryModeState extends State<_GalleryMode>
       context.readerScaffold.addImageFavorite();
       return;
     }
-    var controller = photoViewControllers[reader.page]!;
+    var controller = photoViewControllers[reader.page];
+    if (controller == null) {
+      return;
+    }
     controller.onDoubleClick?.call();
   }
 
   @override
   void handleLongPressDown(Offset location) {
-    if (!appdata.settings['enableLongPressToZoom'] || fingers != 1) {
+    if (!shouldEnableReaderLongPressZoom(
+          appdata.settings['enableLongPressToZoom'],
+        ) ||
+        fingers != 1) {
       return;
     }
-    var photoViewController = photoViewControllers[reader.page]!;
-    double target = photoViewController.getInitialScale!.call()! * 1.75;
+    var photoViewController = photoViewControllers[reader.page];
+    final target = computeReaderZoomInScale(
+      photoViewController?.getInitialScale?.call(),
+    );
+    if (photoViewController == null || target == null) {
+      return;
+    }
     var size = reader.size;
     Offset zoomPosition;
     if (appdata.settings['longPressZoomPosition'] != 'center') {
@@ -731,12 +785,19 @@ class _GalleryModeState extends State<_GalleryMode>
 
   @override
   void handleLongPressUp(Offset location) {
-    if (!appdata.settings['enableLongPressToZoom'] || !isLongPressing) {
+    if (!shouldEnableReaderLongPressZoom(
+          appdata.settings['enableLongPressToZoom'],
+        ) ||
+        !isLongPressing) {
       return;
     }
-    var photoViewController = photoViewControllers[reader.page]!;
-    double target = photoViewController.getInitialScale!.call()!;
-    photoViewController.animateScale?.call(target);
+    var photoViewController = photoViewControllers[reader.page];
+    final target = normalizeReaderInitialScale(
+      photoViewController?.getInitialScale?.call(),
+    );
+    if (photoViewController != null && target != null) {
+      photoViewController.animateScale?.call(target);
+    }
     isLongPressing = false;
   }
 
@@ -808,7 +869,7 @@ class _GalleryModeState extends State<_GalleryMode>
     var imageKey = getImageKeyByOffset(offset);
     if (imageKey == null) return null;
     if (imageKey.startsWith("file://")) {
-      return await File(imageKey.substring(7)).readAsBytes();
+      return await File(localFilePathFromUri(imageKey)).readAsBytes();
     } else {
       return (await CacheManager().findCache(
         "$imageKey@${context.reader.type.sourceKey}@${context.reader.cid}@${context.reader.eid}",
@@ -878,7 +939,8 @@ class _ContinuousModeState extends State<_ContinuousMode>
 
   late List<bool> cached;
 
-  int get preCacheCount => appdata.settings["preloadImageCount"];
+  int get preCacheCount =>
+      appdata.settings.intValue("preloadImageCount", fallback: 4, min: 0);
 
   bool isActivelyScrolling = false;
 
@@ -909,10 +971,19 @@ class _ContinuousModeState extends State<_ContinuousMode>
   @override
   void dispose() {
     itemPositionsListener.itemPositions.removeListener(onPositionChanged);
+    _scrollController?.removeListener(onScroll);
+    _scrollController = null;
+    photoViewController.dispose();
+    if (reader._imageViewController == this) {
+      reader._imageViewController = null;
+    }
     super.dispose();
   }
 
   void onPositionChanged() {
+    if (!mounted) {
+      return;
+    }
     if (itemPositionsListener.itemPositions.value.isEmpty) {
       return;
     }
@@ -964,6 +1035,9 @@ class _ContinuousModeState extends State<_ContinuousMode>
     scrollController
         .animateTo(_futurePosition!, duration: duration, curve: Curves.linear)
         .then((_) {
+          if (!mounted || !scrollController.hasClients) {
+            return;
+          }
           var current = scrollController.position.pixels;
           if (current == target && current == _futurePosition) {
             _futurePosition = null;
@@ -994,12 +1068,15 @@ class _ContinuousModeState extends State<_ContinuousMode>
   }
 
   void _scheduleCacheImages(int current) {
+    final actions = <VoidCallback>[];
     for (int i = current + 1; i <= current + preCacheCount; i++) {
       if (i <= reader.maxPage && !cached[i]) {
-        _preDownloadImage(i, context);
+        final imagePage = i;
+        actions.add(() => _preDownloadImage(imagePage, context));
         cached[i] = true;
       }
     }
+    _scheduleReaderCacheActions(context, actions);
   }
 
   void onScroll() {
@@ -1113,7 +1190,7 @@ class _ContinuousModeState extends State<_ContinuousMode>
         }
       },
       onPointerUp: (event) {
-        fingers--;
+        fingers = readerPointerCountAfterPointerEnd(fingers);
         if (fingers <= 1 && disableScroll) {
           setState(() {
             disableScroll = false;
@@ -1130,7 +1207,7 @@ class _ContinuousModeState extends State<_ContinuousMode>
         }
       },
       onPointerCancel: (event) {
-        fingers--;
+        fingers = readerPointerCountAfterPointerEnd(fingers);
         if (fingers <= 1 && disableScroll) {
           setState(() {
             disableScroll = false;
@@ -1230,7 +1307,7 @@ class _ContinuousModeState extends State<_ContinuousMode>
     );
     var width = reader.size.width;
     var height = reader.size.height;
-    if (appdata.settings['limitImageWidth'] &&
+    if (shouldLimitReaderImageWidth(appdata.settings['limitImageWidth']) &&
         width / height > 0.7 &&
         reader.mode == ReaderMode.continuousTopToBottom) {
       width = height * 0.7;
@@ -1270,6 +1347,9 @@ class _ContinuousModeState extends State<_ContinuousMode>
 
   @override
   Future<void> animateToPage(int page) {
+    if (!mounted || !itemScrollController.isAttached) {
+      return Future.value();
+    }
     return itemScrollController.scrollTo(
       index: page,
       duration: const Duration(milliseconds: 200),
@@ -1283,12 +1363,12 @@ class _ContinuousModeState extends State<_ContinuousMode>
       context.readerScaffold.addImageFavorite();
       return;
     }
-    double target;
-    if (photoViewController.scale !=
-        photoViewController.getInitialScale?.call()) {
-      target = photoViewController.getInitialScale!.call()!;
-    } else {
-      target = photoViewController.getInitialScale!.call()! * 1.75;
+    final target = computeReaderDoubleTapZoomTarget(
+      currentScale: photoViewController.scale,
+      initialScale: photoViewController.getInitialScale?.call(),
+    );
+    if (target == null) {
+      return;
     }
     var size = MediaQuery.of(context).size;
     photoViewController.animateScale?.call(
@@ -1300,10 +1380,18 @@ class _ContinuousModeState extends State<_ContinuousMode>
 
   @override
   void handleLongPressDown(Offset location) {
-    if (!appdata.settings['enableLongPressToZoom'] || isActivelyScrolling) {
+    if (!shouldEnableReaderLongPressZoom(
+          appdata.settings['enableLongPressToZoom'],
+        ) ||
+        isActivelyScrolling) {
       return;
     }
-    double target = photoViewController.getInitialScale!.call()! * 1.75;
+    final target = computeReaderZoomInScale(
+      photoViewController.getInitialScale?.call(),
+    );
+    if (target == null) {
+      return;
+    }
     var size = reader.size;
     Offset zoomPosition;
     if (appdata.settings['longPressZoomPosition'] != 'center') {
@@ -1321,17 +1409,26 @@ class _ContinuousModeState extends State<_ContinuousMode>
 
   @override
   void handleLongPressUp(Offset location) {
-    if (!appdata.settings['enableLongPressToZoom']) {
+    if (!shouldEnableReaderLongPressZoom(
+      appdata.settings['enableLongPressToZoom'],
+    )) {
       return;
     }
-    double target = photoViewController.getInitialScale!.call()!;
-    photoViewController.animateScale?.call(target);
-    onScaleUpdate(target);
+    final target = normalizeReaderInitialScale(
+      photoViewController.getInitialScale?.call(),
+    );
+    if (target != null) {
+      photoViewController.animateScale?.call(target);
+      onScaleUpdate(target);
+    }
     isLongPressing = false;
   }
 
   @override
   void toPage(int page) {
+    if (!mounted || !itemScrollController.isAttached) {
+      return;
+    }
     itemScrollController.jumpTo(index: page);
     _futurePosition = null;
   }
@@ -1371,6 +1468,9 @@ class _ContinuousModeState extends State<_ContinuousMode>
         event.logicalKey == LogicalKeyboardKey.arrowRight) {
       forward = false;
     }
+    if (!scrollController.hasClients) {
+      return;
+    }
     if (forward == true) {
       scrollController.animateTo(
         scrollController.offset + context.height * 0.25,
@@ -1399,7 +1499,7 @@ class _ContinuousModeState extends State<_ContinuousMode>
     var imageKey = getImageKeyByOffset(offset);
     if (imageKey == null) return null;
     if (imageKey.startsWith("file://")) {
-      return await File(imageKey.substring(7)).readAsBytes();
+      return await File(localFilePathFromUri(imageKey)).readAsBytes();
     } else {
       return (await CacheManager().findCache(
         "$imageKey@${context.reader.type.sourceKey}@${context.reader.cid}@${context.reader.eid}",
@@ -1441,7 +1541,7 @@ ImageProvider _createImageProviderFromKey(
     reader.type.comicSource?.key,
     reader.cid,
     reader.eid,
-    reader.page,
+    page,
     loadPriority: loadPriority,
     enableResize: reader
         .mode
@@ -1476,14 +1576,23 @@ void _precacheImage(int page, BuildContext context) {
       priority: ReaderImageLoadPriority.sameChapterPrefetch,
     );
   }
-  precacheImage(
-    _createImageProviderFromKey(
-      imageKey,
+  unawaited(
+    precacheImage(
+      _createImageProviderFromKey(
+        imageKey,
+        context,
+        page,
+        loadPriority: ReaderImageLoadPriority.sameChapterPrefetch,
+      ),
       context,
-      page,
-      loadPriority: ReaderImageLoadPriority.sameChapterPrefetch,
+      onError: (error, stackTrace) {
+        Log.error(
+          "Reader",
+          "Failed to precache image $page: $error",
+          stackTrace,
+        );
+      },
     ),
-    context,
   );
 }
 
@@ -1508,6 +1617,46 @@ void _preDownloadImage(int page, BuildContext context) {
     eid,
     priority: ReaderImageLoadPriority.sameChapterPrefetch,
   );
+}
+
+const int _kReaderCacheActionsPerFrame = 2;
+
+void _scheduleReaderCacheActions(
+  BuildContext context,
+  List<VoidCallback> actions,
+) {
+  if (actions.isEmpty) {
+    return;
+  }
+  final quietRemaining = ImageDownloader.readerLifecycleQuietRemaining;
+  if (quietRemaining > Duration.zero) {
+    Timer(quietRemaining, () {
+      if (context.mounted) {
+        _scheduleReaderCacheActions(context, actions);
+      }
+    });
+    return;
+  }
+
+  var index = 0;
+  void runBatch() {
+    if (!context.mounted) {
+      return;
+    }
+    final end = math.min(index + _kReaderCacheActionsPerFrame, actions.length);
+    for (; index < end; index++) {
+      actions[index]();
+    }
+    if (index < actions.length) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        runBatch();
+      });
+    }
+  }
+
+  WidgetsBinding.instance.addPostFrameCallback((_) {
+    runBatch();
+  });
 }
 
 class _SwipeChangeChapterProgress extends StatefulWidget {
@@ -1556,15 +1705,19 @@ class _SwipeChangeChapterProgressState
 
   @override
   void dispose() {
-    super.dispose();
     controller?.removeListener(onScroll);
+    super.dispose();
   }
 
   void onScroll() {
-    var position = controller!.position.pixels;
+    final scrollController = controller;
+    if (!mounted || scrollController == null || !scrollController.hasClients) {
+      return;
+    }
+    var position = scrollController.position.pixels;
     var offset = isPrev
-        ? controller!.position.minScrollExtent - position
-        : position - controller!.position.maxScrollExtent;
+        ? scrollController.position.minScrollExtent - position
+        : position - scrollController.position.maxScrollExtent;
     var newValue = offset / _kChangeChapterOffset;
     newValue = newValue.clamp(0.0, 1.0);
     if (newValue != value) {

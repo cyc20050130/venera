@@ -6,6 +6,7 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:venera/foundation/app.dart';
 import 'package:venera/foundation/comic_source/comic_source.dart';
+import 'package:venera/foundation/log.dart';
 import 'package:window_manager/window_manager.dart';
 
 const _kTitleBarHeight = 36.0;
@@ -49,6 +50,13 @@ class WindowFrame extends StatefulWidget {
   static WindowFrameController of(BuildContext context) {
     return context.dependOnInheritedWidgetOfExactType<WindowFrameController>()!;
   }
+
+  static WindowFrameController? maybeOf(BuildContext context) {
+    return context
+            .getElementForInheritedWidgetOfExactType<WindowFrameController>()
+            ?.widget
+        as WindowFrameController?;
+  }
 }
 
 typedef WindowCloseListener = bool Function();
@@ -60,6 +68,7 @@ class _WindowFrameState extends State<WindowFrame> {
 
   /// Sets the visibility of the window frame.
   void setWindowFrame(bool show) {
+    if (!mounted) return;
     setState(() {
       isWindowFrameHidden = !show;
     });
@@ -109,55 +118,57 @@ class _WindowFrameState extends State<WindowFrame> {
             child: Material(
               color: Colors.transparent,
               child: Theme(
-                data: Theme.of(context).copyWith(
-                  brightness: useDarkTheme ? Brightness.dark : null,
-                ),
-                child: Builder(builder: (context) {
-                  return SizedBox(
-                    height: _kTitleBarHeight,
-                    child: Row(
-                      children: [
-                        if (App.isMacOS)
-                          const DragToMoveArea(
-                            child: SizedBox(
-                              height: double.infinity,
-                              width: 16,
-                            ),
-                          ).paddingRight(52)
-                        else
-                          const SizedBox(width: 12),
-                        Expanded(
-                          child: DragToMoveArea(
-                            child: Text(
-                              'Venera',
-                              style: TextStyle(
-                                fontSize: 13,
-                                color: (useDarkTheme ||
-                                        context.brightness == Brightness.dark)
-                                    ? Colors.white
-                                    : Colors.black,
+                data: Theme.of(
+                  context,
+                ).copyWith(brightness: useDarkTheme ? Brightness.dark : null),
+                child: Builder(
+                  builder: (context) {
+                    return SizedBox(
+                      height: _kTitleBarHeight,
+                      child: Row(
+                        children: [
+                          if (App.isMacOS)
+                            const DragToMoveArea(
+                              child: SizedBox(
+                                height: double.infinity,
+                                width: 16,
                               ),
-                            )
-                                .toAlign(Alignment.centerLeft)
-                                .paddingLeft(4 + (App.isMacOS ? 25 : 0)),
+                            ).paddingRight(52)
+                          else
+                            const SizedBox(width: 12),
+                          Expanded(
+                            child: DragToMoveArea(
+                              child:
+                                  Text(
+                                        'Venera',
+                                        style: TextStyle(
+                                          fontSize: 13,
+                                          color:
+                                              (useDarkTheme ||
+                                                  context.brightness ==
+                                                      Brightness.dark)
+                                              ? Colors.white
+                                              : Colors.black,
+                                        ),
+                                      )
+                                      .toAlign(Alignment.centerLeft)
+                                      .paddingLeft(4 + (App.isMacOS ? 25 : 0)),
+                            ),
                           ),
-                        ),
-                        if (kDebugMode)
-                          const TextButton(
-                            onPressed: debug,
-                            child: Text('Debug'),
-                          ),
-                        if (!App.isMacOS)
-                          _WindowButtons(
-                            onClose: _onClose,
-                          )
-                      ],
-                    ),
-                  );
-                }),
+                          if (kDebugMode)
+                            const TextButton(
+                              onPressed: debug,
+                              child: Text('Debug'),
+                            ),
+                          if (!App.isMacOS) _WindowButtons(onClose: _onClose),
+                        ],
+                      ),
+                    );
+                  },
+                ),
               ),
             ),
-          )
+          ),
       ],
     );
 
@@ -189,15 +200,16 @@ class _WindowButtonsState extends State<_WindowButtons> with WindowListener {
 
   @override
   void initState() {
+    super.initState();
     windowManager.addListener(this);
     windowManager.isMaximized().then((value) {
-      if (value) {
+      if (!mounted) return;
+      if (value != isMaximized) {
         setState(() {
-          isMaximized = true;
+          isMaximized = value;
         });
       }
     });
-    super.initState();
   }
 
   @override
@@ -208,6 +220,7 @@ class _WindowButtonsState extends State<_WindowButtons> with WindowListener {
 
   @override
   void onWindowMaximize() {
+    if (!mounted) return;
     setState(() {
       isMaximized = true;
     });
@@ -216,6 +229,7 @@ class _WindowButtonsState extends State<_WindowButtons> with WindowListener {
 
   @override
   void onWindowUnmaximize() {
+    if (!mounted) return;
     setState(() {
       isMaximized = false;
     });
@@ -247,9 +261,7 @@ class _WindowButtonsState extends State<_WindowButtons> with WindowListener {
           ),
           if (isMaximized)
             WindowButton(
-              icon: RestoreIcon(
-                color: color,
-              ),
+              icon: RestoreIcon(color: color),
               hoverColor: hoverColor,
               onPressed: () {
                 windowManager.unmaximize();
@@ -257,24 +269,18 @@ class _WindowButtonsState extends State<_WindowButtons> with WindowListener {
             )
           else
             WindowButton(
-              icon: MaximizeIcon(
-                color: color,
-              ),
+              icon: MaximizeIcon(color: color),
               hoverColor: hoverColor,
               onPressed: () {
                 windowManager.maximize();
               },
             ),
           WindowButton(
-            icon: CloseIcon(
-              color: color,
-            ),
-            hoverIcon: CloseIcon(
-              color: !dark ? Colors.white : Colors.black,
-            ),
+            icon: CloseIcon(color: color),
+            hoverIcon: CloseIcon(color: !dark ? Colors.white : Colors.black),
             hoverColor: Colors.red,
             onPressed: widget.onClose,
-          )
+          ),
         ],
       ),
     );
@@ -282,12 +288,13 @@ class _WindowButtonsState extends State<_WindowButtons> with WindowListener {
 }
 
 class WindowButton extends StatefulWidget {
-  const WindowButton(
-      {required this.icon,
-      required this.onPressed,
-      required this.hoverColor,
-      this.hoverIcon,
-      super.key});
+  const WindowButton({
+    required this.icon,
+    required this.onPressed,
+    required this.hoverColor,
+    this.hoverIcon,
+    super.key,
+  });
 
   final Widget icon;
 
@@ -318,8 +325,9 @@ class _WindowButtonState extends State<WindowButton> {
         child: Container(
           width: 46,
           height: double.infinity,
-          decoration:
-              BoxDecoration(color: isHovering ? widget.hoverColor : null),
+          decoration: BoxDecoration(
+            color: isHovering ? widget.hoverColor : null,
+          ),
           child: isHovering ? widget.hoverIcon ?? widget.icon : widget.icon,
         ),
       ),
@@ -372,10 +380,7 @@ class _MaximizePainter extends _IconPainter {
 class RestoreIcon extends StatelessWidget {
   final Color color;
 
-  const RestoreIcon({
-    super.key,
-    required this.color,
-  });
+  const RestoreIcon({super.key, required this.color});
 
   @override
   Widget build(BuildContext context) => _AlignedPaint(_RestorePainter(color));
@@ -391,9 +396,15 @@ class _RestorePainter extends _IconPainter {
     canvas.drawLine(const Offset(2, 2), const Offset(2, 0), p);
     canvas.drawLine(const Offset(2, 0), Offset(size.width, 0), p);
     canvas.drawLine(
-        Offset(size.width, 0), Offset(size.width, size.height - 2), p);
-    canvas.drawLine(Offset(size.width, size.height - 2),
-        Offset(size.width - 2, size.height - 2), p);
+      Offset(size.width, 0),
+      Offset(size.width, size.height - 2),
+      p,
+    );
+    canvas.drawLine(
+      Offset(size.width, size.height - 2),
+      Offset(size.width - 2, size.height - 2),
+      p,
+    );
   }
 }
 
@@ -414,7 +425,10 @@ class _MinimizePainter extends _IconPainter {
   void paint(Canvas canvas, Size size) {
     Paint p = getPaint(color);
     canvas.drawLine(
-        Offset(0, size.height / 2), Offset(size.width, size.height / 2), p);
+      Offset(0, size.height / 2),
+      Offset(size.width, size.height / 2),
+      p,
+    );
   }
 }
 
@@ -436,8 +450,9 @@ class _AlignedPaint extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return Align(
-        alignment: Alignment.center,
-        child: CustomPaint(size: const Size(10, 10), painter: painter));
+      alignment: Alignment.center,
+      child: CustomPaint(size: const Size(10, 10), painter: painter),
+    );
   }
 }
 
@@ -468,13 +483,15 @@ class WindowPlacement {
 
   Future<void> writeToFile() async {
     var file = File("${App.dataPath}/window_placement");
-    await file.writeAsString(jsonEncode({
-      'width': rect.width,
-      'height': rect.height,
-      'x': rect.topLeft.dx,
-      'y': rect.topLeft.dy,
-      'isMaximized': isMaximized
-    }));
+    await file.writeAsString(
+      jsonEncode({
+        'width': rect.width,
+        'height': rect.height,
+        'x': rect.topLeft.dx,
+        'y': rect.topLeft.dy,
+        'isMaximized': isMaximized,
+      }),
+    );
   }
 
   static Future<WindowPlacement> loadFromFile() async {
@@ -483,13 +500,41 @@ class WindowPlacement {
       if (!file.existsSync()) {
         return defaultPlacement;
       }
-      var json = jsonDecode(await file.readAsString());
-      var rect =
-          Rect.fromLTWH(json['x'], json['y'], json['width'], json['height']);
-      return WindowPlacement(rect, json['isMaximized']);
+      return normalizeStoredPlacement(jsonDecode(await file.readAsString()));
     } catch (e) {
       return defaultPlacement;
     }
+  }
+
+  @visibleForTesting
+  static WindowPlacement normalizeStoredPlacement(Object? value) {
+    if (value is! Map) {
+      return defaultPlacement;
+    }
+    final x = _storedPlacementDouble(value['x']);
+    final y = _storedPlacementDouble(value['y']);
+    final width = _storedPlacementDouble(value['width']);
+    final height = _storedPlacementDouble(value['height']);
+    if (x == null || y == null || width == null || height == null) {
+      return defaultPlacement;
+    }
+    final rect = Rect.fromLTWH(x, y, width, height);
+    if (!validate(rect)) {
+      return defaultPlacement;
+    }
+    return WindowPlacement(rect, value['isMaximized'] == true);
+  }
+
+  static double? _storedPlacementDouble(Object? value) {
+    final number = value is num
+        ? value.toDouble()
+        : value is String
+        ? double.tryParse(value)
+        : null;
+    if (number == null || !number.isFinite) {
+      return null;
+    }
+    return number;
   }
 
   static Rect? lastValidRect;
@@ -505,34 +550,63 @@ class WindowPlacement {
     return WindowPlacement(rect, isMaximized);
   }
 
-  static const defaultPlacement =
-      WindowPlacement(Rect.fromLTWH(10, 10, 900, 600), false);
+  static const defaultPlacement = WindowPlacement(
+    Rect.fromLTWH(10, 10, 900, 600),
+    false,
+  );
 
   static WindowPlacement cache = defaultPlacement;
 
   static Timer? timer;
 
+  static bool _isWriting = false;
+
+  @visibleForTesting
+  static bool isPlacementChanged(WindowPlacement a, WindowPlacement b) {
+    return a.rect != b.rect || a.isMaximized != b.isMaximized;
+  }
+
   static void loop() async {
     timer ??= Timer.periodic(const Duration(milliseconds: 100), (timer) async {
-      var placement = await WindowPlacement.current;
-      if (placement.rect != cache.rect ||
-          placement.isMaximized != cache.isMaximized) {
-        cache = placement;
-        await placement.writeToFile();
+      if (_isWriting) {
+        return;
+      }
+      _isWriting = true;
+      try {
+        var placement = await WindowPlacement.current;
+        if (isPlacementChanged(placement, cache)) {
+          cache = placement;
+          await placement.writeToFile();
+        }
+      } catch (e, s) {
+        Log.error("WindowFrame", "Failed to persist window placement: $e", s);
+      } finally {
+        _isWriting = false;
       }
     });
   }
 
+  @visibleForTesting
+  static void stopLoopForTesting() {
+    timer?.cancel();
+    timer = null;
+    _isWriting = false;
+  }
+
   static bool validate(Rect rect) {
-    return rect.topLeft.dx >= 0 && rect.topLeft.dy >= 0;
+    return rect.left.isFinite &&
+        rect.top.isFinite &&
+        rect.width.isFinite &&
+        rect.height.isFinite &&
+        rect.left >= 0 &&
+        rect.top >= 0 &&
+        rect.width > 0 &&
+        rect.height > 0;
   }
 }
 
 class VirtualWindowFrame extends StatefulWidget {
-  const VirtualWindowFrame({
-    super.key,
-    required this.child,
-  });
+  const VirtualWindowFrame({super.key, required this.child});
 
   /// The [child] contained by the VirtualWindowFrame.
   final Widget child;
@@ -568,7 +642,7 @@ class _VirtualWindowFrameState extends State<VirtualWindowFrame>
           BoxShadow(
             color: Colors.black.toOpacity(_isFocused ? 0.4 : 0.2),
             blurRadius: 4,
-          )
+          ),
         ],
       ),
       clipBehavior: Clip.antiAlias,
@@ -589,6 +663,7 @@ class _VirtualWindowFrameState extends State<VirtualWindowFrame>
 
   @override
   void onWindowFocus() {
+    if (!mounted) return;
     setState(() {
       _isFocused = true;
     });
@@ -596,6 +671,7 @@ class _VirtualWindowFrameState extends State<VirtualWindowFrame>
 
   @override
   void onWindowBlur() {
+    if (!mounted) return;
     setState(() {
       _isFocused = false;
     });
@@ -603,6 +679,7 @@ class _VirtualWindowFrameState extends State<VirtualWindowFrame>
 
   @override
   void onWindowMaximize() {
+    if (!mounted) return;
     setState(() {
       _isMaximized = true;
     });
@@ -610,6 +687,7 @@ class _VirtualWindowFrameState extends State<VirtualWindowFrame>
 
   @override
   void onWindowUnmaximize() {
+    if (!mounted) return;
     setState(() {
       _isMaximized = false;
     });
@@ -617,6 +695,7 @@ class _VirtualWindowFrameState extends State<VirtualWindowFrame>
 
   @override
   void onWindowEnterFullScreen() {
+    if (!mounted) return;
     setState(() {
       _isFullScreen = true;
     });
@@ -624,6 +703,7 @@ class _VirtualWindowFrameState extends State<VirtualWindowFrame>
 
   @override
   void onWindowLeaveFullScreen() {
+    if (!mounted) return;
     setState(() {
       _isFullScreen = false;
     });
@@ -633,9 +713,7 @@ class _VirtualWindowFrameState extends State<VirtualWindowFrame>
 // ignore: non_constant_identifier_names
 TransitionBuilder VirtualWindowFrameInit() {
   return (_, Widget? child) {
-    return VirtualWindowFrame(
-      child: child!,
-    );
+    return VirtualWindowFrame(child: child!);
   };
 }
 

@@ -4,6 +4,11 @@ import "package:venera/foundation/app.dart";
 import "package:venera/foundation/comic_source/comic_source.dart";
 import "package:venera/utils/translations.dart";
 
+@visibleForTesting
+String? defaultRankingOptionValue(Map<String, String> options) {
+  return options.keys.firstOrNull;
+}
+
 class RankingPage extends StatefulWidget {
   const RankingPage({required this.categoryKey, super.key});
 
@@ -23,7 +28,7 @@ class _RankingPageState extends State<RankingPage> {
       if (source.categoryData?.key == widget.categoryKey) {
         data = source.categoryComicsData!;
         options = data.rankingData!.options;
-        optionValue = options.keys.first;
+        optionValue = defaultRankingOptionValue(options) ?? "";
         return;
       }
     }
@@ -39,16 +44,25 @@ class _RankingPageState extends State<RankingPage> {
   @override
   Widget build(BuildContext context) {
     var topPadding = context.padding.top + 56;
+    if (options.isEmpty) {
+      return Scaffold(
+        extendBodyBehindAppBar: true,
+        appBar: Appbar(title: Text("Ranking".tl)),
+        body: NetworkError(
+          message: "No ranking options".tl,
+          withAppbar: false,
+        ).paddingTop(topPadding),
+      );
+    }
     return Scaffold(
       extendBodyBehindAppBar: true,
-      appBar: Appbar(
-        title: Text("Ranking".tl),
-      ),
+      appBar: Appbar(title: Text("Ranking".tl)),
       body: ComicList(
         key: Key(optionValue),
         errorLeading: SizedBox(height: topPadding),
-        leadingSliver:
-            buildOptions().sliverPadding(EdgeInsets.only(top: topPadding)),
+        leadingSliver: buildOptions().sliverPadding(
+          EdgeInsets.only(top: topPadding),
+        ),
         loadPage: data.rankingData!.load == null
             ? null
             : (i) => data.rankingData!.load!(optionValue, i),
@@ -74,14 +88,16 @@ class _RankingPageState extends State<RankingPage> {
 
   Widget buildOptions() {
     List<Widget> children = [];
-    children.add(Wrap(
-      spacing: 8,
-      runSpacing: 8,
-      children: [
-        for (var option in options.entries)
-          buildOptionItem(option.value.tl, option.key, context)
-      ],
-    ));
+    children.add(
+      Wrap(
+        spacing: 8,
+        runSpacing: 8,
+        children: [
+          for (var option in options.entries)
+            buildOptionItem(option.value.tl, option.key, context),
+        ],
+      ),
+    );
     return SliverToBoxAdapter(
       child: Column(
         mainAxisSize: MainAxisSize.min,

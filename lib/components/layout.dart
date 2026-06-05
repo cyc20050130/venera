@@ -1,11 +1,12 @@
 part of 'components.dart';
 
 class SliverGridViewWithFixedItemHeight extends StatelessWidget {
-  const SliverGridViewWithFixedItemHeight(
-      {required this.delegate,
-      required this.maxCrossAxisExtent,
-      required this.itemHeight,
-      super.key});
+  const SliverGridViewWithFixedItemHeight({
+    required this.delegate,
+    required this.maxCrossAxisExtent,
+    required this.itemHeight,
+    super.key,
+  });
 
   final SliverChildDelegate delegate;
 
@@ -54,12 +55,13 @@ class SliverGridDelegateWithFixedHeight extends SliverGridDelegate {
       crossItems += 1;
     }
     return SliverGridRegularTileLayout(
-        crossAxisCount: crossItems,
-        mainAxisStride: itemHeight,
-        crossAxisStride: width / crossItems,
-        childMainAxisExtent: itemHeight,
-        childCrossAxisExtent: width / crossItems,
-        reverseCrossAxis: false);
+      crossAxisCount: crossItems,
+      mainAxisStride: itemHeight,
+      crossAxisStride: width / crossItems,
+      childMainAxisExtent: itemHeight,
+      childCrossAxisExtent: width / crossItems,
+      reverseCrossAxis: false,
+    );
   }
 
   @override
@@ -78,41 +80,45 @@ class SliverGridDelegateWithComics extends SliverGridDelegate {
 
   final bool useBriefMode = appdata.settings['comicDisplayMode'] == 'brief';
 
-  final double scale = (appdata.settings['comicTileScale'] as num).toDouble();
+  final double scale = appdata.settings.doubleValue(
+    'comicTileScale',
+    fallback: 1.0,
+    min: 0.75,
+    max: 1.25,
+  );
 
   @override
   SliverGridLayout getLayout(SliverConstraints constraints) {
     if (useBriefMode) {
-      return getBriefModeLayout(
-        constraints,
-        scale,
-      );
+      return getBriefModeLayout(constraints, scale);
     } else {
-      return getDetailedModeLayout(
-        constraints,
-        scale,
-      );
+      return getDetailedModeLayout(constraints, scale);
     }
   }
 
   SliverGridLayout getDetailedModeLayout(
-      SliverConstraints constraints, double scale) {
+    SliverConstraints constraints,
+    double scale,
+  ) {
     const minCrossAxisExtent = 360;
     final itemHeight = 152 * scale;
     final width = constraints.crossAxisExtent;
     var crossItems = width ~/ minCrossAxisExtent;
     crossItems = math.max(1, crossItems);
     return SliverGridRegularTileLayout(
-        crossAxisCount: crossItems,
-        mainAxisStride: itemHeight,
-        crossAxisStride: width / crossItems,
-        childMainAxisExtent: itemHeight,
-        childCrossAxisExtent: width / crossItems,
-        reverseCrossAxis: false);
+      crossAxisCount: crossItems,
+      mainAxisStride: itemHeight,
+      crossAxisStride: width / crossItems,
+      childMainAxisExtent: itemHeight,
+      childCrossAxisExtent: width / crossItems,
+      reverseCrossAxis: false,
+    );
   }
 
   SliverGridLayout getBriefModeLayout(
-      SliverConstraints constraints, double scale) {
+    SliverConstraints constraints,
+    double scale,
+  ) {
     final maxCrossAxisExtent = 192.0 * scale;
     const childAspectRatio = 0.64;
     const crossAxisSpacing = 0.0;
@@ -157,10 +163,7 @@ class SliverLazyToBoxAdapter extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return SliverList.list(children: [
-      SizedBox(),
-      child,
-    ]);
+    return SliverList.list(children: [SizedBox(), child]);
   }
 }
 

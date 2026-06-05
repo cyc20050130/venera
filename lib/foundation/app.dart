@@ -12,8 +12,30 @@ import 'local.dart';
 export "widget_utils.dart";
 export "context.dart";
 
+@visibleForTesting
+Locale? resolveConfiguredLocale(Object? languageSetting) {
+  return switch (languageSetting) {
+    'zh-CN' => const Locale('zh', 'CN'),
+    'zh-TW' => const Locale('zh', 'TW'),
+    'en-US' => const Locale('en', 'US'),
+    'en' => const Locale('en'),
+    _ => null,
+  };
+}
+
+@visibleForTesting
+String resolveAndroidExternalStoragePath(
+  String? externalPath,
+  String dataPath,
+) {
+  if (externalPath == null || externalPath.isEmpty) {
+    return dataPath;
+  }
+  return externalPath;
+}
+
 class _App {
-  final version = "1.6.25";
+  final version = "1.6.26";
 
   bool get isAndroid => Platform.isAndroid;
 
@@ -40,13 +62,8 @@ class _App {
         deviceLocale.scriptCode == "Hant") {
       deviceLocale = const Locale("zh", "TW");
     }
-    if (appdata.settings['language'] != 'system') {
-      return Locale(
-        appdata.settings['language'].split('-')[0],
-        appdata.settings['language'].split('-')[1],
-      );
-    }
-    return deviceLocale;
+    return resolveConfiguredLocale(appdata.settings['language']) ??
+        deviceLocale;
   }
 
   late String dataPath;
@@ -58,6 +75,22 @@ class _App {
   GlobalKey<NavigatorState>? mainNavigatorKey;
 
   BuildContext get rootContext => rootNavigatorKey.currentContext!;
+
+  Future<BuildContext?> waitForMainNavigatorContext({
+    Duration timeout = const Duration(seconds: 2),
+    Duration interval = const Duration(milliseconds: 50),
+  }) async {
+    final deadline = DateTime.now().add(timeout);
+    while (DateTime.now().isBefore(deadline)) {
+      final context = mainNavigatorKey?.currentContext;
+      if (context != null && context.mounted) {
+        return context;
+      }
+      await Future.delayed(interval);
+    }
+    final context = mainNavigatorKey?.currentContext;
+    return context != null && context.mounted ? context : null;
+  }
 
   final Appdata data = appdata;
 
@@ -83,7 +116,10 @@ class _App {
     cachePath = (await getApplicationCacheDirectory()).path;
     dataPath = (await getApplicationSupportDirectory()).path;
     if (isAndroid) {
-      externalStoragePath = (await getExternalStorageDirectory())!.path;
+      externalStoragePath = resolveAndroidExternalStoragePath(
+        (await getExternalStorageDirectory())?.path,
+        dataPath,
+      );
     }
     isInitialized = true;
   }
@@ -97,11 +133,20 @@ class _App {
     ]);
   }
 
-  Function? _forceRebuildHandler;
+  VoidCallback? _forceRebuildHandler;
 
-  void registerForceRebuild(Function handler) {
+  void registerForceRebuild(VoidCallback handler) {
     _forceRebuildHandler = handler;
   }
+
+  void unregisterForceRebuild(VoidCallback handler) {
+    if (identical(_forceRebuildHandler, handler)) {
+      _forceRebuildHandler = null;
+    }
+  }
+
+  @visibleForTesting
+  bool get hasForceRebuildHandler => _forceRebuildHandler != null;
 
   void forceRebuild() {
     _forceRebuildHandler?.call();

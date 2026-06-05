@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:uuid/uuid.dart';
 import 'package:venera/components/components.dart';
 import 'package:venera/foundation/app.dart';
 import 'package:venera/foundation/appdata.dart';
@@ -23,6 +24,14 @@ class LocalComicsPage extends StatefulWidget {
   State<LocalComicsPage> createState() => _LocalComicsPageState();
 }
 
+@visibleForTesting
+LocalSortType normalizeLocalComicsSortType(Object? value) {
+  if (value is String) {
+    return LocalSortType.fromString(value);
+  }
+  return LocalSortType.name;
+}
+
 class _LocalComicsPageState extends State<LocalComicsPage> {
   late List<LocalComic> comics;
 
@@ -37,6 +46,7 @@ class _LocalComicsPageState extends State<LocalComicsPage> {
   Map<LocalComic, bool> selectedComics = {};
 
   void update() {
+    if (!mounted) return;
     if (keyword.isEmpty) {
       setState(() {
         comics = LocalManager().getComics(sortType);
@@ -50,8 +60,7 @@ class _LocalComicsPageState extends State<LocalComicsPage> {
 
   @override
   void initState() {
-    var sort = appdata.implicitData["local_sort"] ?? "name";
-    sortType = LocalSortType.fromString(sort);
+    sortType = normalizeLocalComicsSortType(appdata.implicitData["local_sort"]);
     comics = LocalManager().getComics(sortType);
     LocalManager().addListener(update);
     super.initState();
@@ -121,6 +130,7 @@ class _LocalComicsPageState extends State<LocalComicsPage> {
           text: "Delete".tl,
           onClick: () {
             deleteComics(selectedComics.keys.toList()).then((value) {
+              if (!mounted) return;
               if (value) {
                 setState(() {
                   multiSelectMode = false;
@@ -344,6 +354,7 @@ class _LocalComicsPageState extends State<LocalComicsPage> {
                   text: "Delete".tl,
                   onClick: () {
                     deleteComics([c as LocalComic]).then((value) {
+                      if (!mounted) return;
                       if (value && multiSelectMode) {
                         setState(() {
                           multiSelectMode = false;
@@ -400,13 +411,11 @@ class _LocalComicsPageState extends State<LocalComicsPage> {
                 },
               ),
             FilledButton(
-                onPressed: () {
-                  context.pop();
-                  LocalManager().batchDeleteComicsKeepFavoritesAndHistory(
-                    comics,
-                  );
-                  isDeleted = true;
-                },
+              onPressed: () {
+                context.pop();
+                LocalManager().batchDeleteComicsKeepFavoritesAndHistory(comics);
+                isDeleted = true;
+              },
               child: Text("Confirm".tl),
             ),
           ],
@@ -448,10 +457,12 @@ class _LocalComicsPageState extends State<LocalComicsPage> {
     ExportComicFunc export,
     String ext,
   ) async {
+    final operationId = const Uuid().v4();
     var current = 0;
-    var cacheDir = FilePath.join(App.cachePath, 'comics_export');
-    var outFile = FilePath.join(App.cachePath, 'comics_export.zip');
+    var cacheDir = buildComicsExportDirectory(App.cachePath, operationId);
+    var outFile = buildComicsExportArchivePath(App.cachePath, operationId);
     bool canceled = false;
+    bool archiveReadyForSave = false;
     if (Directory(cacheDir).existsSync()) {
       Directory(cacheDir).deleteSync(recursive: true);
     }
@@ -476,10 +487,15 @@ class _LocalComicsPageState extends State<LocalComicsPage> {
         await export(comic, fileName);
         current++;
         if (comics.length > 1) {
-          loadingController.setMessage(
-            "${"Exporting".tl} $current/${comics.length}",
-          );
-          loadingController.setProgress(current / comics.length);
+          if (shouldApplyLocalComicsExportResult(
+            mounted: mounted,
+            canceled: canceled,
+          )) {
+            loadingController.setMessage(
+              "${"Exporting".tl} $current/${comics.length}",
+            );
+            loadingController.setProgress(current / comics.length);
+          }
         }
         if (canceled) {
           return;
@@ -489,7 +505,6 @@ class _LocalComicsPageState extends State<LocalComicsPage> {
       if (comics.length == 1) {
         await saveFile(file: File(fileName), filename: File(fileName).name);
         Directory(cacheDir).deleteSync(recursive: true);
-        loadingController.close();
         return;
       }
       // For multiple comics, compress the folder
@@ -497,25 +512,59 @@ class _LocalComicsPageState extends State<LocalComicsPage> {
       loadingController.setMessage("Compressing".tl);
       await ZipFile.compressFolderAsync(cacheDir, outFile);
       if (canceled) {
-        File(outFile).deleteIgnoreError();
         return;
       }
+      archiveReadyForSave = true;
     } catch (e, s) {
       Log.error("Export Comics", e, s);
-      context.showMessage(message: e.toString());
-      loadingController.close();
+      if (shouldApplyLocalComicsExportResult(
+        mounted: mounted,
+        canceled: canceled,
+      )) {
+        context.showMessage(message: e.toString());
+      }
       return;
     } finally {
-      Directory(cacheDir).deleteIgnoreError(recursive: true);
+      loadingController.close();
+      await Directory(cacheDir).deleteIgnoreError(recursive: true);
+      if (!archiveReadyForSave) {
+        await File(outFile).deleteIgnoreError();
+      }
     }
-    await saveFile(file: File(outFile), filename: "comics_export.zip");
-    loadingController.close();
-    File(outFile).deleteIgnoreError();
+    try {
+      await saveFile(file: File(outFile), filename: "comics_export.zip");
+    } catch (e, s) {
+      Log.error("Export Comics", "Failed to save exported comics: $e", s);
+      if (shouldApplyLocalComicsExportResult(
+        mounted: mounted,
+        canceled: canceled,
+      )) {
+        context.showMessage(message: e.toString());
+      }
+    } finally {
+      await File(outFile).deleteIgnoreError();
+    }
   }
 }
 
 typedef ExportComicFunc =
     Future<File> Function(LocalComic comic, String outFilePath);
+
+@visibleForTesting
+bool shouldApplyLocalComicsExportResult({
+  required bool mounted,
+  required bool canceled,
+}) {
+  return mounted && !canceled;
+}
+
+@visibleForTesting
+String buildComicsExportDirectory(String cachePath, String operationId) =>
+    FilePath.join(cachePath, 'comics_export-$operationId');
+
+@visibleForTesting
+String buildComicsExportArchivePath(String cachePath, String operationId) =>
+    FilePath.join(cachePath, 'comics_export-$operationId.zip');
 
 /// Opens the folder containing the comic in the system file explorer
 Future<void> openComicFolder(LocalComic comic) async {

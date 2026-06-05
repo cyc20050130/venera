@@ -6,8 +6,38 @@ import 'package:venera/foundation/comic_source/comic_source.dart';
 import 'package:venera/foundation/global_state.dart';
 import 'package:venera/pages/search_page.dart';
 import 'package:venera/utils/ext.dart';
+import 'package:venera/utils/overlay_entry.dart';
 import 'package:venera/utils/tags_translation.dart';
 import 'package:venera/utils/translations.dart';
+
+@visibleForTesting
+String? resolveSearchResultSourceError({
+  required String sourceKey,
+  required SearchPageData? searchPageData,
+}) {
+  if (searchPageData == null) {
+    return 'Search source unavailable: $sourceKey';
+  }
+  if (searchPageData.loadPage == null && searchPageData.loadNext == null) {
+    return 'Search source does not support search: $sourceKey';
+  }
+  return null;
+}
+
+@visibleForTesting
+List<SearchOptions>? resolveSearchSettingsOptions({
+  required String sourceKey,
+  required SearchPageData? searchPageData,
+}) {
+  if (resolveSearchResultSourceError(
+        sourceKey: sourceKey,
+        searchPageData: searchPageData,
+      ) !=
+      null) {
+    return null;
+  }
+  return searchPageData!.searchOptions ?? <SearchOptions>[];
+}
 
 class SearchResultPage extends StatefulWidget {
   const SearchResultPage({
@@ -55,7 +85,11 @@ class _SearchResultPageState extends State<SearchResultPage> {
   }
 
   void onChanged(String s) {
-    if (!ComicSource.find(sourceKey)!.enableTagsSuggestions) {
+    final source = ComicSource.find(sourceKey);
+    if (source == null ||
+        source.searchPageData == null ||
+        !source.enableTagsSuggestions) {
+      suggestionsController.remove();
       return;
     }
     suggestionsController.findSuggestions();
@@ -74,9 +108,7 @@ class _SearchResultPageState extends State<SearchResultPage> {
             right: 0,
             bottom: 0,
             child: Material(
-              child: _Suggestions(
-                controller: suggestionsController,
-              ),
+              child: _Suggestions(controller: suggestionsController),
             ),
           );
         },
@@ -87,9 +119,8 @@ class _SearchResultPageState extends State<SearchResultPage> {
 
   @override
   void dispose() {
-    Future.microtask(() {
-      suggestionsController.remove();
-    });
+    suggestionsController.remove();
+    suggestionsController._state = null;
     super.dispose();
   }
 
@@ -100,10 +131,7 @@ class _SearchResultPageState extends State<SearchResultPage> {
     }
     var searchSource = sourceKey;
     // TODO: Move it to a better place
-    const enabledSources = [
-      'nhentai',
-      'ehentai',
-    ];
+    const enabledSources = ['nhentai', 'ehentai'];
     if (!enabledSources.contains(searchSource)) {
       return text;
     }
@@ -117,10 +145,7 @@ class _SearchResultPageState extends State<SearchResultPage> {
   void initState() {
     sourceKey = widget.sourceKey;
     text = checkAutoLanguage(widget.text);
-    controller = SearchBarController(
-      currentText: text,
-      onSearch: search,
-    );
+    controller = SearchBarController(currentText: text, onSearch: search);
     options = widget.options ?? const [];
     validateOptions();
     appdata.addSearchHistory(text);
@@ -130,10 +155,10 @@ class _SearchResultPageState extends State<SearchResultPage> {
 
   void validateOptions() {
     var source = ComicSource.find(sourceKey);
-    if (source == null) {
-      return;
-    }
-    var searchOptions = source.searchPageData!.searchOptions;
+    var searchOptions = resolveSearchSettingsOptions(
+      sourceKey: sourceKey,
+      searchPageData: source?.searchPageData,
+    );
     if (searchOptions == null) {
       return;
     }
@@ -145,34 +170,31 @@ class _SearchResultPageState extends State<SearchResultPage> {
   @override
   Widget build(BuildContext context) {
     var source = ComicSource.find(sourceKey);
+    final sourceError = resolveSearchResultSourceError(
+      sourceKey: sourceKey,
+      searchPageData: source?.searchPageData,
+    );
+    if (sourceError != null) {
+      return NetworkError(message: sourceError);
+    }
+    final searchPageData = source!.searchPageData!;
     return ComicList(
       key: Key(text + options.toString() + sourceKey),
-      errorLeading: AppSearchBar(
-        controller: controller,
-        action: buildAction(),
-      ),
+      errorLeading: AppSearchBar(controller: controller, action: buildAction()),
       leadingSliver: SliverSearchBar(
         controller: controller,
         onChanged: onChanged,
         action: buildAction(),
       ),
-      loadPage: source!.searchPageData!.loadPage == null
+      loadPage: searchPageData.loadPage == null
           ? null
           : (i) {
-              return source.searchPageData!.loadPage!(
-                text,
-                i,
-                options,
-              );
+              return searchPageData.loadPage!(text, i, options);
             },
-      loadNext: source.searchPageData!.loadNext == null
+      loadNext: searchPageData.loadNext == null
           ? null
           : (i) {
-              return source.searchPageData!.loadNext!(
-                text,
-                i,
-                options,
-              );
+              return searchPageData.loadNext!(text, i, options);
             },
     );
   }
@@ -196,6 +218,7 @@ class _SearchResultPageState extends State<SearchResultPage> {
               return _SearchSettingsDialog(state: this);
             },
           );
+          if (!mounted) return;
           if (!previousOptions.isEqualTo(options) ||
               previousSourceKey != sourceKey) {
             text = checkAutoLanguage(controller.text);
@@ -222,8 +245,10 @@ class _SuggestionsController {
   }
 
   void remove() {
-    entry?.remove();
+    final overlayEntry = entry;
     entry = null;
+    if (overlayEntry == null) return;
+    removeAndDisposeOverlayEntry(overlayEntry);
   }
 
   var suggestions = <Pair<String, TranslationType>>[];
@@ -286,6 +311,7 @@ class _Suggestions extends StatefulWidget {
 
 class _SuggestionsState extends State<_Suggestions> {
   void update() {
+    if (!mounted) return;
     setState(() {});
   }
 
@@ -305,6 +331,14 @@ class _SuggestionsState extends State<_Suggestions> {
   }
 
   @override
+  void dispose() {
+    if (widget.controller._state == this) {
+      widget.controller._state = null;
+    }
+    super.dispose();
+  }
+
+  @override
   Widget build(BuildContext context) {
     return buildSuggestions(context);
   }
@@ -315,34 +349,27 @@ class _SuggestionsState extends State<_Suggestions> {
 
     Widget buildItem(Pair<String, TranslationType> value) {
       var subTitle = TagsTranslation.translationTagWithNamespace(
-          value.left, value.right.name);
+        value.left,
+        value.right.name,
+      );
       return ListTile(
         title: Row(
           mainAxisSize: MainAxisSize.min,
           children: [
-            Expanded(
-              child: Text(
-                value.left,
-                maxLines: 2,
-              ),
-            ),
-            if (!showMethod)
-              const SizedBox(
-                width: 12,
-              ),
+            Expanded(child: Text(value.left, maxLines: 2)),
+            if (!showMethod) const SizedBox(width: 12),
             if (!showMethod && showTranslation)
               Text(
                 subTitle,
                 style: TextStyle(
-                    fontSize: 14, color: Theme.of(context).colorScheme.outline),
-              )
+                  fontSize: 14,
+                  color: Theme.of(context).colorScheme.outline,
+                ),
+              ),
           ],
         ),
         subtitle: (showMethod && showTranslation) ? Text(subTitle) : null,
-        trailing: Text(
-          value.right.name,
-          style: const TextStyle(fontSize: 13),
-        ),
+        trailing: Text(value.right.name, style: const TextStyle(fontSize: 13)),
         onTap: () => onSelected(value.left, value.right),
       );
     }
@@ -370,7 +397,7 @@ class _SuggestionsState extends State<_Suggestions> {
             itemBuilder: (context, index) =>
                 buildItem(widget.controller.suggestions[index]),
           ),
-        )
+        ),
       ],
     );
   }
@@ -394,13 +421,20 @@ class _SuggestionsState extends State<_Suggestions> {
     var controller = widget.controller.controller;
     var words = controller.text.split(" ");
     if (words.length >= 2 &&
-        check("${words[words.length - 2]} ${words[words.length - 1]}", text,
-            text.translateTagsToCN)) {
+        check(
+          "${words[words.length - 2]} ${words[words.length - 1]}",
+          text,
+          text.translateTagsToCN,
+        )) {
       controller.text = controller.text.replaceLast(
-          "${words[words.length - 2]} ${words[words.length - 1]}", "");
+        "${words[words.length - 2]} ${words[words.length - 1]}",
+        "",
+      );
     } else {
-      controller.text =
-          controller.text.replaceLast(words[words.length - 1], "");
+      controller.text = controller.text.replaceLast(
+        words[words.length - 1],
+        "",
+      );
     }
     final source = ComicSource.find(widget.controller.sourceKey);
     String insert;
@@ -446,9 +480,9 @@ class _SearchSettingsDialogState extends State<_SearchSettingsDialog> {
   @override
   Widget build(BuildContext context) {
     var sources = ComicSource.all();
-    var enabled = appdata.settings['searchSources'] as List;
+    var enabled = appdata.settings.stringList('searchSources');
     sources.removeWhere((e) {
-      return !enabled.contains(e.key);
+      return !enabled.contains(e.key) || e.searchPageData == null;
     });
     return ContentDialog(
       title: "Settings".tl,
@@ -469,10 +503,8 @@ class _SearchSettingsDialogState extends State<_SearchSettingsDialog> {
                   setState(() {
                     searchTarget = e.key;
                     options.clear();
-                    final searchOptions = ComicSource.find(searchTarget)!
-                            .searchPageData!
-                            .searchOptions ??
-                        <SearchOptions>[];
+                    final searchOptions =
+                        e.searchPageData?.searchOptions ?? <SearchOptions>[];
                     options = searchOptions.map((e) => e.defaultValue).toList();
                     onChanged();
                   });
@@ -496,9 +528,20 @@ class _SearchSettingsDialogState extends State<_SearchSettingsDialog> {
   Widget buildSearchOptions() {
     var children = <Widget>[];
 
-    final searchOptions =
-        ComicSource.find(searchTarget)!.searchPageData!.searchOptions ??
-            <SearchOptions>[];
+    final searchPageData = ComicSource.find(searchTarget)?.searchPageData;
+    final searchOptions = resolveSearchSettingsOptions(
+      sourceKey: searchTarget,
+      searchPageData: searchPageData,
+    );
+    if (searchOptions == null) {
+      final error = resolveSearchResultSourceError(
+        sourceKey: searchTarget,
+        searchPageData: searchPageData,
+      );
+      return Text(
+        error ?? 'Search source unavailable: $searchTarget',
+      ).paddingHorizontal(16);
+    }
     if (searchOptions.length != options.length) {
       options = searchOptions.map((e) => e.defaultValue).toList();
     }
@@ -507,16 +550,18 @@ class _SearchSettingsDialogState extends State<_SearchSettingsDialog> {
     }
     for (int i = 0; i < searchOptions.length; i++) {
       final option = searchOptions[i];
-      children.add(SearchOptionWidget(
-        option: option,
-        value: options[i],
-        onChanged: (value) {
-          setState(() {
-            options[i] = value;
-          });
-        },
-        sourceKey: searchTarget,
-      ));
+      children.add(
+        SearchOptionWidget(
+          option: option,
+          value: options[i],
+          onChanged: (value) {
+            setState(() {
+              options[i] = value;
+            });
+          },
+          sourceKey: searchTarget,
+        ),
+      );
     }
 
     return Container(

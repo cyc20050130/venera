@@ -155,11 +155,16 @@ class IOSBackGestureController {
 
   final NavigatorState navigator;
 
+  bool _isActive = true;
+
   IOSBackGestureController(this.controller, this.navigator) {
     navigator.didStartUserGesture();
   }
 
   void dragEnd(double velocity) {
+    if (!_isActive) {
+      return;
+    }
     const Curve animationCurve = Curves.fastLinearToSlowEaseIn;
     final bool animateForward;
 
@@ -202,17 +207,35 @@ class IOSBackGestureController {
     if (controller.isAnimating) {
       late AnimationStatusListener animationStatusCallback;
       animationStatusCallback = (status) {
-        navigator.didStopUserGesture();
+        _stopGesture();
         controller.removeStatusListener(animationStatusCallback);
       };
       controller.addStatusListener(animationStatusCallback);
     } else {
-      navigator.didStopUserGesture();
+      _stopGesture();
     }
   }
 
   void dragUpdate(double delta) {
+    if (!_isActive) {
+      return;
+    }
     controller.value -= delta;
+  }
+
+  void cancel() {
+    if (!_isActive) {
+      return;
+    }
+    _stopGesture();
+  }
+
+  void _stopGesture() {
+    if (!_isActive) {
+      return;
+    }
+    _isActive = false;
+    navigator.didStopUserGesture();
   }
 }
 
@@ -254,6 +277,8 @@ class _IOSBackGestureDetectorState extends State<IOSBackGestureDetector> {
 
   @override
   void dispose() {
+    _backGestureController?.cancel();
+    _backGestureController = null;
     _recognizer.dispose();
     super.dispose();
   }
@@ -322,18 +347,26 @@ class _IOSBackGestureDetectorState extends State<IOSBackGestureDetector> {
 
   void _handleDragUpdate(DragUpdateDetails details) {
     if (mounted && _backGestureController != null) {
+      final width = context.size?.width;
+      if (width == null || width <= 0 || details.primaryDelta == null) {
+        return;
+      }
       _backGestureController!.dragUpdate(
-        _convertToLogical(details.primaryDelta! / context.size!.width),
+        _convertToLogical(details.primaryDelta! / width),
       );
     }
   }
 
   void _handleDragEnd(DragEndDetails details) {
     if (mounted && _backGestureController != null) {
+      final width = context.size?.width;
+      if (width == null || width <= 0) {
+        _backGestureController?.dragEnd(0.0);
+        _backGestureController = null;
+        return;
+      }
       _backGestureController!.dragEnd(
-        _convertToLogical(
-          details.velocity.pixelsPerSecond.dx / context.size!.width,
-        ),
+        _convertToLogical(details.velocity.pixelsPerSecond.dx / width),
       );
       _backGestureController = null;
     }

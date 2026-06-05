@@ -27,13 +27,20 @@ class CacheManager {
   int _limitSize = 2 * 1024 * 1024 * 1024;
 
   bool _maintenanceScheduled = false;
+  bool _initialMaintenanceScheduled = false;
   bool _isChecking = false;
   bool _checkPending = false;
+  bool _closed = false;
+  Timer? _initialMaintenanceTimer;
+  Timer? _maintenanceTimer;
   Completer<void>? _checkCompleter;
   late final Future<void> _storeReady;
   Future<void> _maintenanceQueue = Future.value();
+  final Map<String, Future<void>> _writeQueues = <String, Future<void>>{};
+  final Map<String, int> _lastTouchTimes = <String, int>{};
   final Set<String> _pendingManagedPaths = <String>{};
   static const _yieldEvery = 24;
+  static const _touchThrottleDuration = Duration(minutes: 5);
 
   CacheManager._create() {
     _currentSize = 0;
@@ -42,7 +49,6 @@ class CacheManager {
     initStopwatch.stop();
     _logPerf('cache store ready', initStopwatch);
     _storeReady = Future.value();
-    unawaited(_runInitialMaintenance());
   }
 
   /// Get the singleton instance of CacheManager.
@@ -93,12 +99,24 @@ class CacheManager {
   }
 
   Future<void> _runInitialMaintenance() async {
+    if (_closed || CacheManager.instance != this) {
+      return;
+    }
     final stopwatch = Stopwatch()..start();
     try {
       await _enqueueMaintenance(() async {
+        if (_closed || CacheManager.instance != this) {
+          return;
+        }
         final scanResult = await _scanDir(cachePath);
+        if (_closed || CacheManager.instance != this) {
+          return;
+        }
         _currentSize = scanResult.$1;
         await _cleanupUnmanagedFiles(scanResult.$2);
+        if (_closed || CacheManager.instance != this) {
+          return;
+        }
         await _runCheckCache();
       });
     } finally {
@@ -109,6 +127,29 @@ class CacheManager {
         extra: 'currentSize=${_currentSize ?? -1}',
       );
     }
+  }
+
+  void scheduleInitialMaintenance([
+    Duration delay = const Duration(seconds: 3),
+  ]) {
+    if (_closed || _initialMaintenanceScheduled) {
+      return;
+    }
+    _initialMaintenanceScheduled = true;
+    _initialMaintenanceTimer = Timer(delay, () {
+      _initialMaintenanceTimer = null;
+      if (_closed || CacheManager.instance != this) {
+        return;
+      }
+      unawaited(
+        _runInitialMaintenance().catchError((Object e, StackTrace s) {
+          Log.error(
+            "CacheManager",
+            "Initial cache maintenance failed: $e\n$s",
+          );
+        }),
+      );
+    });
   }
 
   static Future<(int, List<String>)> _scanDir(String dir) async {
@@ -157,12 +198,19 @@ class CacheManager {
     final rows = _db.select('SELECT key, dir, name FROM cache;');
     for (var i = 0; i < rows.length; i++) {
       final row = rows[i];
-      final dbFilePath = p.normalize(
-        p.join(cachePath, row["dir"] as String, row["name"] as String),
-      );
+      final key = _cacheRowKey(row);
+      final dbFilePath = _cacheFilePath(row);
+      if (dbFilePath == null) {
+        if (key != null) {
+          _deleteCacheRow(key);
+        }
+        continue;
+      }
       if (!scannedFiles.contains(dbFilePath) &&
           !_pendingManagedPaths.contains(dbFilePath)) {
-        _db.execute('DELETE FROM cache WHERE key = ?;', [row["key"]]);
+        if (key != null) {
+          _deleteCacheRow(key);
+        }
       }
       if ((i + 1) % _yieldEvery == 0) {
         await Future<void>.delayed(Duration.zero);
@@ -175,7 +223,11 @@ class CacheManager {
     int total = 0;
     final rows = _db.select('SELECT dir, name FROM cache;');
     for (final row in rows) {
-      final file = File('$cachePath/${row["dir"]}/${row["name"]}');
+      final filePath = _cacheFilePath(row);
+      if (filePath == null) {
+        continue;
+      }
+      final file = File(filePath);
       if (await file.exists()) {
         total += await file.length();
       }
@@ -189,18 +241,35 @@ class CacheManager {
   }
 
   void scheduleMaintenance([Duration delay = const Duration(seconds: 3)]) {
-    if (_maintenanceScheduled) {
+    if (_closed || _maintenanceScheduled) {
       return;
     }
     _maintenanceScheduled = true;
-    Future.delayed(delay, () async {
+    _maintenanceTimer = Timer(delay, () async {
+      _maintenanceTimer = null;
+      if (_closed || CacheManager.instance != this) {
+        _maintenanceScheduled = false;
+        return;
+      }
       final stopwatch = Stopwatch()..start();
       try {
         await _storeReady;
+        if (_closed || CacheManager.instance != this) {
+          return;
+        }
         await _enqueueMaintenance(() async {
+          if (_closed || CacheManager.instance != this) {
+            return;
+          }
           final scanResult = await _scanDir(cachePath);
+          if (_closed || CacheManager.instance != this) {
+            return;
+          }
           _currentSize = scanResult.$1;
           await _cleanupUnmanagedFiles(scanResult.$2);
+          if (_closed || CacheManager.instance != this) {
+            return;
+          }
           await _runCheckCache();
         });
       } catch (e, s) {
@@ -224,8 +293,58 @@ class CacheManager {
     int duration = 7 * 24 * 60 * 60 * 1000,
   ]) async {
     await _storeReady;
-    await _deleteInternal(key);
+    final previousWrite = _writeQueues[key] ?? Future.value();
+    final currentWrite = _enqueueMaintenance(() async {
+      try {
+        await previousWrite;
+      } catch (_) {
+        // Keep later writes for this key moving after a failed write.
+      }
+      await _writeCacheInternal(key, data, duration);
+    });
+    _writeQueues[key] = currentWrite;
+    try {
+      await currentWrite;
+    } finally {
+      if (_writeQueues[key] == currentWrite) {
+        _writeQueues.remove(key);
+      }
+    }
+  }
+
+  Future<void> _writeCacheInternal(
+    String key,
+    List<int> data,
+    int duration,
+  ) async {
+    final oldRows = _db.select(
+      '''
+      SELECT dir, name
+      FROM cache
+      WHERE key = ?
+    ''',
+      [key],
+    );
+    File? oldFile;
+    int oldFileSize = 0;
+    String? oldFilePath;
+    if (oldRows.isNotEmpty) {
+      final row = oldRows.first;
+      oldFilePath = _cacheFilePath(row);
+      oldFile = oldFilePath == null ? null : File(oldFilePath);
+      try {
+        if (oldFile != null && await oldFile.exists()) {
+          oldFileSize = await oldFile.length();
+        }
+      } catch (_) {
+        oldFileSize = 0;
+      }
+    }
+
     dir = (dir + 1) % 100;
+    if (oldRows.isNotEmpty && oldRows.first["dir"].toString() == '$dir') {
+      dir = (dir + 1) % 100;
+    }
     final currentDir = dir;
     final name = md5.convert(key.codeUnits).toString();
     final filePath = p.normalize('$cachePath/$currentDir/$name');
@@ -247,6 +366,22 @@ class CacheManager {
     } finally {
       _pendingManagedPaths.remove(filePath);
     }
+
+    if (oldFile != null && oldFilePath != filePath) {
+      try {
+        if (await oldFile.exists()) {
+          await oldFile.delete();
+          if (_currentSize != null) {
+            _currentSize = (_currentSize! - oldFileSize).clamp(0, 1 << 62);
+          }
+        }
+      } catch (_) {
+        // The previous cache file can still be held by an image reader on
+        // Windows. It becomes unmanaged after the DB pointer moves and will be
+        // cleaned by the next maintenance pass.
+      }
+    }
+    _lastTouchTimes[key] = DateTime.now().millisecondsSinceEpoch;
     checkCacheIfRequired();
   }
 
@@ -267,13 +402,18 @@ class CacheManager {
       return null;
     }
     final row = res.first;
-    final dir = row["dir"] as String;
-    final name = row["name"] as String;
-    final expires = row["expires"] as int;
-    final file = File('$cachePath/$dir/$name');
+    final filePath = _cacheFilePath(row);
+    final expires = _cacheRowExpires(row);
+    if (filePath == null || expires == null) {
+      Log.warning("CacheManager", "Deleting malformed cache row for $key");
+      _deleteCacheRow(key);
+      return null;
+    }
+    final file = File(filePath);
     final now = DateTime.now().millisecondsSinceEpoch;
     if (expires < now) {
       _db.execute('DELETE FROM cache WHERE key = ?;', [key]);
+      _lastTouchTimes.remove(key);
       if (await file.exists()) {
         final size = await file.length();
         await file.delete();
@@ -284,24 +424,46 @@ class CacheManager {
       return null;
     }
     if (await file.exists()) {
-      _db.execute(
-        '''
-        UPDATE cache
-        SET expires = ?
-        WHERE key = ?
-      ''',
-        [now + 7 * 24 * 60 * 60 * 1000, key],
-      );
+      final lastTouch = _lastTouchTimes[key] ?? 0;
+      if (_shouldTouchCache(now: now, expires: expires, lastTouch: lastTouch)) {
+        _db.execute(
+          '''
+          UPDATE cache
+          SET expires = ?
+          WHERE key = ?
+        ''',
+          [now + 7 * 24 * 60 * 60 * 1000, key],
+        );
+        _lastTouchTimes[key] = now;
+      }
       return file;
     }
     _db.execute('DELETE FROM cache WHERE key = ?;', [key]);
+    _lastTouchTimes.remove(key);
     return null;
+  }
+
+  bool _shouldTouchCache({
+    required int now,
+    required int expires,
+    required int lastTouch,
+  }) {
+    final throttleMs = _touchThrottleDuration.inMilliseconds;
+    return now - lastTouch > throttleMs || expires - now < throttleMs;
   }
 
   /// Only check cache if current size is greater than limit size.
   void checkCacheIfRequired() {
     if (_currentSize != null && _currentSize! > _limitSize) {
-      unawaited(checkCache());
+      unawaited(_checkCacheGuarded());
+    }
+  }
+
+  Future<void> _checkCacheGuarded() async {
+    try {
+      await checkCache();
+    } catch (e, s) {
+      Log.error("CacheManager", "Background cache check failed: $e\n$s");
     }
   }
 
@@ -345,13 +507,21 @@ class CacheManager {
     );
     for (var i = 0; i < expired.length; i++) {
       final row = expired[i];
-      final file = File('$cachePath/${row["dir"]}/${row["name"]}');
+      final key = _cacheRowKey(row);
+      final filePath = _cacheFilePath(row);
+      if (key == null || filePath == null) {
+        if (key != null) {
+          _deleteCacheRow(key);
+        }
+        continue;
+      }
+      final file = File(filePath);
       if (await file.exists()) {
         final size = await file.length();
         await file.delete();
         _currentSize = (_currentSize! - size).clamp(0, 1 << 62);
       }
-      _db.execute('DELETE FROM cache WHERE key = ?;', [row["key"]]);
+      _deleteCacheRow(key);
       if ((i + 1) % _yieldEvery == 0) {
         await Future<void>.delayed(Duration.zero);
       }
@@ -370,14 +540,21 @@ class CacheManager {
       }
       for (var i = 0; i < res.length; i++) {
         final row = res[i];
-        final key = row["key"] as String;
-        final file = File('$cachePath/${row["dir"]}/${row["name"]}');
+        final key = _cacheRowKey(row);
+        final filePath = _cacheFilePath(row);
+        if (key == null || filePath == null) {
+          if (key != null) {
+            _deleteCacheRow(key);
+          }
+          continue;
+        }
+        final file = File(filePath);
         if (await file.exists()) {
           final size = await file.length();
           await file.delete();
           _currentSize = (_currentSize! - size).clamp(0, 1 << 62);
         }
-        _db.execute('DELETE FROM cache WHERE key = ?;', [key]);
+        _deleteCacheRow(key);
         if (_currentSize! <= _limitSize) {
           break;
         }
@@ -387,13 +564,18 @@ class CacheManager {
       }
     }
     stopwatch.stop();
-    _logPerf('check cache', stopwatch, extra: 'currentSize=${_currentSize ?? -1}');
+    _logPerf(
+      'check cache',
+      stopwatch,
+      extra: 'currentSize=${_currentSize ?? -1}',
+    );
   }
 
   Future<void> _rebuildCacheDirectory() async {
     await Directory(cachePath).deleteIfExists(recursive: true);
     Directory(cachePath).createSync(recursive: true);
     _db.execute('DELETE FROM cache;');
+    _lastTouchTimes.clear();
     _currentSize = 0;
   }
 
@@ -415,13 +597,18 @@ class CacheManager {
       return;
     }
     final row = res.first;
-    final file = File('$cachePath/${row["dir"]}/${row["name"]}');
+    final filePath = _cacheFilePath(row);
+    if (filePath == null) {
+      _deleteCacheRow(key);
+      return;
+    }
+    final file = File(filePath);
     int fileSize = 0;
     if (await file.exists()) {
       fileSize = await file.length();
       await file.delete();
     }
-    _db.execute('DELETE FROM cache WHERE key = ?;', [key]);
+    _deleteCacheRow(key);
     if (_currentSize != null) {
       _currentSize = (_currentSize! - fileSize).clamp(0, 1 << 62);
     }
@@ -434,15 +621,26 @@ class CacheManager {
       await Directory(cachePath).deleteIfExists(recursive: true);
       Directory(cachePath).createSync(recursive: true);
       _db.execute('DELETE FROM cache;');
+      _writeQueues.clear();
+      _lastTouchTimes.clear();
       _currentSize = 0;
     });
   }
 
   void close() {
+    _closed = true;
+    _initialMaintenanceTimer?.cancel();
+    _initialMaintenanceTimer = null;
+    _maintenanceTimer?.cancel();
+    _maintenanceTimer = null;
     _db.dispose();
     _currentSize = null;
+    _maintenanceScheduled = false;
+    _initialMaintenanceScheduled = false;
     _isChecking = false;
     _checkPending = false;
+    _writeQueues.clear();
+    _lastTouchTimes.clear();
     instance = null;
   }
 
@@ -468,5 +666,33 @@ class CacheManager {
     });
     _maintenanceQueue = _maintenanceQueue.catchError((_) {});
     return completer.future;
+  }
+
+  String? _cacheRowKey(Row row) {
+    final key = row["key"];
+    return key is String ? key : null;
+  }
+
+  int? _cacheRowExpires(Row row) {
+    final expires = row["expires"];
+    return expires is int ? expires : null;
+  }
+
+  String? _cacheFilePath(Row row) {
+    final dir = row["dir"];
+    final name = row["name"];
+    if (dir is! String || name is! String) {
+      return null;
+    }
+    final filePath = p.normalize(p.join(cachePath, dir, name));
+    if (!isPathInsideDirectory(filePath, cachePath)) {
+      return null;
+    }
+    return filePath;
+  }
+
+  void _deleteCacheRow(String key) {
+    _db.execute('DELETE FROM cache WHERE key = ?;', [key]);
+    _lastTouchTimes.remove(key);
   }
 }

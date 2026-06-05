@@ -1,5 +1,14 @@
 part of 'favorites_page.dart';
 
+@visibleForTesting
+bool shouldApplyNetworkFavoriteActionResult({
+  required bool mounted,
+  required int requestId,
+  required int activeRequestId,
+}) {
+  return mounted && requestId == activeRequestId;
+}
+
 Future<bool> _deleteComic(
   String cid,
   String? fid,
@@ -7,7 +16,8 @@ Future<bool> _deleteComic(
   String? favId,
 ) async {
   var source = ComicSource.find(sourceKey);
-  if (source == null) {
+  final addOrDelFavorite = source?.favoriteData?.addOrDelFavorite;
+  if (addOrDelFavorite == null) {
     return false;
   }
 
@@ -17,42 +27,77 @@ Future<bool> _deleteComic(
     context: App.rootContext,
     builder: (context) {
       bool loading = false;
-      return StatefulBuilder(builder: (context, setState) {
-        return ContentDialog(
-          title: "Remove".tl,
-          content: Text("Remove comic from favorite?".tl).paddingHorizontal(16),
-          actions: [
-            Button.filled(
-              isLoading: loading,
-              color: context.colorScheme.error,
-              onPressed: () async {
-                setState(() {
-                  loading = true;
-                });
-                var res = await source.favoriteData!.addOrDelFavorite!(
-                  cid,
-                  fid ?? '',
-                  false,
-                  favId,
-                );
-                if (res.success) {
-                  // Invalidate network cache so next loads fetch fresh data
-                  NetworkCacheManager().clear();
-                  context.showMessage(message: "Deleted".tl);
-                  result = true;
-                  context.pop();
-                } else {
+      var requestId = 0;
+      return StatefulBuilder(
+        builder: (context, setState) {
+          return ContentDialog(
+            title: "Remove".tl,
+            content: Text(
+              "Remove comic from favorite?".tl,
+            ).paddingHorizontal(16),
+            actions: [
+              Button.filled(
+                isLoading: loading,
+                color: context.colorScheme.error,
+                onPressed: () async {
+                  if (loading) return;
+                  requestId++;
+                  final currentRequestId = requestId;
                   setState(() {
-                    loading = false;
+                    loading = true;
                   });
-                  context.showMessage(message: res.errorMessage!);
-                }
-              },
-              child: Text("Confirm".tl),
-            ),
-          ],
-        );
-      });
+
+                  try {
+                    var res = await addOrDelFavorite(
+                      cid,
+                      fid ?? '',
+                      false,
+                      favId,
+                    );
+                    if (!shouldApplyNetworkFavoriteActionResult(
+                      mounted: context.mounted,
+                      requestId: currentRequestId,
+                      activeRequestId: requestId,
+                    )) {
+                      return;
+                    }
+                    if (res.success) {
+                      // Invalidate network cache so next loads fetch fresh data
+                      NetworkCacheManager().clear();
+                      context.showMessage(message: "Deleted".tl);
+                      result = true;
+                      context.pop();
+                    } else {
+                      setState(() {
+                        loading = false;
+                      });
+                      context.showMessage(message: res.errorMessage!);
+                    }
+                  } catch (e, stackTrace) {
+                    if (!shouldApplyNetworkFavoriteActionResult(
+                      mounted: context.mounted,
+                      requestId: currentRequestId,
+                      activeRequestId: requestId,
+                    )) {
+                      return;
+                    }
+                    Log.error(
+                      "NetworkFavoritePage",
+                      "Failed to remove network favorite $sourceKey/$cid: $e",
+                      stackTrace,
+                    );
+                    setState(() {
+                      loading = false;
+                    });
+                    context.showMessage(message: e.toString());
+                  }
+                },
+                child: Text("Confirm".tl),
+              ),
+            ],
+          );
+        },
+      );
     },
   );
 
@@ -86,8 +131,8 @@ class _NormalFavoritePageState extends State<_NormalFavoritePage> {
 
   void showFolders() {
     context
-        .findAncestorStateOfType<_FavoritesPageState>()!
-        .showFolderSelector();
+        .findAncestorStateOfType<_FavoritesPageState>()
+        ?.showFolderSelector();
   }
 
   @override
@@ -95,8 +140,9 @@ class _NormalFavoritePageState extends State<_NormalFavoritePage> {
     return ComicList(
       key: comicListKey,
       leadingSliver: SliverAppbar(
-        style:
-            context.width < changePoint ? AppbarStyle.shadow : AppbarStyle.blur,
+        style: context.width < changePoint
+            ? AppbarStyle.shadow
+            : AppbarStyle.blur,
         leading: Tooltip(
           message: "Folders".tl,
           child: context.width <= _kTwoPanelChangeWidth
@@ -119,19 +165,21 @@ class _NormalFavoritePageState extends State<_NormalFavoritePage> {
               onPressed: () {
                 // Force refresh bypassing cache
                 NetworkCacheManager().clear();
-                comicListKey.currentState!.refresh();
+                comicListKey.currentState?.refresh();
               },
             ),
           ),
-          MenuButton(entries: [
-            MenuEntry(
-              icon: Icons.sync,
-              text: "Convert to local".tl,
-              onClick: () {
-                importNetworkFolder(widget.data.key, 9999999, null, null);
-              },
-            )
-          ]),
+          MenuButton(
+            entries: [
+              MenuEntry(
+                icon: Icons.sync,
+                text: "Convert to local".tl,
+                onClick: () {
+                  importNetworkFolder(widget.data.key, 9999999, null, null);
+                },
+              ),
+            ],
+          ),
         ],
       ),
       errorLeading: Appbar(
@@ -141,9 +189,11 @@ class _NormalFavoritePageState extends State<_NormalFavoritePage> {
               ? IconButton(
                   icon: const Icon(Icons.menu),
                   color: context.colorScheme.primary,
-                  onPressed: context
-                      .findAncestorStateOfType<_FavoritesPageState>()!
-                      .showFolderSelector,
+                  onPressed: () {
+                    context
+                        .findAncestorStateOfType<_FavoritesPageState>()
+                        ?.showFolderSelector();
+                  },
                 )
               : null,
         ),
@@ -159,6 +209,10 @@ class _NormalFavoritePageState extends State<_NormalFavoritePage> {
           ? null
           : (next) => widget.data.loadNext!(next),
       menuBuilder: (comic) {
+        final source = ComicSource.find(comic.sourceKey);
+        if (source?.favoriteData?.addOrDelFavorite == null) {
+          return [];
+        }
         return [
           MenuEntry(
             icon: Icons.delete_outline,
@@ -170,8 +224,8 @@ class _NormalFavoritePageState extends State<_NormalFavoritePage> {
                 comic.sourceKey,
                 comic.favoriteId,
               );
-              if (res) {
-                comicListKey.currentState!.remove(comic);
+              if (context.mounted && res) {
+                comicListKey.currentState?.remove(comic);
               }
             },
           ),
@@ -195,28 +249,79 @@ class _MultiFolderFavoritesPage extends StatefulWidget {
 class _MultiFolderFavoritesPageState extends State<_MultiFolderFavoritesPage> {
   bool _loading = true;
 
+  bool _loadInFlight = false;
+
+  int _loadRequestId = 0;
+
   String? _errorMessage;
 
   Map<String, String>? folders;
 
   void showFolders() {
     context
-        .findAncestorStateOfType<_FavoritesPageState>()!
-        .showFolderSelector();
+        .findAncestorStateOfType<_FavoritesPageState>()
+        ?.showFolderSelector();
   }
 
-  void loadPage() async {
-    var res = await widget.data.loadFolders!();
-    _loading = false;
-    if (res.error) {
+  @override
+  void initState() {
+    super.initState();
+    _startLoadFolders();
+  }
+
+  @override
+  void didUpdateWidget(covariant _MultiFolderFavoritesPage oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.data.key != widget.data.key) {
+      _restartLoadFolders();
+    }
+  }
+
+  void _startLoadFolders() async {
+    if (!shouldStartNetworkFavoriteFolderLoad(
+      loading: _loading,
+      inFlight: _loadInFlight,
+    )) {
+      return;
+    }
+    final requestId = ++_loadRequestId;
+    _loadInFlight = true;
+    try {
+      final res = await widget.data.loadFolders!();
+      if (!mounted || requestId != _loadRequestId) return;
       setState(() {
-        _errorMessage = res.errorMessage;
+        _loadInFlight = false;
+        _loading = false;
+        if (res.error) {
+          _errorMessage = res.errorMessage;
+          folders = null;
+        } else {
+          _errorMessage = null;
+          folders = res.data;
+        }
       });
-    } else {
+    } catch (e, stackTrace) {
+      Log.error("Load favorite folders failed", e.toString(), stackTrace);
+      if (!mounted || requestId != _loadRequestId) return;
       setState(() {
-        folders = res.data;
+        _loadInFlight = false;
+        _loading = false;
+        _errorMessage = e.toString();
+        folders = null;
       });
     }
+  }
+
+  void _restartLoadFolders() {
+    if (!mounted) return;
+    setState(() {
+      _loading = true;
+      _loadInFlight = false;
+      _errorMessage = null;
+      folders = null;
+      _loadRequestId++;
+    });
+    _startLoadFolders();
   }
 
   void openFolder(String key, String title) {
@@ -226,8 +331,9 @@ class _MultiFolderFavoritesPageState extends State<_MultiFolderFavoritesPage> {
   @override
   Widget build(BuildContext context) {
     var sliverAppBar = SliverAppbar(
-      style:
-          context.width < changePoint ? AppbarStyle.shadow : AppbarStyle.blur,
+      style: context.width < changePoint
+          ? AppbarStyle.shadow
+          : AppbarStyle.blur,
       leading: Tooltip(
         message: "Folders".tl,
         child: context.width <= _kTwoPanelChangeWidth
@@ -262,15 +368,10 @@ class _MultiFolderFavoritesPageState extends State<_MultiFolderFavoritesPage> {
     );
 
     if (_loading) {
-      loadPage();
       return Column(
         children: [
           appBar,
-          const Expanded(
-            child: Center(
-              child: CircularProgressIndicator(),
-            ),
-          ),
+          const Expanded(child: Center(child: CircularProgressIndicator())),
         ],
       );
     } else if (_errorMessage != null) {
@@ -282,13 +383,10 @@ class _MultiFolderFavoritesPageState extends State<_MultiFolderFavoritesPage> {
               message: _errorMessage!,
               withAppbar: false,
               retry: () {
-                setState(() {
-                  _loading = true;
-                  _errorMessage = null;
-                });
+                _restartLoadFolders();
               },
             ),
-          )
+          ),
         ],
       );
     } else {
@@ -300,14 +398,17 @@ class _MultiFolderFavoritesPageState extends State<_MultiFolderFavoritesPage> {
         slivers: [
           sliverAppBar,
           SliverGridViewWithFixedItemHeight(
-            delegate:
-                SliverChildBuilderDelegate(childCount: length, (context, i) {
+            delegate: SliverChildBuilderDelegate(childCount: length, (
+              context,
+              i,
+            ) {
               if (widget.data.allFavoritesId != null) {
                 if (i == 0) {
                   return _FolderTile(
-                      name: "All".tl,
-                      onTap: () =>
-                          openFolder(widget.data.allFavoritesId!, "All".tl));
+                    name: "All".tl,
+                    onTap: () =>
+                        openFolder(widget.data.allFavoritesId!, "All".tl),
+                  );
                 } else {
                   i--;
                   return _FolderTile(
@@ -316,9 +417,7 @@ class _MultiFolderFavoritesPageState extends State<_MultiFolderFavoritesPage> {
                     deleteFolder: widget.data.deleteFolder == null
                         ? null
                         : () => widget.data.deleteFolder!(keys[i]),
-                    updateState: () => setState(() {
-                      _loading = true;
-                    }),
+                    updateState: _restartLoadFolders,
                   );
                 }
               } else {
@@ -328,9 +427,7 @@ class _MultiFolderFavoritesPageState extends State<_MultiFolderFavoritesPage> {
                   deleteFolder: widget.data.deleteFolder == null
                       ? null
                       : () => widget.data.deleteFolder!(keys[i]),
-                  updateState: () => setState(() {
-                    _loading = true;
-                  }),
+                  updateState: _restartLoadFolders,
                 );
               }
             }),
@@ -348,10 +445,7 @@ class _MultiFolderFavoritesPageState extends State<_MultiFolderFavoritesPage> {
                       mainAxisSize: MainAxisSize.min,
                       children: [
                         Text("Create a folder".tl),
-                        const Icon(
-                          Icons.add,
-                          size: 18,
-                        ),
+                        const Icon(Icons.add, size: 18),
                       ],
                     ),
                     onPressed: () {
@@ -360,9 +454,7 @@ class _MultiFolderFavoritesPageState extends State<_MultiFolderFavoritesPage> {
                         builder: (context) {
                           return _CreateFolderDialog(
                             widget.data,
-                            () => setState(() {
-                              _loading = true;
-                            }),
+                            _restartLoadFolders,
                           );
                         },
                       );
@@ -370,7 +462,7 @@ class _MultiFolderFavoritesPageState extends State<_MultiFolderFavoritesPage> {
                   ),
                 ),
               ),
-            )
+            ),
         ],
       );
     }
@@ -378,11 +470,12 @@ class _MultiFolderFavoritesPageState extends State<_MultiFolderFavoritesPage> {
 }
 
 class _FolderTile extends StatelessWidget {
-  const _FolderTile(
-      {required this.name,
-      required this.onTap,
-      this.deleteFolder,
-      this.updateState});
+  const _FolderTile({
+    required this.name,
+    required this.onTap,
+    this.deleteFolder,
+    this.updateState,
+  });
 
   final String name;
 
@@ -406,16 +499,16 @@ class _FolderTile extends StatelessWidget {
                 size: 28,
                 color: Theme.of(context).colorScheme.secondary,
               ),
-              const SizedBox(
-                width: 16,
-              ),
+              const SizedBox(width: 16),
               Expanded(
                 child: Align(
                   alignment: Alignment.centerLeft,
                   child: Text(
                     name,
                     style: const TextStyle(
-                        fontSize: 16, fontWeight: FontWeight.w500),
+                      fontSize: 16,
+                      fontWeight: FontWeight.w500,
+                    ),
                   ),
                 ),
               ),
@@ -438,35 +531,68 @@ class _FolderTile extends StatelessWidget {
       context: context,
       builder: (context) {
         bool loading = false;
-        return StatefulBuilder(builder: (context, setState) {
-          return ContentDialog(
-            title: "Delete".tl,
-            content: Text("Delete folder?".tl).paddingHorizontal(16),
-            actions: [
-              Button.filled(
-                isLoading: loading,
-                color: context.colorScheme.error,
-                onPressed: () async {
-                  setState(() {
-                    loading = true;
-                  });
-                  var res = await deleteFolder!();
-                  if (res.success) {
-                    context.showMessage(message: "Deleted".tl);
-                    context.pop();
-                    updateState?.call();
-                  } else {
+        var requestId = 0;
+        return StatefulBuilder(
+          builder: (context, setState) {
+            return ContentDialog(
+              title: "Delete".tl,
+              content: Text("Delete folder?".tl).paddingHorizontal(16),
+              actions: [
+                Button.filled(
+                  isLoading: loading,
+                  color: context.colorScheme.error,
+                  onPressed: () async {
+                    if (loading) return;
+                    requestId++;
+                    final currentRequestId = requestId;
                     setState(() {
-                      loading = false;
+                      loading = true;
                     });
-                    context.showMessage(message: res.errorMessage!);
-                  }
-                },
-                child: Text("Confirm".tl),
-              ),
-            ],
-          );
-        });
+
+                    try {
+                      var res = await deleteFolder!();
+                      if (!shouldApplyNetworkFavoriteActionResult(
+                        mounted: context.mounted,
+                        requestId: currentRequestId,
+                        activeRequestId: requestId,
+                      )) {
+                        return;
+                      }
+                      if (res.success) {
+                        context.showMessage(message: "Deleted".tl);
+                        context.pop();
+                        updateState?.call();
+                      } else {
+                        setState(() {
+                          loading = false;
+                        });
+                        context.showMessage(message: res.errorMessage!);
+                      }
+                    } catch (e, stackTrace) {
+                      if (!shouldApplyNetworkFavoriteActionResult(
+                        mounted: context.mounted,
+                        requestId: currentRequestId,
+                        activeRequestId: requestId,
+                      )) {
+                        return;
+                      }
+                      Log.error(
+                        "NetworkFavoritePage",
+                        "Failed to delete network favorite folder $name: $e",
+                        stackTrace,
+                      );
+                      setState(() {
+                        loading = false;
+                      });
+                      context.showMessage(message: e.toString());
+                    }
+                  },
+                  child: Text("Confirm".tl),
+                ),
+              ],
+            );
+          },
+        );
       },
     );
   }
@@ -486,6 +612,14 @@ class _CreateFolderDialog extends StatefulWidget {
 class _CreateFolderDialogState extends State<_CreateFolderDialog> {
   var controller = TextEditingController();
   bool loading = false;
+  int _createRequestId = 0;
+
+  @override
+  void dispose() {
+    _createRequestId++;
+    controller.dispose();
+    super.dispose();
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -503,19 +637,29 @@ class _CreateFolderDialogState extends State<_CreateFolderDialog> {
               ),
             ),
           ),
-          const SizedBox(
-            height: 16
-          ),
+          const SizedBox(height: 16),
         ],
       ),
       actions: [
         Button.filled(
           isLoading: loading,
-          onPressed: () {
+          onPressed: () async {
+            if (loading) return;
+            final requestId = ++_createRequestId;
+            final name = controller.text;
             setState(() {
               loading = true;
             });
-            widget.data.addFolder!(controller.text).then((b) {
+
+            try {
+              final b = await widget.data.addFolder!(name);
+              if (!shouldApplyNetworkFavoriteActionResult(
+                mounted: mounted,
+                requestId: requestId,
+                activeRequestId: _createRequestId,
+              )) {
+                return;
+              }
               if (b.error) {
                 context.showMessage(message: b.errorMessage!);
                 setState(() {
@@ -526,10 +670,27 @@ class _CreateFolderDialogState extends State<_CreateFolderDialog> {
                 context.showMessage(message: "Created successfully".tl);
                 widget.updateState();
               }
-            });
+            } catch (e, stackTrace) {
+              if (!shouldApplyNetworkFavoriteActionResult(
+                mounted: mounted,
+                requestId: requestId,
+                activeRequestId: _createRequestId,
+              )) {
+                return;
+              }
+              Log.error(
+                "NetworkFavoritePage",
+                "Failed to create network favorite folder $name: $e",
+                stackTrace,
+              );
+              context.showMessage(message: e.toString());
+              setState(() {
+                loading = false;
+              });
+            }
           },
           child: Text("Submit".tl),
-        )
+        ),
       ],
     );
   }
@@ -554,26 +715,31 @@ class _FavoriteFolder extends StatelessWidget {
       leadingSliver: SliverAppbar(
         title: Text(title),
         actions: [
-          MenuButton(entries: [
-            MenuEntry(
-              icon: Icons.sync,
-              text: "Convert to local".tl,
-              onClick: () {
-                importNetworkFolder(data.key, 9999999, title, folderID);
-              },
-            )
-          ]),
+          MenuButton(
+            entries: [
+              MenuEntry(
+                icon: Icons.sync,
+                text: "Convert to local".tl,
+                onClick: () {
+                  importNetworkFolder(data.key, 9999999, title, folderID);
+                },
+              ),
+            ],
+          ),
         ],
       ),
-      errorLeading: Appbar(
-        title: Text(title),
-      ),
-      loadPage:
-          data.loadComic == null ? null : (i) => data.loadComic!(i, folderID),
+      errorLeading: Appbar(title: Text(title)),
+      loadPage: data.loadComic == null
+          ? null
+          : (i) => data.loadComic!(i, folderID),
       loadNext: data.loadNext == null
           ? null
           : (next) => data.loadNext!(next, folderID),
       menuBuilder: (comic) {
+        final source = ComicSource.find(comic.sourceKey);
+        if (source?.favoriteData?.addOrDelFavorite == null) {
+          return [];
+        }
         return [
           MenuEntry(
             icon: Icons.delete_outline,
@@ -585,8 +751,8 @@ class _FavoriteFolder extends StatelessWidget {
                 comic.sourceKey,
                 comic.favoriteId,
               );
-              if (res) {
-                comicListKey.currentState!.remove(comic);
+              if (context.mounted && res) {
+                comicListKey.currentState?.remove(comic);
               }
             },
           ),
@@ -594,4 +760,12 @@ class _FavoriteFolder extends StatelessWidget {
       },
     );
   }
+}
+
+@visibleForTesting
+bool shouldStartNetworkFavoriteFolderLoad({
+  required bool loading,
+  required bool inFlight,
+}) {
+  return loading && !inFlight;
 }

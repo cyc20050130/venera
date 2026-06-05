@@ -12,6 +12,25 @@ import '../history.dart';
 import 'base_image_provider.dart';
 import 'image_favorites_provider.dart' as image_provider;
 
+@visibleForTesting
+String imageFavoriteCacheKey(ImageFavorite imageFavorite) {
+  return "ImageFavorites ${imageFavorite.imageKey}@${imageFavorite.sourceKey}@${imageFavorite.id}@${imageFavorite.eid}";
+}
+
+String _imageFavoriteCacheFileName(ImageFavorite imageFavorite) {
+  return md5.convert(imageFavoriteCacheKey(imageFavorite).codeUnits).toString();
+}
+
+File _imageFavoriteCacheFile(ImageFavorite imageFavorite) {
+  return File(
+    FilePath.join(
+      App.cachePath,
+      'image_favorites',
+      _imageFavoriteCacheFileName(imageFavorite),
+    ),
+  );
+}
+
 class ImageFavoritesProvider
     extends BaseImageProvider<image_provider.ImageFavoritesProvider> {
   /// Image provider for imageFavorites
@@ -65,8 +84,7 @@ class ImageFavoritesProvider
   }
 
   Future<void> writeToCache(Uint8List image) async {
-    var fileName = md5.convert(key.codeUnits).toString();
-    var file = File(FilePath.join(App.cachePath, 'image_favorites', fileName));
+    var file = _imageFavoriteCacheFile(imageFavorite);
     if (!file.existsSync()) {
       file.createSync(recursive: true);
     }
@@ -74,40 +92,52 @@ class ImageFavoritesProvider
   }
 
   Future<Uint8List?> readFromCache() async {
-    var fileName = md5.convert(key.codeUnits).toString();
-    var file = File(FilePath.join(App.cachePath, 'image_favorites', fileName));
+    var file = _imageFavoriteCacheFile(imageFavorite);
     if (!file.existsSync()) {
       return null;
     }
-    return await file.readAsBytes();
+    final data = await file.readAsBytes();
+    return data.isEmpty ? null : data;
   }
 
   /// Delete a image favorite cache
   static Future<void> deleteFromCache(ImageFavorite imageFavorite) async {
-    var fileName = md5.convert(imageFavorite.imageKey.codeUnits).toString();
-    var file = File(FilePath.join(App.cachePath, 'image_favorites', fileName));
+    var file = _imageFavoriteCacheFile(imageFavorite);
     if (file.existsSync()) {
       await file.delete();
     }
   }
 
   Future<Uint8List?> getImageFromLocal() async {
-    var localComic =
-        LocalManager().find(sourceKey, ComicType.fromKey(sourceKey));
+    final type = ComicType.fromKey(sourceKey);
+    var localComic = LocalManager().find(cid, type);
     if (localComic == null) {
       return null;
     }
-    var epIndex = localComic.chapters?.ids.toList().indexOf(eid) ?? -1;
-    if (epIndex == -1 && localComic.hasChapters) {
+    final Object localEpisode;
+    if (localComic.hasChapters) {
+      if (!localComic.downloadedChapters.contains(eid)) {
+        return null;
+      }
+      localEpisode = eid;
+    } else {
+      localEpisode = 1;
+    }
+    var images = await LocalManager().getImages(cid, type, localEpisode);
+    final imagePath = images.elementAtOrNull(page - 1);
+    if (imagePath == null) {
       return null;
     }
-    var images = await LocalManager().getImages(
-      sourceKey,
-      ComicType.fromKey(sourceKey),
-      epIndex,
-    );
-    var data = await File(images[page]).readAsBytes();
-    return data;
+    final file = File(localFilePathFromUri(imagePath));
+    if (!await file.exists()) {
+      return null;
+    }
+    try {
+      final data = await file.readAsBytes();
+      return data.isEmpty ? null : data;
+    } on FileSystemException {
+      return null;
+    }
   }
 
   Future<Uint8List> getImageFromNetwork(
@@ -115,14 +145,20 @@ class ImageFavoritesProvider
     StreamController<ImageChunkEvent>? chunkEvents,
     void Function()? checkStop,
   ) async {
-    await for (var progress
-        in ImageDownloader.loadComicImage(imageKey, sourceKey, cid, eid)) {
+    await for (var progress in ImageDownloader.loadComicImage(
+      imageKey,
+      sourceKey,
+      cid,
+      eid,
+    )) {
       checkStop?.call();
       if (chunkEvents != null) {
-        chunkEvents.add(ImageChunkEvent(
-          cumulativeBytesLoaded: progress.currentBytes,
-          expectedTotalBytes: progress.totalBytes,
-        ));
+        chunkEvents.add(
+          ImageChunkEvent(
+            cumulativeBytesLoaded: progress.currentBytes,
+            expectedTotalBytes: progress.totalBytes,
+          ),
+        );
       }
       if (progress.imageBytes != null) {
         return progress.imageBytes!;
@@ -140,8 +176,19 @@ class ImageFavoritesProvider
     if (comicSource == null) {
       throw "Error: Comic source not found.";
     }
-    var res = await comicSource.loadComicPages!(cid, eid);
-    return res.data[page - 1];
+    final loadComicPages = comicSource.loadComicPages;
+    if (loadComicPages == null) {
+      throw "Error: Comic pages loader not available.";
+    }
+    var res = await loadComicPages(cid, eid);
+    if (res.error) {
+      throw "Error: ${res.errorMessage}";
+    }
+    final index = page - 1;
+    if (index < 0 || index >= res.data.length) {
+      throw "Error: Image favorite page out of range.";
+    }
+    return res.data[index];
   }
 
   @override
@@ -150,6 +197,5 @@ class ImageFavoritesProvider
   }
 
   @override
-  String get key =>
-      "ImageFavorites ${imageFavorite.imageKey}@${imageFavorite.sourceKey}@${imageFavorite.id}@${imageFavorite.eid}";
+  String get key => imageFavoriteCacheKey(imageFavorite);
 }

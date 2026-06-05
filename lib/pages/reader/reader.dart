@@ -41,6 +41,7 @@ import 'package:venera/utils/data_sync.dart';
 import 'package:venera/utils/ext.dart';
 import 'package:venera/utils/file_type.dart';
 import 'package:venera/utils/io.dart';
+import 'package:venera/utils/overlay_entry.dart';
 import 'package:venera/utils/tags_translation.dart';
 import 'package:venera/utils/translations.dart';
 import 'package:venera/utils/volume.dart';
@@ -130,6 +131,153 @@ int? computeReaderImageStartIndexForDisplayPage({
   }
   final index = (page - 2) * imagesPerPage + 1;
   return index >= imageCount ? null : index;
+}
+
+@visibleForTesting
+double? normalizeReaderInitialScale(double? initialScale) {
+  if (initialScale == null || !initialScale.isFinite || initialScale <= 0) {
+    return null;
+  }
+  return initialScale;
+}
+
+@visibleForTesting
+double? computeReaderZoomInScale(double? initialScale) {
+  final normalized = normalizeReaderInitialScale(initialScale);
+  if (normalized == null) {
+    return null;
+  }
+  return normalized * 1.75;
+}
+
+@visibleForTesting
+double? computeReaderDoubleTapZoomTarget({
+  required double? currentScale,
+  required double? initialScale,
+}) {
+  final normalized = normalizeReaderInitialScale(initialScale);
+  if (normalized == null) {
+    return null;
+  }
+  return currentScale != normalized ? normalized : normalized * 1.75;
+}
+
+@visibleForTesting
+bool shouldEnableReaderLongPressZoom(Object? value) {
+  return normalizeBoolSetting(value, true);
+}
+
+@visibleForTesting
+bool shouldShowReaderClockAndBatteryInfo(Object? value) {
+  return normalizeBoolSetting(value, true);
+}
+
+@visibleForTesting
+bool shouldShowReaderSystemStatusBar(Object? value) {
+  return normalizeBoolSetting(value, false);
+}
+
+@visibleForTesting
+bool shouldEnableReaderVolumeKey(Object? value) {
+  return normalizeBoolSetting(value, true);
+}
+
+@visibleForTesting
+bool shouldEnableReaderPageAnimation(Object? value) {
+  return normalizeBoolSetting(value, true);
+}
+
+@visibleForTesting
+bool shouldLimitReaderImageWidth(Object? value) {
+  return normalizeBoolSetting(value, true);
+}
+
+@visibleForTesting
+bool shouldShowSingleImageOnFirstPage(Object? value) {
+  return normalizeBoolSetting(value, false);
+}
+
+@visibleForTesting
+int normalizeReaderImagesPerPage(Object? value) {
+  final normalized = normalizeNumSetting(value, 1).toInt();
+  return normalized.clamp(1, 5);
+}
+
+@visibleForTesting
+int normalizeAutoPageTurningIntervalSeconds(Object? value) {
+  final normalized = normalizeNumSetting(value, 5).toInt();
+  return normalized.clamp(1, 20);
+}
+
+@visibleForTesting
+int normalizeReaderPageForLoadedImages({
+  required int page,
+  required int maxPage,
+}) {
+  if (maxPage <= 0) {
+    return 1;
+  }
+  return page.clamp(1, maxPage);
+}
+
+@visibleForTesting
+int normalizeReaderInitialChapter({
+  required int? requestedChapter,
+  required int? requestedGroup,
+  required ComicChapters? chapters,
+}) {
+  var chapter = requestedChapter ?? 1;
+  if (chapter < 1) {
+    chapter = 1;
+  }
+  final maxChapter = chapters?.length ?? 1;
+  if (maxChapter <= 0) {
+    return 1;
+  }
+  if (requestedGroup == null) {
+    return chapter.clamp(1, maxChapter);
+  }
+  if (requestedGroup < 1) {
+    return 1;
+  }
+  if (chapters == null || !chapters.isGrouped) {
+    return chapter.clamp(1, maxChapter);
+  }
+  final groups = chapters.groups.toList();
+  if (requestedGroup > groups.length) {
+    return 1;
+  }
+  var offset = 0;
+  for (var i = 0; i < requestedGroup - 1; i++) {
+    offset += chapters.getGroup(groups[i]).length;
+  }
+  final groupLength = chapters.getGroup(groups[requestedGroup - 1]).length;
+  if (groupLength <= 0) {
+    return 1;
+  }
+  return (offset + chapter.clamp(1, groupLength)).clamp(1, maxChapter);
+}
+
+@visibleForTesting
+({int groupIndex, int chapterInGroup})? resolveGroupedReaderChapterPosition({
+  required ComicChapters chapters,
+  required int chapter,
+}) {
+  if (!chapters.isGrouped || chapter < 1) {
+    return null;
+  }
+  var remainingChapter = chapter;
+  for (var groupIndex = 0; groupIndex < chapters.groupCount; groupIndex++) {
+    final groupLength = chapters.getGroupByIndex(groupIndex).length;
+    if (groupLength <= 0) {
+      continue;
+    }
+    if (remainingChapter <= groupLength) {
+      return (groupIndex: groupIndex, chapterInGroup: remainingChapter);
+    }
+    remainingChapter -= groupLength;
+  }
+  return null;
 }
 
 class Reader extends StatefulWidget {
@@ -249,6 +397,10 @@ Duration computeReaderDeferredWorkRemaining({
   return remaining > Duration.zero ? remaining : Duration.zero;
 }
 
+Duration _maxDuration(Duration a, Duration b) {
+  return a >= b ? a : b;
+}
+
 class _ReaderState extends State<Reader>
     with _ReaderLocation, _ReaderWindow, _VolumeListener, _ImagePerPageHandler {
   static const _initialReaderBackgroundWorkDelay = Duration(milliseconds: 2500);
@@ -270,6 +422,9 @@ class _ReaderState extends State<Reader>
 
   @override
   void update() {
+    if (!mounted) {
+      return;
+    }
     setState(() {});
   }
 
@@ -365,15 +520,11 @@ class _ReaderState extends State<Reader>
     if (_page < 1) {
       _page = 1;
     }
-    chapter = widget.initialChapter ?? 1;
-    if (chapter < 1) {
-      chapter = 1;
-    }
-    if (widget.initialChapterGroup != null) {
-      for (int i = 0; i < (widget.initialChapterGroup! - 1); i++) {
-        chapter += widget.chapters!.getGroupByIndex(i).length;
-      }
-    }
+    chapter = normalizeReaderInitialChapter(
+      requestedChapter: widget.initialChapter,
+      requestedGroup: widget.initialChapterGroup,
+      chapters: widget.chapters,
+    );
     if (widget.initialPage != null) {
       _page = widget.initialPage!;
       if (_page < 1) {
@@ -381,19 +532,24 @@ class _ReaderState extends State<Reader>
       }
     }
     history = widget.history;
-    if (!appdata.settings.getReaderSetting(
-      cid,
-      type.sourceKey,
-      'showSystemStatusBar',
-    )) {
+    final showSystemStatusBar = shouldShowReaderSystemStatusBar(
+      appdata.settings.getReaderSetting(
+        cid,
+        type.sourceKey,
+        'showSystemStatusBar',
+      ),
+    );
+    if (!showSystemStatusBar) {
       SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersive);
     } else {
       SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
     }
-    if (appdata.settings.getReaderSetting(
-      cid,
-      type.sourceKey,
-      'enableTurnPageByVolumeKey',
+    if (shouldEnableReaderVolumeKey(
+      appdata.settings.getReaderSetting(
+        cid,
+        type.sourceKey,
+        'enableTurnPageByVolumeKey',
+      ),
     )) {
       handleVolumeEvent();
     }
@@ -427,23 +583,27 @@ class _ReaderState extends State<Reader>
   }
 
   Future<void> setImageCacheSize() async {
-    var availableRAM = await MemoryInfo.getFreePhysicalMemorySize();
-    if (availableRAM == null) return;
-    int maxImageCacheSize;
-    if (availableRAM < 1 << 30) {
-      maxImageCacheSize = 100 << 20;
-    } else if (availableRAM < 2 << 30) {
-      maxImageCacheSize = 200 << 20;
-    } else if (availableRAM < 4 << 30) {
-      maxImageCacheSize = 300 << 20;
-    } else {
-      maxImageCacheSize = 500 << 20;
+    try {
+      var availableRAM = await MemoryInfo.getFreePhysicalMemorySize();
+      if (availableRAM == null) return;
+      int maxImageCacheSize;
+      if (availableRAM < 1 << 30) {
+        maxImageCacheSize = 100 << 20;
+      } else if (availableRAM < 2 << 30) {
+        maxImageCacheSize = 200 << 20;
+      } else if (availableRAM < 4 << 30) {
+        maxImageCacheSize = 300 << 20;
+      } else {
+        maxImageCacheSize = 500 << 20;
+      }
+      Log.info(
+        "Reader",
+        "Detect available RAM: $availableRAM, set image cache size to $maxImageCacheSize",
+      );
+      PaintingBinding.instance.imageCache.maximumSizeBytes = maxImageCacheSize;
+    } catch (e, s) {
+      Log.error("Reader", "Failed to set reader image cache size: $e", s);
     }
-    Log.info(
-      "Reader",
-      "Detect available RAM: $availableRAM, set image cache size to $maxImageCacheSize",
-    );
-    PaintingBinding.instance.imageCache.maximumSizeBytes = maxImageCacheSize;
   }
 
   @override
@@ -580,15 +740,17 @@ class _ReaderState extends State<Reader>
     }
     history!.maxPage = imageCount;
     if (widget.chapters?.isGrouped ?? false) {
-      int g = 0;
-      int c = chapter;
-      while (c > widget.chapters!.getGroupByIndex(g).length) {
-        c -= widget.chapters!.getGroupByIndex(g).length;
-        g++;
+      final position = resolveGroupedReaderChapterPosition(
+        chapters: widget.chapters!,
+        chapter: chapter,
+      );
+      if (position != null) {
+        history!.readEpisode.add(
+          '${position.groupIndex + 1}-${position.chapterInGroup}',
+        );
+        history!.ep = position.chapterInGroup;
+        history!.group = position.groupIndex + 1;
       }
-      history!.readEpisode.add('${g + 1}-$c');
-      history!.ep = c;
-      history!.group = g + 1;
     } else {
       history!.readEpisode.add(chapter.toString());
       history!.ep = chapter;
@@ -602,7 +764,7 @@ class _ReaderState extends State<Reader>
   }
 
   void onChapterImagesResolved() {
-    unawaited(_prepareNextChapterPrefetch());
+    _prepareNextChapterPrefetchInBackground();
   }
 
   void _maybeWarmRemainingNextChapterImages() {
@@ -611,10 +773,12 @@ class _ReaderState extends State<Reader>
     }
     final threshold = math.max(
       1,
-      maxPage - (appdata.settings['preloadImageCount'] as int) + 1,
+      maxPage -
+          appdata.settings.intValue('preloadImageCount', fallback: 4, min: 0) +
+          1,
     );
     if (page >= threshold) {
-      unawaited(_prepareNextChapterPrefetch(warmRemainingImages: true));
+      _prepareNextChapterPrefetchInBackground(warmRemainingImages: true);
     }
   }
 
@@ -686,7 +850,13 @@ class _ReaderState extends State<Reader>
               page >=
               math.max(
                 1,
-                maxPage - (appdata.settings['preloadImageCount'] as int) + 1,
+                maxPage -
+                    appdata.settings.intValue(
+                      'preloadImageCount',
+                      fallback: 4,
+                      min: 0,
+                    ) +
+                    1,
               );
           await _warmNextChapterImages(
             nextChapterId,
@@ -715,6 +885,22 @@ class _ReaderState extends State<Reader>
       pages,
       generation: generation,
       warmRemainingImages: warmRemainingImages,
+    );
+  }
+
+  void _prepareNextChapterPrefetchInBackground({
+    bool warmRemainingImages = false,
+  }) {
+    unawaited(
+      _prepareNextChapterPrefetch(
+        warmRemainingImages: warmRemainingImages,
+      ).catchError((Object error, StackTrace stackTrace) {
+        Log.error(
+          "Reader",
+          "Failed to prepare next chapter prefetch: $error",
+          stackTrace,
+        );
+      }),
     );
   }
 
@@ -776,29 +962,39 @@ class _ReaderState extends State<Reader>
       if (!mounted || generation != _chapterPrefetchGeneration) {
         return;
       }
-      unawaited(
-        _prepareNextChapterPrefetch(warmRemainingImages: shouldWarmRemaining),
+      _prepareNextChapterPrefetchInBackground(
+        warmRemainingImages: shouldWarmRemaining,
       );
     });
   }
 
   Duration get _initialReaderBackgroundWorkRemaining {
-    return computeReaderDeferredWorkRemaining(
+    final mountedWarmupRemaining = computeReaderDeferredWorkRemaining(
       startedAt: _readerMountedAt,
       now: DateTime.now(),
       delay: _initialReaderBackgroundWorkDelay,
     );
+    return _maxDuration(
+      mountedWarmupRemaining,
+      ImageDownloader.readerLifecycleQuietRemaining,
+    );
   }
 
   Duration get _nextHistoryWriteDelay {
+    final lifecycleQuietRemaining =
+        ImageDownloader.readerLifecycleQuietRemaining;
     if (_historyWriteHasRun) {
-      return _subsequentHistoryWriteDelay;
+      return _maxDuration(
+        _subsequentHistoryWriteDelay,
+        lifecycleQuietRemaining,
+      );
     }
-    return computeReaderDeferredWorkRemaining(
+    final firstWriteRemaining = computeReaderDeferredWorkRemaining(
       startedAt: _readerMountedAt,
       now: DateTime.now(),
       delay: _firstHistoryWriteDelay,
     );
+    return _maxDuration(firstWriteRemaining, lifecycleQuietRemaining);
   }
 
   bool _deferNextChapterPrefetchUntilReaderWarmsUp(bool warmRemainingImages) {
@@ -820,8 +1016,8 @@ class _ReaderState extends State<Reader>
       if (!mounted || generation != _chapterPrefetchGeneration) {
         return;
       }
-      unawaited(
-        _prepareNextChapterPrefetch(warmRemainingImages: shouldWarmRemaining),
+      _prepareNextChapterPrefetchInBackground(
+        warmRemainingImages: shouldWarmRemaining,
       );
     });
     return true;
@@ -847,10 +1043,15 @@ class _ReaderState extends State<Reader>
     }
     _historyWriteHasRun = true;
     unawaited(
-      HistoryManager().addHistoryAsync(
-        _snapshotHistory(currentHistory),
-        notify: false,
-      ),
+      HistoryManager()
+          .addHistoryAsync(_snapshotHistory(currentHistory), notify: false)
+          .catchError((Object error, StackTrace stackTrace) {
+            Log.error(
+              "Reader",
+              "Failed to persist reader history: $error",
+              stackTrace,
+            );
+          }),
     );
   }
 
@@ -881,34 +1082,26 @@ class _ReaderState extends State<Reader>
 
   bool get isFirstChapterOfGroup {
     if (widget.chapters?.isGrouped ?? false) {
-      int c = chapter - 1;
-      int g = 1;
-      while (c > 0) {
-        c -= widget.chapters!.getGroupByIndex(g - 1).length;
-        g++;
-      }
-      if (c == 0) {
-        return true;
-      } else {
-        return false;
-      }
+      final position = resolveGroupedReaderChapterPosition(
+        chapters: widget.chapters!,
+        chapter: chapter,
+      );
+      return position?.chapterInGroup == 1;
     }
     return chapter == 1;
   }
 
   bool get isLastChapterOfGroup {
     if (widget.chapters?.isGrouped ?? false) {
-      int c = chapter;
-      int g = 1;
-      while (c > 0) {
-        c -= widget.chapters!.getGroupByIndex(g - 1).length;
-        g++;
-      }
-      if (c == 0) {
+      final position = resolveGroupedReaderChapterPosition(
+        chapters: widget.chapters!,
+        chapter: chapter,
+      );
+      if (position == null) {
         return true;
-      } else {
-        return false;
       }
+      return position.chapterInGroup ==
+          widget.chapters!.getGroupByIndex(position.groupIndex).length;
     }
     return chapter == maxChapter;
   }
@@ -939,6 +1132,12 @@ class _ReaderOverlayHostState extends State<_ReaderOverlayHost> {
   void didUpdateWidget(covariant _ReaderOverlayHost oldWidget) {
     super.didUpdateWidget(oldWidget);
     _entry.markNeedsBuild();
+  }
+
+  @override
+  void dispose() {
+    removeAndDisposeOverlayEntry(_entry);
+    super.dispose();
   }
 
   @override
@@ -989,30 +1188,35 @@ abstract mixin class _ImagePerPageHandler {
     }
   }
 
-  bool showSingleImageOnFirstPage() => appdata.settings.getReaderSetting(
-    cid,
-    type.sourceKey,
-    'showSingleImageOnFirstPage',
-  );
+  bool showSingleImageOnFirstPage() {
+    return shouldShowSingleImageOnFirstPage(
+      appdata.settings.getReaderSetting(
+        cid,
+        type.sourceKey,
+        'showSingleImageOnFirstPage',
+      ),
+    );
+  }
 
   /// The number of images displayed on one screen
   int get imagesPerPage {
     if (mode.isContinuous) return 1;
     if (isPortrait) {
-      return appdata.settings.getReaderSetting(
-            cid,
-            type.sourceKey,
-            'readerScreenPicNumberForPortrait',
-          ) ??
-          1;
-    } else {
-      return appdata.settings.getReaderSetting(
-            cid,
-            type.sourceKey,
-            'readerScreenPicNumberForLandscape',
-          ) ??
-          1;
+      return normalizeReaderImagesPerPage(
+        appdata.settings.getReaderSetting(
+          cid,
+          type.sourceKey,
+          'readerScreenPicNumberForPortrait',
+        ),
+      );
     }
+    return normalizeReaderImagesPerPage(
+      appdata.settings.getReaderSetting(
+        cid,
+        type.sourceKey,
+        'readerScreenPicNumberForLandscape',
+      ),
+    );
   }
 
   /// Calculate maxPage with a specific imagesPerPage value
@@ -1156,8 +1360,15 @@ abstract mixin class _ReaderLocation {
 
   void update();
 
-  bool enablePageAnimation(String cid, ComicType type) => appdata.settings
-      .getReaderSetting(cid, type.sourceKey, 'enablePageAnimation');
+  bool enablePageAnimation(String cid, ComicType type) {
+    return shouldEnableReaderPageAnimation(
+      appdata.settings.getReaderSetting(
+        cid,
+        type.sourceKey,
+        'enablePageAnimation',
+      ),
+    );
+  }
 
   _ImageViewController? _imageViewController;
 
@@ -1193,21 +1404,29 @@ abstract mixin class _ReaderLocation {
         return false;
       }
       final hasAnimation = enablePageAnimation(cid, type);
-      if (hasAnimation) {
+      final imageViewController = _imageViewController;
+      if (hasAnimation && imageViewController != null) {
         _pendingPage = page;
         _animationCount++;
         update();
-        _imageViewController!.animateToPage(page).then((_) {
-          _animationCount--;
+        void finishAnimation([Object? error, StackTrace? stackTrace]) {
+          if (error != null) {
+            Log.error('Reader page animation failed', error, stackTrace);
+          }
+          _animationCount = math.max(0, _animationCount - 1);
           if (_pendingPage == page) {
             _pendingPage = null;
           }
           update();
-        });
+        }
+
+        imageViewController
+            .animateToPage(page)
+            .then((_) => finishAnimation(), onError: finishAnimation);
       } else {
         this.page = page;
         update();
-        _imageViewController!.toPage(page);
+        imageViewController?.toPage(page);
       }
       return true;
     }
@@ -1249,10 +1468,12 @@ abstract mixin class _ReaderLocation {
       autoPageTurningTimer!.cancel();
       autoPageTurningTimer = null;
     } else {
-      int interval = appdata.settings.getReaderSetting(
-        cid,
-        type.sourceKey,
-        'autoPageTurningInterval',
+      final interval = normalizeAutoPageTurningIntervalSeconds(
+        appdata.settings.getReaderSetting(
+          cid,
+          type.sourceKey,
+          'autoPageTurningInterval',
+        ),
       );
       autoPageTurningTimer = Timer.periodic(Duration(seconds: interval), (_) {
         if (page == maxPage) {
@@ -1267,14 +1488,22 @@ abstract mixin class _ReaderLocation {
 mixin class _ReaderWindow {
   bool isFullscreen = false;
 
-  late WindowFrameController windowFrame;
+  WindowFrameController? windowFrame;
 
   bool _isInit = false;
 
+  WindowFrameController? _findWindowFrameController() {
+    final context = App.rootNavigatorKey.currentContext;
+    if (context == null || !context.mounted) return null;
+    return WindowFrame.maybeOf(context);
+  }
+
   void initReaderWindow() {
     if (!App.isDesktop || _isInit) return;
-    windowFrame = WindowFrame.of(App.rootContext);
-    windowFrame.addCloseListener(onWindowClose);
+    final controller = _findWindowFrameController();
+    if (controller == null) return;
+    windowFrame = controller;
+    controller.addCloseListener(onWindowClose);
     _isInit = true;
   }
 
@@ -1284,12 +1513,14 @@ mixin class _ReaderWindow {
     await windowManager.setFullScreen(!isFullscreen);
     await windowManager.show();
     isFullscreen = !isFullscreen;
-    WindowFrame.of(App.rootContext).setWindowFrame(!isFullscreen);
+    final controller = windowFrame ?? _findWindowFrameController();
+    controller?.setWindowFrame(!isFullscreen);
   }
 
   bool onWindowClose() {
-    if (Navigator.of(App.rootContext).canPop()) {
-      Navigator.of(App.rootContext).pop();
+    final navigator = App.rootNavigatorKey.currentState;
+    if (navigator?.canPop() ?? false) {
+      navigator?.pop();
       return false;
     } else {
       return true;
@@ -1298,7 +1529,9 @@ mixin class _ReaderWindow {
 
   void disposeReaderWindow() {
     if (!App.isDesktop) return;
-    windowFrame.removeCloseListener(onWindowClose);
+    windowFrame?.removeCloseListener(onWindowClose);
+    windowFrame = null;
+    _isInit = false;
   }
 }
 
@@ -1318,7 +1551,10 @@ enum ReaderMode {
 
   const ReaderMode(this.key);
 
-  static ReaderMode fromKey(String key) {
+  static ReaderMode fromKey(Object? key) {
+    if (key is! String) {
+      return galleryLeftToRight;
+    }
     for (var mode in values) {
       if (mode.key == key) {
         return mode;

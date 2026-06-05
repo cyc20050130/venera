@@ -14,15 +14,18 @@ class AuthPage extends StatefulWidget {
 }
 
 class _AuthPageState extends State<AuthPage> {
+  bool _authInFlight = false;
 
   @override
   void initState() {
+    super.initState();
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      if(SchedulerBinding.instance.lifecycleState != AppLifecycleState.paused) {
+      if (!mounted) return;
+      if (SchedulerBinding.instance.lifecycleState !=
+          AppLifecycleState.paused) {
         auth();
       }
     });
-    super.initState();
   }
 
   @override
@@ -43,10 +46,7 @@ class _AuthPageState extends State<AuthPage> {
               const SizedBox(height: 16),
               Text("Authentication Required".tl),
               const SizedBox(height: 16),
-              FilledButton(
-                onPressed: auth,
-                child: Text("Continue".tl),
-              ),
+              FilledButton(onPressed: auth, child: Text("Continue".tl)),
             ],
           ),
         ),
@@ -55,17 +55,28 @@ class _AuthPageState extends State<AuthPage> {
   }
 
   void auth() async {
+    if (_authInFlight) return;
+    _authInFlight = true;
     var localAuth = LocalAuthentication();
-    var canCheckBiometrics = await localAuth.canCheckBiometrics;
-    if (!canCheckBiometrics && !await localAuth.isDeviceSupported()) {
-      widget.onSuccessfulAuth?.call();
-      return;
-    }
-    var isAuthorized = await localAuth.authenticate(
-      localizedReason: "Please authenticate to continue".tl,
-    );
-    if (isAuthorized) {
-      widget.onSuccessfulAuth?.call();
+    try {
+      var canCheckBiometrics = await localAuth.canCheckBiometrics;
+      if (!mounted) return;
+      if (!canCheckBiometrics && !await localAuth.isDeviceSupported()) {
+        if (mounted) {
+          widget.onSuccessfulAuth?.call();
+        }
+        return;
+      }
+      if (!mounted) return;
+      var isAuthorized = await localAuth.authenticate(
+        localizedReason: "Please authenticate to continue".tl,
+      );
+      if (!mounted) return;
+      if (isAuthorized) {
+        widget.onSuccessfulAuth?.call();
+      }
+    } finally {
+      _authInFlight = false;
     }
   }
 }

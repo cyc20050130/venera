@@ -1,10 +1,7 @@
 part of 'comic_page.dart';
 
 class _CommentsPart extends StatefulWidget {
-  const _CommentsPart({
-    required this.comments,
-    required this.showMore,
-  });
+  const _CommentsPart({required this.comments, required this.showMore});
 
   final List<Comment> comments;
 
@@ -26,6 +23,12 @@ class _CommentsPartState extends State<_CommentsPart> {
   }
 
   @override
+  void dispose() {
+    scrollController.dispose();
+    super.dispose();
+  }
+
+  @override
   Widget build(BuildContext context) {
     return MultiSliver(
       children: [
@@ -38,6 +41,7 @@ class _CommentsPartState extends State<_CommentsPart> {
                 IconButton(
                   icon: const Icon(Icons.chevron_left),
                   onPressed: () {
+                    if (!scrollController.hasClients) return;
                     scrollController.animateTo(
                       scrollController.position.pixels - 340,
                       duration: const Duration(milliseconds: 200),
@@ -48,6 +52,7 @@ class _CommentsPartState extends State<_CommentsPart> {
                 IconButton(
                   icon: const Icon(Icons.chevron_right),
                   onPressed: () {
+                    if (!scrollController.hasClients) return;
                     scrollController.animateTo(
                       scrollController.position.pixels + 340,
                       duration: const Duration(milliseconds: 200),
@@ -89,9 +94,7 @@ class _CommentsPartState extends State<_CommentsPart> {
             ],
           ),
         ),
-        const SliverToBoxAdapter(
-          child: Divider(),
-        ),
+        const SliverToBoxAdapter(child: Divider()),
       ],
     );
   }

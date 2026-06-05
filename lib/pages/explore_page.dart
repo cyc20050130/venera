@@ -8,6 +8,7 @@ import 'package:venera/foundation/res.dart';
 import 'package:venera/pages/comic_source_page.dart';
 import 'package:venera/pages/settings/settings_page.dart';
 import 'package:venera/utils/ext.dart';
+import 'package:venera/utils/tab_controller.dart';
 import 'package:venera/utils/translations.dart';
 
 class ExplorePage extends StatefulWidget {
@@ -28,19 +29,21 @@ class _ExplorePageState extends State<ExplorePage>
   late List<String> pages;
 
   void onSettingsChanged() {
-    var explorePages = List<String>.from(appdata.settings["explore_pages"]);
+    var explorePages = appdata.settings.stringList("explore_pages");
     var all = ComicSource.all()
         .map((e) => e.explorePages)
         .expand((e) => e.map((e) => e.title))
         .toList();
     explorePages = explorePages.where((e) => all.contains(e)).toList();
     if (!pages.isEqualTo(explorePages)) {
+      final newController = replaceOwnedTabController(
+        previous: controller,
+        length: explorePages.length,
+        vsync: this,
+      );
       setState(() {
         pages = explorePages;
-        controller = TabController(
-          length: pages.length,
-          vsync: this,
-        );
+        controller = newController;
       });
     }
   }
@@ -61,16 +64,13 @@ class _ExplorePageState extends State<ExplorePage>
 
   @override
   void initState() {
-    pages = List<String>.from(appdata.settings["explore_pages"]);
+    pages = appdata.settings.stringList("explore_pages");
     var all = ComicSource.all()
         .map((e) => e.explorePages)
         .expand((e) => e.map((e) => e.title))
         .toList();
     pages = pages.where((e) => all.contains(e)).toList();
-    controller = TabController(
-      length: pages.length,
-      vsync: this,
-    );
+    controller = TabController(length: pages.length, vsync: this);
     appdata.settings.addListener(onSettingsChanged);
     NaviPane.of(context).addNaviItemTapListener(onNaviItemTapped);
     super.initState();
@@ -97,23 +97,23 @@ class _ExplorePageState extends State<ExplorePage>
   }
 
   Widget buildFAB() => Material(
-        color: Colors.transparent,
-        child: FloatingActionButton(
-          key: const Key("FAB"),
-          onPressed: refresh,
-          child: const Icon(Icons.refresh),
-        ),
-      );
+    color: Colors.transparent,
+    child: FloatingActionButton(
+      key: const Key("FAB"),
+      onPressed: refresh,
+      child: const Icon(Icons.refresh),
+    ),
+  );
 
   Tab buildTab(String i) {
-    var comicSource = ComicSource.all()
-        .firstWhere((e) => e.explorePages.any((e) => e.title == i));
+    var comicSource = ComicSource.all().firstWhere(
+      (e) => e.explorePages.any((e) => e.title == i),
+    );
     return Tab(text: i.ts(comicSource.key), key: Key(i));
   }
 
-  Widget buildBody(String i) => Material(
-        child: _SingleExplorePage(i, key: PageStorageKey(i)),
-      );
+  Widget buildBody(String i) =>
+      Material(child: _SingleExplorePage(i, key: PageStorageKey(i)));
 
   Widget buildEmpty() {
     var msg = "No Explore Pages".tl;
@@ -201,7 +201,7 @@ class _ExplorePageState extends State<ExplorePage>
                     ),
                   ),
                 ),
-              )
+              ),
             ],
           ),
         ),
@@ -214,14 +214,16 @@ class _ExplorePageState extends State<ExplorePage>
             child: showFB ? buildFAB() : const SizedBox(),
             transitionBuilder: (widget, animation) {
               var tween = Tween<Offset>(
-                  begin: const Offset(0, 1), end: const Offset(0, 0));
+                begin: const Offset(0, 1),
+                end: const Offset(0, 0),
+              );
               return SlideTransition(
                 position: tween.animate(animation),
                 child: widget,
               );
             },
           ),
-        )
+        ),
       ],
     );
   }
@@ -252,7 +254,7 @@ class _SingleExplorePageState extends AutomaticGlobalState<_SingleExplorePage>
   VoidCallback? refreshHandler;
 
   void onSettingsChanged() {
-    var explorePages = appdata.settings["explore_pages"];
+    var explorePages = appdata.settings.stringList("explore_pages");
     if (!explorePages.contains(widget.title)) {
       _wantKeepAlive = false;
       updateKeepAlive();
@@ -262,6 +264,7 @@ class _SingleExplorePageState extends AutomaticGlobalState<_SingleExplorePage>
   @override
   void initState() {
     super.initState();
+    appdata.settings.addListener(onSettingsChanged);
     for (var source in ComicSource.all()) {
       for (var d in source.explorePages) {
         if (d.title == widget.title) {
@@ -271,13 +274,14 @@ class _SingleExplorePageState extends AutomaticGlobalState<_SingleExplorePage>
         }
       }
     }
-    appdata.settings.addListener(onSettingsChanged);
+    appdata.settings.removeListener(onSettingsChanged);
     throw "Explore Page ${widget.title} Not Found!";
   }
 
   @override
   void dispose() {
     appdata.settings.removeListener(onSettingsChanged);
+    scrollController.dispose();
     super.dispose();
   }
 
@@ -316,9 +320,7 @@ class _SingleExplorePageState extends AutomaticGlobalState<_SingleExplorePage>
         },
       );
     } else {
-      return const Center(
-        child: Text("Empty Page"),
-      );
+      return const Center(child: Text("Empty Page"));
     }
   }
 
@@ -345,8 +347,13 @@ class _SingleExplorePageState extends AutomaticGlobalState<_SingleExplorePage>
 }
 
 class _MixedExplorePage extends StatefulWidget {
-  const _MixedExplorePage(this.data, this.sourceKey,
-      {super.key, this.controller, required this.refreshHandlerCallback});
+  const _MixedExplorePage(
+    this.data,
+    this.sourceKey, {
+    super.key,
+    this.controller,
+    required this.refreshHandlerCallback,
+  });
 
   final ExplorePageData data;
 
@@ -377,22 +384,18 @@ class _MixedExplorePageState
     for (var part in data) {
       if (part is ExplorePagePart) {
         if (cache.isNotEmpty) {
-          yield SliverGridComics(
-            comics: (cache),
-          );
+          yield SliverGridComics(comics: (cache));
           yield const SliverToBoxAdapter(child: Divider());
           cache.clear();
         }
         yield* _buildExplorePagePart(part, widget.sourceKey);
         yield const SliverToBoxAdapter(child: Divider());
       } else {
-        cache.addAll(part as List<Comic>);
+        cache.addAll(normalizeExploreComicList(part));
       }
     }
     if (cache.isNotEmpty) {
-      yield SliverGridComics(
-        comics: (cache),
-      );
+      yield SliverGridComics(comics: (cache));
     }
   }
 
@@ -422,8 +425,42 @@ class _MixedExplorePageState
   }
 }
 
+@visibleForTesting
+List<Comic> normalizeExploreComicList(Object? value) {
+  if (value is! Iterable) {
+    return <Comic>[];
+  }
+  return value.whereType<Comic>().toList();
+}
+
+@visibleForTesting
+Map<String, dynamic>? normalizeMultiPartExploreState(Object? value) {
+  if (value is! Map) {
+    return null;
+  }
+  final partsValue = value['parts'];
+  final parsedParts = partsValue is Iterable
+      ? partsValue.whereType<ExplorePagePart>().toList()
+      : null;
+  final parts = parsedParts == null || parsedParts.isEmpty ? null : parsedParts;
+  final messageValue = value['message'];
+  final message = messageValue is String && messageValue.isNotEmpty
+      ? messageValue
+      : null;
+  final loadingValue = value['loading'];
+  final loading = loadingValue is bool
+      ? loadingValue
+      : parts == null && message == null;
+  if (!loading && parts == null && message == null) {
+    return null;
+  }
+  return {'loading': loading, 'message': message, 'parts': parts};
+}
+
 Iterable<Widget> _buildExplorePagePart(
-    ExplorePagePart part, String sourceKey) sync* {
+  ExplorePagePart part,
+  String sourceKey,
+) sync* {
   Widget buildTitle(ExplorePagePart part) {
     return SliverToBoxAdapter(
       child: SizedBox(
@@ -434,18 +471,21 @@ Iterable<Widget> _buildExplorePagePart(
             children: [
               Text(
                 part.title,
-                style:
-                    const TextStyle(fontSize: 20, fontWeight: FontWeight.w500),
+                style: const TextStyle(
+                  fontSize: 20,
+                  fontWeight: FontWeight.w500,
+                ),
               ),
               const Spacer(),
               if (part.viewMore != null)
                 TextButton(
                   onPressed: () {
-                    var context = App.mainNavigatorKey!.currentContext!;
+                    var context = App.mainNavigatorKey?.currentContext;
+                    if (context == null || !context.mounted) return;
                     part.viewMore!.jump(context);
                   },
                   child: Text("View more".tl),
-                )
+                ),
             ],
           ),
         ),
@@ -489,19 +529,24 @@ class _MultiPartExplorePageState extends State<_MultiPartExplorePage> {
 
   bool loading = true;
 
+  bool _loadingInFlight = false;
+
+  int _loadRequestId = 0;
+
   String? message;
 
   Map<String, dynamic> get state => {
-        "loading": loading,
-        "message": message,
-        "parts": parts,
-      };
+    "loading": loading,
+    "message": message,
+    "parts": parts,
+  };
 
   void restoreState(dynamic state) {
-    if (state == null) return;
-    loading = state["loading"];
-    message = state["message"];
-    parts = state["parts"];
+    final normalized = normalizeMultiPartExploreState(state);
+    if (normalized == null) return;
+    loading = normalized["loading"] as bool;
+    message = normalized["message"] as String?;
+    parts = normalized["parts"] as List<ExplorePagePart>?;
   }
 
   void storeState() {
@@ -509,8 +554,11 @@ class _MultiPartExplorePageState extends State<_MultiPartExplorePage> {
   }
 
   void refresh() {
+    if (!mounted) return;
     setState(() {
       loading = true;
+      _loadingInFlight = false;
+      _loadRequestId++;
       message = null;
       parts = null;
     });
@@ -531,27 +579,40 @@ class _MultiPartExplorePageState extends State<_MultiPartExplorePage> {
   }
 
   void load() async {
-    var res = await data.loadMultiPart!();
-    loading = false;
-    if (mounted) {
-      setState(() {
-        if (res.error) {
-          message = res.errorMessage;
-        } else {
-          parts = res.data;
-        }
-      });
-      storeState();
+    if (_loadingInFlight) {
+      return;
     }
+    _loadingInFlight = true;
+    final requestId = ++_loadRequestId;
+    late final Res<List<ExplorePagePart>> res;
+    try {
+      res = await data.loadMultiPart!();
+    } catch (e) {
+      res = Res.error(e.toString());
+    }
+    if (!mounted) {
+      return;
+    }
+    if (requestId != _loadRequestId) {
+      return;
+    }
+    setState(() {
+      loading = false;
+      _loadingInFlight = false;
+      if (res.error) {
+        message = res.errorMessage;
+      } else {
+        parts = res.data;
+      }
+    });
+    storeState();
   }
 
   @override
   Widget build(BuildContext context) {
     if (loading) {
       load();
-      return const Center(
-        child: CircularProgressIndicator(),
-      );
+      return const Center(child: CircularProgressIndicator());
     } else if (message != null) {
       return NetworkError(
         message: message!,

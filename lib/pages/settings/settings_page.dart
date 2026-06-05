@@ -30,6 +30,33 @@ part 'about.dart';
 part 'network.dart';
 part 'debug.dart';
 
+@visibleForTesting
+int normalizeSettingsPageIndex(
+  Object? value,
+  int pageCount, {
+  bool allowUnset = true,
+}) {
+  int? page;
+  if (value is int) {
+    page = value;
+  } else if (value is num) {
+    page = value.toInt();
+  } else if (value is String) {
+    page = int.tryParse(value);
+  }
+
+  if (pageCount <= 0) {
+    return allowUnset ? -1 : 0;
+  }
+  if (allowUnset && page == -1) {
+    return -1;
+  }
+  if (page != null && page >= 0 && page < pageCount) {
+    return page;
+  }
+  return allowUnset ? -1 : 0;
+}
+
 class SettingsPage extends StatefulWidget {
   const SettingsPage({this.initialPage = -1, super.key});
 
@@ -54,7 +81,7 @@ class _SettingsPageState extends State<SettingsPage> {
     "APP",
     "Network",
     "About",
-    "Debug"
+    "Debug",
   ];
 
   final icons = <IconData>[
@@ -70,26 +97,23 @@ class _SettingsPageState extends State<SettingsPage> {
 
   @override
   void initState() {
-    currentPage = widget.initialPage;
+    currentPage = normalizeSettingsPageIndex(
+      widget.initialPage,
+      categories.length,
+    );
     super.initState();
   }
 
   @override
   Widget build(BuildContext context) {
-    return Material(
-      child: buildBody(),
-    );
+    return Material(child: buildBody());
   }
 
   Widget buildBody() {
     if (enableTwoViews) {
       return Row(
         children: [
-          SizedBox(
-            width: 280,
-            height: double.infinity,
-            child: buildLeft(),
-          ),
+          SizedBox(width: 280, height: double.infinity, child: buildLeft()),
           Container(
             height: double.infinity,
             decoration: BoxDecoration(
@@ -133,7 +157,7 @@ class _SettingsPageState extends State<SettingsPage> {
               },
               child: buildRight(),
             ),
-          )
+          ),
         ],
       );
     } else {
@@ -145,37 +169,26 @@ class _SettingsPageState extends State<SettingsPage> {
     return Material(
       child: Column(
         children: [
-          SizedBox(
-            height: MediaQuery.of(context).padding.top,
-          ),
+          SizedBox(height: MediaQuery.of(context).padding.top),
           SizedBox(
             height: 56,
-            child: Row(children: [
-              const SizedBox(
-                width: 8,
-              ),
-              Tooltip(
-                message: "Back",
-                child: IconButton(
-                  icon: const Icon(Icons.arrow_back),
-                  onPressed: context.pop,
+            child: Row(
+              children: [
+                const SizedBox(width: 8),
+                Tooltip(
+                  message: "Back",
+                  child: IconButton(
+                    icon: const Icon(Icons.arrow_back),
+                    onPressed: context.pop,
+                  ),
                 ),
-              ),
-              const SizedBox(
-                width: 24,
-              ),
-              Text(
-                "Settings".tl,
-                style: ts.s20,
-              )
-            ]),
+                const SizedBox(width: 24),
+                Text("Settings".tl, style: ts.s20),
+              ],
+            ),
           ),
-          const SizedBox(
-            height: 4,
-          ),
-          Expanded(
-            child: buildCategories(),
-          )
+          const SizedBox(height: 4),
+          Expanded(child: buildCategories()),
         ],
       ),
     );
@@ -200,16 +213,15 @@ class _SettingsPageState extends State<SettingsPage> {
             ),
           ),
         ),
-        child: Row(children: [
-          Icon(icons[id]),
-          const SizedBox(width: 16),
-          Text(
-            name,
-            style: ts.s16,
-          ),
-          const Spacer(),
-          if (selected) const Icon(Icons.arrow_right)
-        ]),
+        child: Row(
+          children: [
+            Icon(icons[id]),
+            const SizedBox(width: 16),
+            Text(name, style: ts.s16),
+            const Spacer(),
+            if (selected) const Icon(Icons.arrow_right),
+          ],
+        ),
       );
 
       return Padding(
@@ -237,14 +249,18 @@ class _SettingsPageState extends State<SettingsPage> {
   }
 
   Widget buildRight() {
-    if (currentPage == -1) {
+    final pageIndex = normalizeSettingsPageIndex(
+      currentPage,
+      categories.length,
+    );
+    if (pageIndex == -1) {
       return const SizedBox();
     }
     return Navigator(
       onGenerateRoute: (settings) {
         return PageRouteBuilder(
           pageBuilder: (context, animation, secondaryAnimation) {
-            return _buildSettingsContent(currentPage);
+            return _buildSettingsContent(pageIndex);
           },
           transitionDuration: Duration.zero,
         );
@@ -253,19 +269,28 @@ class _SettingsPageState extends State<SettingsPage> {
   }
 
   Widget _buildSettingsContent(int pageIndex) {
-    return switch (pageIndex) {
-      0 => const ExploreSettings(),
-      1 => const ReaderSettings(),
-      2 => const AppearanceSettings(),
-      3 => const LocalFavoritesSettings(),
-      4 => const AppSettings(),
-      5 => const NetworkSettings(),
-      6 => const AboutSettings(),
-      7 => const DebugPage(),
-      _ => throw UnimplementedError()
-    };
+    final normalized = normalizeSettingsPageIndex(
+      pageIndex,
+      categories.length,
+      allowUnset: false,
+    );
+    return buildSettingsPageContent(normalized);
   }
+}
 
+@visibleForTesting
+Widget buildSettingsPageContent(int pageIndex) {
+  return switch (pageIndex) {
+    0 => const ExploreSettings(),
+    1 => const ReaderSettings(),
+    2 => const AppearanceSettings(),
+    3 => const LocalFavoritesSettings(),
+    4 => const AppSettings(),
+    5 => const NetworkSettings(),
+    6 => const AboutSettings(),
+    7 => const DebugPage(),
+    _ => const ExploreSettings(),
+  };
 }
 
 class _SettingsDetailPage extends StatelessWidget {
@@ -275,22 +300,15 @@ class _SettingsDetailPage extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return Material(
-      child: _buildPage(),
-    );
+    return Material(child: _buildPage());
   }
 
   Widget _buildPage() {
-    return switch (pageIndex) {
-      0 => const ExploreSettings(),
-      1 => const ReaderSettings(),
-      2 => const AppearanceSettings(),
-      3 => const LocalFavoritesSettings(),
-      4 => const AppSettings(),
-      5 => const NetworkSettings(),
-      6 => const AboutSettings(),
-      7 => const DebugPage(),
-      _ => throw UnimplementedError()
-    };
+    final normalized = normalizeSettingsPageIndex(
+      pageIndex,
+      8,
+      allowUnset: false,
+    );
+    return buildSettingsPageContent(normalized);
   }
 }

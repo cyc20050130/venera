@@ -1,5 +1,3 @@
-import 'package:venera/utils/ext.dart';
-
 enum ImageFavoriteSortType {
   title("Title"),
   timeAsc("Time Asc"),
@@ -30,29 +28,39 @@ class TimeRange {
 
   static const lastMonth = TimeRange(end: null, duration: Duration(days: 30));
 
-  static const lastHalfYear =
-      TimeRange(end: null, duration: Duration(days: 180));
+  static const lastHalfYear = TimeRange(
+    end: null,
+    duration: Duration(days: 180),
+  );
 
   static const lastYear = TimeRange(end: null, duration: Duration(days: 365));
 
   @override
   String toString() {
-    return "${end?.millisecond}:${duration.inMilliseconds}";
+    return "${end?.millisecondsSinceEpoch}:${duration.inMilliseconds}";
   }
 
   /// Parse a time range from a string, return [TimeRange.all] if failed
-  factory TimeRange.fromString(String? str) {
-    if (str == null) {
+  factory TimeRange.fromString(Object? value) {
+    if (value is! String) {
       return TimeRange.all;
     }
-    final parts = str.split(":");
-    if (parts.length != 2 || !parts[0].isInt || !parts[1].isInt) {
+    final parts = value.split(":");
+    if (parts.length != 2) {
       return TimeRange.all;
     }
-    final end = parts[0] == "null"
+    final durationMs = int.tryParse(parts[1]);
+    if (durationMs == null || durationMs < 0) {
+      return TimeRange.all;
+    }
+    final endMs = parts[0] == "null" ? null : int.tryParse(parts[0]);
+    if (parts[0] != "null" && endMs == null) {
+      return TimeRange.all;
+    }
+    final end = endMs == null
         ? null
-        : DateTime.fromMillisecondsSinceEpoch(int.parse(parts[0]));
-    final duration = Duration(milliseconds: int.parse(parts[1]));
+        : DateTime.fromMillisecondsSinceEpoch(endMs);
+    final duration = Duration(milliseconds: durationMs);
     return TimeRange(end: end, duration: duration);
   }
 
@@ -87,6 +95,20 @@ class TimeRange {
   ];
 }
 
+int normalizeImageFavoriteNumberFilter(Object? value) {
+  final parsed = switch (value) {
+    int() => value,
+    num() when value.isFinite && value == value.truncateToDouble() =>
+      value.toInt(),
+    String() => int.tryParse(value),
+    _ => null,
+  };
+  if (parsed != null && numFilterList.contains(parsed)) {
+    return parsed;
+  }
+  return numFilterList[0];
+}
+
 enum TimeRangeType {
   all("All"),
   lastWeek("Last Week"),
@@ -98,4 +120,26 @@ enum TimeRangeType {
   final String value;
 
   const TimeRangeType(this.value);
+}
+
+TimeRange? resolveImageFavoriteTimeRangeSelection({
+  required TimeRangeType type,
+  DateTime? start,
+  DateTime? end,
+}) {
+  return switch (type) {
+    TimeRangeType.all => TimeRange.all,
+    TimeRangeType.lastWeek => TimeRange.lastWeek,
+    TimeRangeType.lastMonth => TimeRange.lastMonth,
+    TimeRangeType.lastHalfYear => TimeRange.lastHalfYear,
+    TimeRangeType.lastYear => TimeRange.lastYear,
+    TimeRangeType.custom => _resolveCustomTimeRange(start: start, end: end),
+  };
+}
+
+TimeRange? _resolveCustomTimeRange({DateTime? start, DateTime? end}) {
+  if (start == null || end == null || end.isBefore(start)) {
+    return null;
+  }
+  return TimeRange(end: end, duration: end.difference(start));
 }

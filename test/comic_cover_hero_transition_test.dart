@@ -71,6 +71,64 @@ void main() {
     },
   );
 
+  test(
+    'resolveCoverDecodeDimension clamps invalid and oversized dimensions',
+    () {
+      expect(resolveCoverDecodeDimension(100, 2.5), 250);
+      expect(resolveCoverDecodeDimension(0, 2), isNull);
+      expect(resolveCoverDecodeDimension(-1, 2), isNull);
+      expect(resolveCoverDecodeDimension(100, 0), isNull);
+      expect(resolveCoverDecodeDimension(double.nan, 2), isNull);
+      expect(resolveCoverDecodeDimension(100, double.infinity), isNull);
+      expect(resolveCoverDecodeDimension(5000, 3), 4096);
+    },
+  );
+
+  test('comic page cover has a stable logical decode surface', () {
+    expect(comicPageCoverLogicalHeight, 144);
+    expect(comicPageCoverLogicalWidth, 144 * 0.72);
+  });
+
+  test('comic thumbnails keep a bounded decode surface', () {
+    expect(comicThumbnailMaxCrossAxisExtent, 200);
+    expect(comicThumbnailChildAspectRatio, 0.68);
+    expect(
+      resolveCoverDecodeDimension(
+        comicThumbnailMaxCrossAxisExtent / comicThumbnailChildAspectRatio,
+        3,
+      ),
+      883,
+    );
+  });
+
+  test('comic thumbnail parser extracts optional crop ranges', () {
+    final thumbnail = parseComicThumbnailSpec(
+      'https://example.test/a.jpg@x=0.1-0.9&y=0.2-0.8',
+    );
+
+    expect(thumbnail.url, 'https://example.test/a.jpg');
+    expect(thumbnail.part?.x1, 0.1);
+    expect(thumbnail.part?.x2, 0.9);
+    expect(thumbnail.part?.y1, 0.2);
+    expect(thumbnail.part?.y2, 0.8);
+  });
+
+  test('comic thumbnail parser ignores malformed crop suffixes', () {
+    expect(parseComicThumbnailSpec('https://example.test/a.jpg').part, isNull);
+    expect(parseComicThumbnailSpec('https://example.test/a.jpg@').part, isNull);
+    expect(
+      parseComicThumbnailSpec('https://example.test/a.jpg@x=bad&y=1').part,
+      isNull,
+    );
+  });
+
+  test('comic pagination cursor normalizes source values', () {
+    expect(normalizeComicPaginationCursor('next'), 'next');
+    expect(normalizeComicPaginationCursor(2), '2');
+    expect(normalizeComicPaginationCursor(''), isNull);
+    expect(normalizeComicPaginationCursor(null), isNull);
+  });
+
   testWidgets(
     'AnimatedImage skips AnimatedSwitcher when first frame animation is disabled',
     (tester) async {
@@ -120,6 +178,45 @@ void main() {
 
   test('comic page opens reader with snapshotting disabled', () {
     expect(comicPageReaderAllowSnapshotting, isFalse);
+  });
+
+  testWidgets('IOSBackGestureController cancel stops user gesture once', (
+    tester,
+  ) async {
+    final navigatorKey = GlobalKey<NavigatorState>();
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Navigator(
+          key: navigatorKey,
+          onGenerateRoute: (settings) =>
+              MaterialPageRoute<void>(builder: (_) => const SizedBox()),
+        ),
+      ),
+    );
+
+    navigatorKey.currentState!.push(
+      MaterialPageRoute<void>(builder: (_) => const SizedBox()),
+    );
+    await tester.pumpAndSettle();
+
+    final navigator = navigatorKey.currentState!;
+    final animationController = AnimationController(
+      vsync: tester,
+      duration: const Duration(milliseconds: 300),
+    );
+    addTearDown(animationController.dispose);
+    final controller = IOSBackGestureController(animationController, navigator);
+
+    expect(navigator.userGestureInProgress, isTrue);
+
+    controller.cancel();
+    expect(navigator.userGestureInProgress, isFalse);
+
+    controller.cancel();
+    controller.dragEnd(0);
+    expect(navigator.userGestureInProgress, isFalse);
+    expect(tester.takeException(), isNull);
   });
 }
 

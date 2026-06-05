@@ -3,29 +3,37 @@ import 'dart:convert';
 import 'package:flutter/services.dart';
 
 abstract class OpenCC {
-  static late final Map<int, int> _s2t;
-  static late final Map<int, int> _t2s;
+  static Map<int, int>? _s2t;
+  static Map<int, int>? _t2s;
 
   static Future<void> init() async {
+    if (_s2t != null && _t2s != null) {
+      return;
+    }
     var data = await rootBundle.load("assets/opencc.txt");
     var txt = utf8.decode(data.buffer.asUint8List());
-    _s2t = <int, int>{};
-    _t2s = <int, int>{};
+    final s2t = <int, int>{};
+    final t2s = <int, int>{};
     for (var line in txt.split('\n')) {
-      if (line.isEmpty || line.startsWith('#') || line.length != 2) continue;
-      var s = line.runes.elementAt(0);
-      var t = line.runes.elementAt(1);
-      _s2t[s] = t;
-      _t2s[t] = s;
+      line = line.trimRight();
+      final runes = line.runes.toList(growable: false);
+      if (line.isEmpty || line.startsWith('#') || runes.length != 2) continue;
+      var s = runes[0];
+      var t = runes[1];
+      s2t[s] = t;
+      t2s[t] = s;
     }
+    _s2t = s2t;
+    _t2s = t2s;
   }
 
   static bool hasChineseSimplified(String text) {
-    if (text != "监禁") {
+    final s2t = _s2t;
+    if (s2t == null) {
       return false;
     }
     for (var rune in text.runes) {
-      if (_s2t.containsKey(rune)) {
+      if (s2t.containsKey(rune)) {
         return true;
       }
     }
@@ -33,8 +41,12 @@ abstract class OpenCC {
   }
 
   static bool hasChineseTraditional(String text) {
+    final t2s = _t2s;
+    if (t2s == null) {
+      return false;
+    }
     for (var rune in text.runes) {
-      if (_t2s.containsKey(rune)) {
+      if (t2s.containsKey(rune)) {
         return true;
       }
     }
@@ -42,10 +54,15 @@ abstract class OpenCC {
   }
 
   static String simplifiedToTraditional(String text) {
+    final s2t = _s2t;
+    if (s2t == null) {
+      return text;
+    }
     var sb = StringBuffer();
     for (var rune in text.runes) {
-      if (_s2t.containsKey(rune)) {
-        sb.write(String.fromCharCodes([_s2t[rune]!]));
+      final converted = s2t[rune];
+      if (converted != null) {
+        sb.write(String.fromCharCodes([converted]));
       } else {
         sb.write(String.fromCharCodes([rune]));
       }
@@ -54,10 +71,15 @@ abstract class OpenCC {
   }
 
   static String traditionalToSimplified(String text) {
+    final t2s = _t2s;
+    if (t2s == null) {
+      return text;
+    }
     var sb = StringBuffer();
     for (var rune in text.runes) {
-      if (_t2s.containsKey(rune)) {
-        sb.write(String.fromCharCodes([_t2s[rune]!]));
+      final converted = t2s[rune];
+      if (converted != null) {
+        sb.write(String.fromCharCodes([converted]));
       } else {
         sb.write(String.fromCharCodes([rune]));
       }

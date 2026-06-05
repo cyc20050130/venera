@@ -47,13 +47,16 @@ class Select extends StatelessWidget {
               offset.dy,
             ),
             items: values
-                .map((e) => PopupMenuItem(
-                      height: App.isMobile ? 46 : 40,
-                      value: e,
-                      child: Text(e),
-                    ))
+                .map(
+                  (e) => PopupMenuItem(
+                    height: App.isMobile ? 46 : 40,
+                    value: e,
+                    child: Text(e),
+                  ),
+                )
                 .toList(),
           ).then((value) {
+            if (!context.mounted) return;
             if (value != null) {
               onTap?.call(values.indexOf(value));
             }
@@ -78,11 +81,12 @@ class Select extends StatelessWidget {
 }
 
 class FilterChipFixedWidth extends StatefulWidget {
-  const FilterChipFixedWidth(
-      {required this.label,
-      required this.selected,
-      required this.onSelected,
-      super.key});
+  const FilterChipFixedWidth({
+    required this.label,
+    required this.selected,
+    required this.onSelected,
+    super.key,
+  });
 
   final Widget label;
 
@@ -110,8 +114,12 @@ class _FilterChipFixedWidthState extends State<FilterChipFixedWidth> {
   }
 
   void measureSize() {
-    final RenderBox renderBox =
-        key.currentContext!.findRenderObject() as RenderBox;
+    if (!mounted) return;
+    final keyContext = key.currentContext;
+    if (keyContext == null) return;
+    final renderObject = keyContext.findRenderObject();
+    if (renderObject is! RenderBox || !renderObject.hasSize) return;
+    final renderBox = renderObject;
     labelWidth = renderBox.size.width;
     labelHeight = renderBox.size.height;
     setState(() {});
@@ -142,10 +150,7 @@ class _FilterChipFixedWidthState extends State<FilterChipFixedWidth> {
 
   Widget firstBuild() {
     return Center(
-      child: SizedBox(
-        key: key,
-        child: widget.label,
-      ),
+      child: SizedBox(key: key, child: widget.label),
     );
   }
 
@@ -169,7 +174,7 @@ class _FilterChipFixedWidthState extends State<FilterChipFixedWidth> {
               bottom: 0,
               right: labelWidth! + gap,
               child: const AnimatedCheckIcon(size: iconSize).toCenter(),
-            )
+            ),
         ],
       ),
     );
@@ -245,19 +250,17 @@ class _AnimatedCheckIconState extends State<AnimatedCheckIcon>
 
   @override
   Widget build(BuildContext context) {
-    return AnimatedCheckWidget(
-      animation: animation,
-      size: widget.size,
-    );
+    return AnimatedCheckWidget(animation: animation, size: widget.size);
   }
 }
 
 class OptionChip extends StatelessWidget {
-  const OptionChip(
-      {super.key,
-      required this.text,
-      required this.isSelected,
-      required this.onTap});
+  const OptionChip({
+    super.key,
+    required this.text,
+    required this.isSelected,
+    required this.onTap,
+  });
 
   final String text;
 

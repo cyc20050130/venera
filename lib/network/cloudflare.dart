@@ -1,6 +1,7 @@
 import 'dart:io' as io;
 
 import 'package:dio/dio.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter_inappwebview/flutter_inappwebview.dart';
 import 'package:venera/foundation/app.dart';
 import 'package:venera/foundation/appdata.dart';
@@ -28,13 +29,14 @@ class CloudflareException implements DioException {
   }
 
   @override
-  DioException copyWith(
-      {RequestOptions? requestOptions,
-      Response<dynamic>? response,
-      DioExceptionType? type,
-      Object? error,
-      StackTrace? stackTrace,
-      String? message}) {
+  DioException copyWith({
+    RequestOptions? requestOptions,
+    Response<dynamic>? response,
+    DioExceptionType? type,
+    Object? error,
+    StackTrace? stackTrace,
+    String? message,
+  }) {
     return this;
   }
 
@@ -70,7 +72,7 @@ class CloudflareInterceptor extends Interceptor {
   }
 
   @override
-  void onError(DioException err, ErrorInterceptorHandler handler) async {
+  void onError(DioException err, ErrorInterceptorHandler handler) {
     if (err.response?.statusCode == 403) {
       handler.next(_check(err.response!) ?? err);
     } else {
@@ -98,25 +100,94 @@ class CloudflareInterceptor extends Interceptor {
   }
 }
 
+@visibleForTesting
+Uri? parseCloudflareChallengeUri(String url) {
+  try {
+    if (_hasMalformedPercentEncoding(url)) {
+      return null;
+    }
+    final uri = Uri.parse(url);
+    if (!uri.hasScheme || uri.host.isEmpty) {
+      return null;
+    }
+    final scheme = uri.scheme.toLowerCase();
+    if (scheme != 'http' && scheme != 'https') {
+      return null;
+    }
+    return uri;
+  } catch (_) {
+    return null;
+  }
+}
+
+bool _hasMalformedPercentEncoding(String value) {
+  for (var i = 0; i < value.length; i++) {
+    if (value.codeUnitAt(i) != 0x25) {
+      continue;
+    }
+    if (i + 2 >= value.length ||
+        !_isHexDigit(value.codeUnitAt(i + 1)) ||
+        !_isHexDigit(value.codeUnitAt(i + 2))) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool _isHexDigit(int codeUnit) {
+  return (codeUnit >= 0x30 && codeUnit <= 0x39) ||
+      (codeUnit >= 0x41 && codeUnit <= 0x46) ||
+      (codeUnit >= 0x61 && codeUnit <= 0x66);
+}
+
+@visibleForTesting
+List<io.Cookie> buildCloudflareCookies(Uri uri, Map<String, String> cookies) {
+  var domain = uri.host;
+  var splits = domain.split('.');
+  if (splits.length > 1) {
+    domain = ".${splits[splits.length - 2]}.${splits[splits.length - 1]}";
+  }
+  return List<io.Cookie>.generate(cookies.length, (index) {
+    var cookie = io.Cookie(
+      cookies.keys.elementAt(index),
+      cookies.values.elementAt(index),
+    );
+    cookie.domain = domain;
+    return cookie;
+  });
+}
+
+@visibleForTesting
+bool saveCloudflareCookies(
+  CookieJarSql? jar,
+  Uri uri,
+  Map<String, String> cookies,
+) {
+  if (jar == null || cookies.isEmpty) {
+    return false;
+  }
+  jar.saveFromResponse(uri, buildCloudflareCookies(uri, cookies));
+  return true;
+}
+
 void passCloudflare(CloudflareException e, void Function() onFinished) async {
   var url = e.url;
-  var uri = Uri.parse(url);
+  final uri = parseCloudflareChallengeUri(url);
+  if (uri == null) {
+    Log.warning("Cloudflare", "Ignoring invalid challenge URL: $url");
+    onFinished();
+    return;
+  }
 
   void saveCookies(Map<String, String> cookies) {
-    var domain = uri.host;
-    var splits = domain.split('.');
-    if (splits.length > 1) {
-      domain = ".${splits[splits.length - 2]}.${splits[splits.length - 1]}";
-    }
-    SingleInstanceCookieJar.instance!.saveFromResponse(
+    final saved = saveCloudflareCookies(
+      SingleInstanceCookieJar.instance,
       uri,
-      List<io.Cookie>.generate(cookies.length, (index) {
-        var cookie = io.Cookie(
-            cookies.keys.elementAt(index), cookies.values.elementAt(index));
-        cookie.domain = domain;
-        return cookie;
-      }),
+      cookies,
     );
+    if (!saved) {
+      Log.warning("Cloudflare", "Cookie jar is unavailable; cookies skipped");
+    }
   }
 
   // windows version of package `flutter_inappwebview` cannot get some cookies
@@ -125,14 +196,66 @@ void passCloudflare(CloudflareException e, void Function() onFinished) async {
     var webview = DesktopWebview(
       initialUrl: url,
       onTitleChange: (title, controller) async {
+        try {
+          var head =
+              (await controller.evaluateJavascript(
+                "document.head.innerHTML",
+              ))?.toString() ??
+              "";
+          var body =
+              (await controller.evaluateJavascript(
+                "document.body.innerHTML",
+              ))?.toString() ??
+              "";
+          Log.info("Cloudflare", "Checking head: $head");
+          var isChallenging =
+              head.contains('#challenge-success-text') ||
+              head.contains("#challenge-error-text") ||
+              head.contains("#challenge-form") ||
+              body.contains("challenge-platform") ||
+              body.contains("window._cf_chl_opt");
+          if (!isChallenging) {
+            Log.info(
+              "Cloudflare",
+              "Cloudflare is passed due to there is no challenge css",
+            );
+            var ua = controller.userAgent;
+            if (ua != null) {
+              appdata.implicitData['ua'] = ua;
+              appdata.writeImplicitData();
+            }
+            var cookiesMap = await controller.getCookies(url);
+            if (cookiesMap['cf_clearance'] == null) {
+              return;
+            }
+            saveCookies(cookiesMap);
+            controller.close();
+            onFinished();
+          }
+        } catch (e, s) {
+          Log.error("Cloudflare", "Failed to inspect challenge page: $e", s);
+        }
+      },
+      onClose: onFinished,
+    );
+    webview.open();
+  } else {
+    bool success = false;
+    Future<void> check(InAppWebViewController controller) async {
+      try {
         var head =
-            await controller.evaluateJavascript("document.head.innerHTML") ??
-                "";
+            (await controller.evaluateJavascript(
+              source: "document.head.innerHTML",
+            ))?.toString() ??
+            "";
         var body =
-            await controller.evaluateJavascript("document.body.innerHTML") ??
-                "";
+            (await controller.evaluateJavascript(
+              source: "document.body.innerHTML",
+            ))?.toString() ??
+            "";
         Log.info("Cloudflare", "Checking head: $head");
-        var isChallenging = head.contains('#challenge-success-text') ||
+        var isChallenging =
+            head.contains('#challenge-success-text') ||
             head.contains("#challenge-error-text") ||
             head.contains("#challenge-form") ||
             body.contains("challenge-platform") ||
@@ -142,57 +265,26 @@ void passCloudflare(CloudflareException e, void Function() onFinished) async {
             "Cloudflare",
             "Cloudflare is passed due to there is no challenge css",
           );
-          var ua = controller.userAgent;
+          var ua = await controller.getUA();
           if (ua != null) {
             appdata.implicitData['ua'] = ua;
             appdata.writeImplicitData();
           }
-          var cookiesMap = await controller.getCookies(url);
-          if (cookiesMap['cf_clearance'] == null) {
+          var cookies = await controller.getCookies(url) ?? [];
+          if (cookies.firstWhereOrNull(
+                (element) => element.name == 'cf_clearance',
+              ) ==
+              null) {
             return;
           }
-          saveCookies(cookiesMap);
-          controller.close();
-          onFinished();
+          SingleInstanceCookieJar.instance?.saveFromResponse(uri, cookies);
+          if (!success) {
+            App.rootPop();
+            success = true;
+          }
         }
-      },
-      onClose: onFinished,
-    );
-    webview.open();
-  } else {
-    bool success = false;
-    void check(InAppWebViewController controller) async {
-      var head = await controller.evaluateJavascript(
-          source: "document.head.innerHTML") as String;
-      var body = await controller.evaluateJavascript(
-          source: "document.body.innerHTML") as String;
-      Log.info("Cloudflare", "Checking head: $head");
-      var isChallenging = head.contains('#challenge-success-text') ||
-          head.contains("#challenge-error-text") ||
-          head.contains("#challenge-form") ||
-          body.contains("challenge-platform") ||
-          body.contains("window._cf_chl_opt");
-      if (!isChallenging) {
-        Log.info(
-          "Cloudflare",
-          "Cloudflare is passed due to there is no challenge css",
-        );
-        var ua = await controller.getUA();
-        if (ua != null) {
-          appdata.implicitData['ua'] = ua;
-          appdata.writeImplicitData();
-        }
-        var cookies = await controller.getCookies(url) ?? [];
-        if (cookies.firstWhereOrNull(
-                (element) => element.name == 'cf_clearance') ==
-            null) {
-          return;
-        }
-        SingleInstanceCookieJar.instance?.saveFromResponse(uri, cookies);
-        if (!success) {
-          App.rootPop();
-          success = true;
-        }
+      } catch (e, s) {
+        Log.error("Cloudflare", "Failed to inspect challenge page: $e", s);
       }
     }
 
@@ -201,19 +293,23 @@ void passCloudflare(CloudflareException e, void Function() onFinished) async {
         initialUrl: url,
         singlePage: true,
         onTitleChange: (title, controller) async {
-          check(controller);
+          await check(controller);
         },
         onLoadStop: (controller) async {
-          check(controller);
+          await check(controller);
         },
         onStarted: (controller) async {
-          var ua = await controller.getUA();
-          if (ua != null) {
-            appdata.implicitData['ua'] = ua;
-            appdata.writeImplicitData();
+          try {
+            var ua = await controller.getUA();
+            if (ua != null) {
+              appdata.implicitData['ua'] = ua;
+              appdata.writeImplicitData();
+            }
+            var cookies = await controller.getCookies(url) ?? [];
+            SingleInstanceCookieJar.instance?.saveFromResponse(uri, cookies);
+          } catch (e, s) {
+            Log.error("Cloudflare", "Failed to read challenge cookies: $e", s);
           }
-          var cookies = await controller.getCookies(url) ?? [];
-          SingleInstanceCookieJar.instance?.saveFromResponse(uri, cookies);
         },
       ),
     );

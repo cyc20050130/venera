@@ -1,5 +1,22 @@
 part of 'components.dart';
 
+@visibleForTesting
+bool shouldHandleAnimatedImageStreamEvent({
+  required bool mounted,
+  Object? streamKey,
+  Object? currentStreamKey,
+}) {
+  if (!mounted) {
+    return false;
+  }
+  if (streamKey != null &&
+      currentStreamKey != null &&
+      streamKey != currentStreamKey) {
+    return false;
+  }
+  return true;
+}
+
 class AnimatedImage extends StatefulWidget {
   /// show animation when loading is complete.
   AnimatedImage({
@@ -172,11 +189,23 @@ class _AnimatedImageState extends State<AnimatedImage>
 
   ImageStreamListener _getListener({bool recreateListener = false}) {
     if (_imageStreamListener == null || recreateListener) {
+      final streamKey = _imageStream?.key;
       _lastException = null;
       _imageStreamListener = ImageStreamListener(
-        _handleImageFrame,
-        onChunk: _handleImageChunk,
+        (imageInfo, synchronousCall) {
+          _handleImageFrame(imageInfo, synchronousCall, streamKey);
+        },
+        onChunk: (event) {
+          _handleImageChunk(event, streamKey);
+        },
         onError: (Object error, StackTrace? stackTrace) {
+          if (!shouldHandleAnimatedImageStreamEvent(
+            mounted: mounted,
+            streamKey: streamKey,
+            currentStreamKey: _imageStream?.key,
+          )) {
+            return;
+          }
           // 图片加错错误回调
           widget.onError?.call(error, stackTrace);
           setState(() {
@@ -188,7 +217,19 @@ class _AnimatedImageState extends State<AnimatedImage>
     return _imageStreamListener!;
   }
 
-  void _handleImageFrame(ImageInfo imageInfo, bool synchronousCall) {
+  void _handleImageFrame(
+    ImageInfo imageInfo,
+    bool synchronousCall,
+    Object? streamKey,
+  ) {
+    if (!shouldHandleAnimatedImageStreamEvent(
+      mounted: mounted,
+      streamKey: streamKey,
+      currentStreamKey: _imageStream?.key,
+    )) {
+      imageInfo.dispose();
+      return;
+    }
     setState(() {
       _replaceImage(info: imageInfo);
       _loadingProgress = null;
@@ -198,7 +239,14 @@ class _AnimatedImageState extends State<AnimatedImage>
     });
   }
 
-  void _handleImageChunk(ImageChunkEvent event) {
+  void _handleImageChunk(ImageChunkEvent event, Object? streamKey) {
+    if (!shouldHandleAnimatedImageStreamEvent(
+      mounted: mounted,
+      streamKey: streamKey,
+      currentStreamKey: _imageStream?.key,
+    )) {
+      return;
+    }
     setState(() {
       _loadingProgress = event;
       _lastException = null;
@@ -239,7 +287,7 @@ class _AnimatedImageState extends State<AnimatedImage>
 
     _imageStream = newStream;
     if (_isListeningToStream) {
-      _imageStream!.addListener(_getListener());
+      _imageStream!.addListener(_getListener(recreateListener: true));
     }
   }
 
@@ -248,7 +296,7 @@ class _AnimatedImageState extends State<AnimatedImage>
       return;
     }
 
-    _imageStream!.addListener(_getListener());
+    _imageStream!.addListener(_getListener(recreateListener: true));
     _completerHandle?.dispose();
     _completerHandle = null;
 

@@ -21,6 +21,22 @@ void markMainPageFirstFrameInteractive(
   controller.markHomeInteractive();
 }
 
+@visibleForTesting
+int resolveInitialMainPageIndex(Object? value, int pageCount) {
+  if (pageCount <= 0) {
+    return 0;
+  }
+  final parsed = switch (value) {
+    int() => value,
+    String() => int.tryParse(value),
+    _ => null,
+  };
+  if (parsed == null || parsed < 0 || parsed >= pageCount) {
+    return 0;
+  }
+  return parsed;
+}
+
 class MainPage extends StatefulWidget {
   const MainPage({super.key});
 
@@ -36,38 +52,51 @@ class _MainPageState extends State<MainPage> {
   void to(Widget Function() widget, {bool preventDuplicate = false}) async {
     if (preventDuplicate) {
       var page = widget();
-      if ("/${page.runtimeType}" == _observer.routes.last.toString()) return;
+      final lastRoute = _observer.routes.lastOrNull;
+      if (lastRoute != null && "/${page.runtimeType}" == lastRoute.toString()) {
+        return;
+      }
     }
-    _navigatorKey!.currentContext!.to(widget);
+    final context = _navigatorKey?.currentContext;
+    if (context == null || !context.mounted) return;
+    context.to(widget);
   }
 
   void back() {
-    _navigatorKey!.currentContext!.pop();
+    final context = _navigatorKey?.currentContext;
+    if (context == null || !context.mounted) return;
+    context.pop();
   }
 
   @override
   void initState() {
+    super.initState();
     _observer = NaviObserver();
     _navigatorKey = GlobalKey();
     App.mainNavigatorKey = _navigatorKey;
-    index = int.tryParse(appdata.settings['initialPage'].toString()) ?? 0;
+    index = resolveInitialMainPageIndex(
+      appdata.settings['initialPage'],
+      _pages.length,
+    );
     WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
       markMainPageFirstFrameInteractive(bootstrapController);
     });
-    super.initState();
+  }
+
+  @override
+  void dispose() {
+    if (App.mainNavigatorKey == _navigatorKey) {
+      App.mainNavigatorKey = null;
+    }
+    super.dispose();
   }
 
   final _pages = [
     const HomePage(),
-    const FavoritesPage(
-      key: PageStorageKey('favorites'),
-    ),
-    const ExplorePage(
-      key: PageStorageKey('explore'),
-    ),
-    const CategoriesPage(
-      key: PageStorageKey('categories'),
-    ),
+    const FavoritesPage(key: PageStorageKey('favorites')),
+    const ExplorePage(key: PageStorageKey('explore')),
+    const CategoriesPage(key: PageStorageKey('categories')),
   ];
 
   var index = 0;
@@ -106,7 +135,7 @@ class _MainPageState extends State<MainPage> {
         });
       },
       paneActions: [
-        if(index != 0)
+        if (index != 0)
           PaneActionEntry(
             icon: Icons.search,
             label: "Search".tl,
@@ -120,7 +149,7 @@ class _MainPageState extends State<MainPage> {
           onTap: () {
             to(() => const SettingsPage(), preventDuplicate: true);
           },
-        )
+        ),
       ],
       pageBuilder: (index) {
         return _pages[index];

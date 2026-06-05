@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:collection';
 import 'dart:convert';
 
 import 'package:dio/dio.dart';
@@ -14,6 +15,177 @@ import 'cloudflare.dart';
 import 'cookie_jar.dart';
 
 export 'package:dio/dio.dart';
+
+const Set<String> _ignoredPreventParallelHeaders = {
+  'prevent-parallel',
+  'cache-time',
+  'date',
+  'connection',
+  'content-length',
+  'transfer-encoding',
+};
+
+@visibleForTesting
+String? buildPreventParallelRequestKey({
+  required String method,
+  required String path,
+  Map<String, dynamic>? queryParameters,
+  Map<String, dynamic>? headers,
+  String baseUrl = '',
+}) {
+  if (method.toUpperCase() != 'GET') {
+    return null;
+  }
+  final normalizedUri = _normalizePreventParallelUri(
+    path: path,
+    queryParameters: queryParameters,
+    baseUrl: baseUrl,
+  );
+  if (normalizedUri == null) {
+    return null;
+  }
+  final normalizedHeaders = _normalizePreventParallelHeaders(headers ?? {});
+  final headerFingerprint = normalizedHeaders.entries
+      .map(
+        (entry) =>
+            '${Uri.encodeComponent(entry.key)}='
+            '${entry.value.map(Uri.encodeComponent).join(',')}',
+      )
+      .join('&');
+  return 'GET $normalizedUri $headerFingerprint';
+}
+
+String? _normalizePreventParallelUri({
+  required String path,
+  Map<String, dynamic>? queryParameters,
+  required String baseUrl,
+}) {
+  final Uri resolved;
+  try {
+    if (_hasMalformedPercentEncoding(path) ||
+        (baseUrl.isNotEmpty && _hasMalformedPercentEncoding(baseUrl))) {
+      return null;
+    }
+    final parsedPath = Uri.parse(path);
+    resolved = parsedPath.hasScheme || baseUrl.isEmpty
+        ? parsedPath
+        : Uri.parse(baseUrl).resolve(path);
+  } catch (_) {
+    return null;
+  }
+  final normalizedQuery = SplayTreeMap<String, List<String>>();
+
+  void addQueryValue(String key, Object? value) {
+    final normalizedKey = key.trim();
+    if (normalizedKey.isEmpty || value == null) {
+      return;
+    }
+    final target = normalizedQuery.putIfAbsent(normalizedKey, () => <String>[]);
+    if (value is Iterable && value is! String) {
+      for (final item in value) {
+        if (item != null) {
+          final normalizedValue = item.toString().trim();
+          if (normalizedValue.isNotEmpty) {
+            target.add(normalizedValue);
+          }
+        }
+      }
+    } else {
+      final normalizedValue = value.toString().trim();
+      if (normalizedValue.isNotEmpty) {
+        target.add(normalizedValue);
+      }
+    }
+  }
+
+  for (final entry in resolved.queryParametersAll.entries) {
+    for (final value in entry.value) {
+      addQueryValue(entry.key, value);
+    }
+  }
+  queryParameters?.forEach(addQueryValue);
+
+  final queryParts = <String>[];
+  for (final entry in normalizedQuery.entries) {
+    final values = entry.value..sort();
+    if (values.isEmpty) {
+      queryParts.add(Uri.encodeQueryComponent(entry.key));
+    } else {
+      for (final value in values) {
+        queryParts.add(
+          '${Uri.encodeQueryComponent(entry.key)}='
+          '${Uri.encodeQueryComponent(value)}',
+        );
+      }
+    }
+  }
+
+  final normalizedUri = resolved.replace(
+    scheme: resolved.scheme.toLowerCase(),
+    host: resolved.host.toLowerCase(),
+    query: queryParts.isEmpty ? null : queryParts.join('&'),
+  );
+  return normalizedUri.toString();
+}
+
+bool _hasMalformedPercentEncoding(String value) {
+  for (var i = 0; i < value.length; i++) {
+    if (value.codeUnitAt(i) != 0x25) {
+      continue;
+    }
+    if (i + 2 >= value.length ||
+        !_isHexCodeUnit(value.codeUnitAt(i + 1)) ||
+        !_isHexCodeUnit(value.codeUnitAt(i + 2))) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool _isHexCodeUnit(int codeUnit) {
+  return (codeUnit >= 0x30 && codeUnit <= 0x39) ||
+      (codeUnit >= 0x41 && codeUnit <= 0x46) ||
+      (codeUnit >= 0x61 && codeUnit <= 0x66);
+}
+
+Map<String, List<String>> _normalizePreventParallelHeaders(
+  Map<String, dynamic> headers,
+) {
+  final result = SplayTreeMap<String, List<String>>();
+  for (final entry in headers.entries) {
+    final key = entry.key.toLowerCase().trim();
+    if (key.isEmpty || _ignoredPreventParallelHeaders.contains(key)) {
+      continue;
+    }
+    final values = _normalizePreventParallelHeaderValue(entry.value);
+    if (values.isNotEmpty) {
+      result[key] = values;
+    }
+  }
+  return result;
+}
+
+List<String> _normalizePreventParallelHeaderValue(Object? value) {
+  if (value == null) {
+    return const [];
+  }
+  final values = <String>[];
+  if (value is Iterable && value is! String) {
+    for (final item in value) {
+      final normalized = item?.toString().trim() ?? '';
+      if (normalized.isNotEmpty) {
+        values.add(normalized);
+      }
+    }
+  } else {
+    final normalized = value.toString().trim();
+    if (normalized.isNotEmpty) {
+      values.add(normalized);
+    }
+  }
+  values.sort();
+  return values;
+}
 
 class MyLogInterceptor implements Interceptor {
   @override
@@ -205,15 +377,21 @@ class AppDio with DioMixin {
   AppDio([BaseOptions? options]) {
     this.options = options ?? BaseOptions();
     httpClientAdapter = RHttpAdapter();
+    interceptors.add(_PreventParallelHeaderInterceptor());
     if (App.isInitialized) {
-      interceptors.add(CookieManagerSql(SingleInstanceCookieJar.instance!));
+      final cookieJar = SingleInstanceCookieJar.instance;
+      if (cookieJar != null) {
+        interceptors.add(CookieManagerSql(cookieJar));
+      } else {
+        Log.warning("Network", "Cookie jar is unavailable; cookies disabled");
+      }
       interceptors.add(NetworkCacheManager());
       interceptors.add(CloudflareInterceptor());
       interceptors.add(MyLogInterceptor());
     }
   }
 
-  static final Map<String, bool> _requests = {};
+  static final Set<String> _requests = {};
 
   @override
   Future<Response<T>> request<T>(
@@ -225,15 +403,30 @@ class AppDio with DioMixin {
     ProgressCallback? onSendProgress,
     ProgressCallback? onReceiveProgress,
   }) async {
-    if (options?.headers?['prevent-parallel'] == 'true') {
-      while (_requests.containsKey(path)) {
+    final effectiveHeaders = _effectivePreventParallelHeaders(
+      this.options.headers,
+      options?.headers,
+    );
+    final preventParallel = _hasPreventParallelHeader(effectiveHeaders);
+    String? preventParallelKey;
+    if (preventParallel) {
+      preventParallelKey = buildPreventParallelRequestKey(
+        method: options?.method ?? this.options.method,
+        path: path,
+        queryParameters: queryParameters,
+        headers: effectiveHeaders,
+        baseUrl: this.options.baseUrl,
+      );
+    }
+    if (preventParallelKey != null) {
+      while (_requests.contains(preventParallelKey)) {
         await Future.delayed(const Duration(milliseconds: 20));
       }
-      _requests[path] = true;
-      options!.headers!.remove('prevent-parallel');
+      _requests.add(preventParallelKey);
     }
+
     try {
-      return super.request<T>(
+      return await super.request<T>(
         path,
         data: data,
         queryParameters: queryParameters,
@@ -243,10 +436,86 @@ class AppDio with DioMixin {
         onReceiveProgress: onReceiveProgress,
       );
     } finally {
-      if (_requests.containsKey(path)) {
-        _requests.remove(path);
+      if (preventParallelKey != null) {
+        _requests.remove(preventParallelKey);
       }
     }
+  }
+}
+
+Map<String, dynamic> _effectivePreventParallelHeaders(
+  Map<String, dynamic> baseHeaders,
+  Map<String, dynamic>? requestHeaders,
+) {
+  final result = <String, dynamic>{};
+
+  void setHeader(String key, dynamic value) {
+    final normalizedKey = key.toLowerCase();
+    String? existingKey;
+    for (final candidate in result.keys) {
+      if (candidate.toLowerCase() == normalizedKey) {
+        existingKey = candidate;
+        break;
+      }
+    }
+    if (existingKey != null) {
+      result.remove(existingKey);
+    }
+    result[key] = value;
+  }
+
+  baseHeaders.forEach(setHeader);
+  requestHeaders?.forEach(setHeader);
+  return result;
+}
+
+bool _hasPreventParallelHeader(Map<String, dynamic>? headers) {
+  if (headers == null) {
+    return false;
+  }
+  for (final entry in headers.entries) {
+    if (entry.key.toLowerCase() == 'prevent-parallel') {
+      return entry.value?.toString().toLowerCase() == 'true';
+    }
+  }
+  return false;
+}
+
+@visibleForTesting
+bool shouldEnableDnsOverrides(Object? value) {
+  return normalizeBoolSetting(value, false);
+}
+
+void _removePreventParallelHeader(Map<String, dynamic>? headers) {
+  if (headers == null) {
+    return;
+  }
+  final keys = headers.keys
+      .where((key) => key.toLowerCase() == 'prevent-parallel')
+      .toList(growable: false);
+  for (final key in keys) {
+    headers.remove(key);
+  }
+}
+
+class _PreventParallelHeaderInterceptor implements Interceptor {
+  @override
+  void onRequest(RequestOptions options, RequestInterceptorHandler handler) {
+    _removePreventParallelHeader(options.headers);
+    handler.next(options);
+  }
+
+  @override
+  void onResponse(
+    Response<dynamic> response,
+    ResponseInterceptorHandler handler,
+  ) {
+    handler.next(response);
+  }
+
+  @override
+  void onError(DioException err, ErrorInterceptorHandler handler) {
+    handler.next(err);
   }
 }
 
@@ -274,7 +543,7 @@ class RHttpAdapter implements HttpClientAdapter {
   }
 
   static Map<String, List<String>> _getOverrides() {
-    if (!appdata.settings['enableDnsOverrides'] == true) {
+    if (!shouldEnableDnsOverrides(appdata.settings['enableDnsOverrides'])) {
       return {};
     }
     var config = appdata.settings["dnsOverrides"];

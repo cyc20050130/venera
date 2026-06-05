@@ -11,10 +11,16 @@ extension Navigation on BuildContext {
   }
 
   bool canPop() {
+    if (!mounted) {
+      return false;
+    }
     return Navigator.of(this).canPop();
   }
 
   Future<T?> to<T>(Widget Function() builder, {bool allowSnapshotting = true}) {
+    if (!mounted) {
+      return Future<T?>.value();
+    }
     return Navigator.of(this).push<T>(
       AppPageRoute(
         builder: (context) => builder(),
@@ -27,6 +33,9 @@ extension Navigation on BuildContext {
     Widget Function() builder, {
     bool allowSnapshotting = true,
   }) {
+    if (!mounted) {
+      return Future<void>.value();
+    }
     return Navigator.of(this).pushReplacement(
       AppPageRoute(
         builder: (context) => builder(),

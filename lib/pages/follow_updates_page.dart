@@ -5,10 +5,87 @@ import 'package:venera/components/components.dart';
 import 'package:venera/foundation/app.dart';
 import 'package:venera/foundation/appdata.dart';
 import 'package:venera/foundation/favorites.dart';
+import 'package:venera/foundation/log.dart';
 import 'package:venera/utils/data_sync.dart';
 import 'package:venera/utils/translations.dart';
 import '../foundation/global_state.dart';
 import 'package:venera/foundation/follow_updates.dart';
+
+@visibleForTesting
+List<int>? parseFollowUpdateTimeParts(String? value) {
+  if (value == null || value.trim().isEmpty) {
+    return null;
+  }
+  final parts = value.split('-');
+  final result = <int>[];
+  for (final part in parts) {
+    final parsed = int.tryParse(part.trim());
+    if (parsed == null) {
+      return null;
+    }
+    result.add(parsed);
+  }
+  return result;
+}
+
+@visibleForTesting
+int compareFollowUpdateTime(String? a, String? b) {
+  final aParts = parseFollowUpdateTimeParts(a);
+  final bParts = parseFollowUpdateTimeParts(b);
+  if (aParts == null && bParts == null) {
+    return 0;
+  }
+  if (aParts == null) {
+    return 1;
+  }
+  if (bParts == null) {
+    return -1;
+  }
+  final length = aParts.length > bParts.length ? aParts.length : bParts.length;
+  for (var i = 0; i < length; i++) {
+    final aValue = i < aParts.length ? aParts[i] : 0;
+    final bValue = i < bParts.length ? bParts[i] : 0;
+    if (aValue != bValue) {
+      return bValue.compareTo(aValue);
+    }
+  }
+  return 0;
+}
+
+@visibleForTesting
+double? followUpdateProgressRatio(UpdateProgress progress) {
+  if (progress.total <= 0) {
+    return null;
+  }
+  final ratio = progress.current / progress.total;
+  if (ratio.isNaN || ratio.isInfinite) {
+    return null;
+  }
+  if (ratio < 0) {
+    return 0;
+  }
+  if (ratio > 1) {
+    return 1;
+  }
+  return ratio;
+}
+
+@visibleForTesting
+bool shouldWaitForDataSyncBeforeFollowUpdate({
+  required bool isDownloading,
+  required bool isCanceled,
+}) {
+  return isDownloading && !isCanceled;
+}
+
+@visibleForTesting
+bool shouldApplyFollowUpdateActionResult({
+  required bool mounted,
+  required int requestId,
+  required int activeRequestId,
+}) {
+  return mounted && requestId == activeRequestId;
+}
 
 class FollowUpdatesWidget extends StatefulWidget {
   const FollowUpdatesWidget({super.key});
@@ -21,7 +98,8 @@ class _FollowUpdatesWidgetState
     extends AutomaticGlobalState<FollowUpdatesWidget> {
   int _count = 0;
 
-  String? get folder => appdata.settings["followUpdatesFolder"];
+  String? get folder =>
+      resolveFollowUpdatesFolder(appdata.settings["followUpdatesFolder"]);
 
   void getCount() {
     if (folder == null) {
@@ -32,7 +110,7 @@ class _FollowUpdatesWidgetState
       _count = 0;
       appdata.settings["followUpdatesFolder"] = null;
       Future.microtask(() {
-        appdata.saveData();
+        appdata.saveDataInBackground();
       });
     } else {
       _count = LocalFavoritesManager().countUpdates(folder!);
@@ -76,9 +154,7 @@ class _FollowUpdatesWidgetState
                 height: 56,
                 child: Row(
                   children: [
-                    Center(
-                      child: Text('Follow Updates'.tl, style: ts.s18),
-                    ),
+                    Center(child: Text('Follow Updates'.tl, style: ts.s18)),
                     const Spacer(),
                     const Icon(Icons.arrow_right),
                   ],
@@ -86,17 +162,17 @@ class _FollowUpdatesWidgetState
               ).paddingHorizontal(16),
               if (_count > 0)
                 Container(
-                  padding:
-                      const EdgeInsets.symmetric(horizontal: 16, vertical: 2),
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 16,
+                    vertical: 2,
+                  ),
                   margin: const EdgeInsets.only(bottom: 16, left: 16),
                   decoration: BoxDecoration(
                     borderRadius: BorderRadius.circular(8),
                     color: Theme.of(context).colorScheme.primaryContainer,
                   ),
                   child: Text(
-                    '@c updates'.tlParams({
-                      'c': _count,
-                    }),
+                    '@c updates'.tlParams({'c': _count}),
                     style: ts.s16,
                   ),
                 ),
@@ -119,33 +195,17 @@ class FollowUpdatesPage extends StatefulWidget {
 }
 
 class _FollowUpdatesPageState extends AutomaticGlobalState<FollowUpdatesPage> {
-  String? get folder => appdata.settings["followUpdatesFolder"];
+  String? get folder =>
+      resolveFollowUpdatesFolder(appdata.settings["followUpdatesFolder"]);
 
   var updatedComics = <FavoriteItemWithUpdateInfo>[];
   var allComics = <FavoriteItemWithUpdateInfo>[];
+  int _updateRequestId = 0;
 
   /// Sort comics by update time in descending order with nulls at the end.
   void sortComics() {
     allComics.sort((a, b) {
-      if (a.updateTime == null && b.updateTime == null) {
-        return 0;
-      } else if (a.updateTime == null) {
-        return -1;
-      } else if (b.updateTime == null) {
-        return 1;
-      }
-      try {
-        var aNums = a.updateTime!.split('-').map(int.parse).toList();
-        var bNums = b.updateTime!.split('-').map(int.parse).toList();
-        for (int i = 0; i < aNums.length; i++) {
-          if (aNums[i] != bNums[i]) {
-            return bNums[i] - aNums[i];
-          }
-        }
-        return 0;
-      } catch (_) {
-        return 0;
-      }
+      return compareFollowUpdateTime(a.updateTime, b.updateTime);
     });
   }
 
@@ -225,10 +285,7 @@ class _FollowUpdatesPageState extends AutomaticGlobalState<FollowUpdatesPage> {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            ListTile(
-              leading: Icon(Icons.stars_outlined),
-              title: Text(folder!),
-            ),
+            ListTile(leading: Icon(Icons.stars_outlined), title: Text(folder!)),
             Text(
               "Automatic update checking enabled.".tl,
               style: ts.s14,
@@ -278,10 +335,7 @@ class _FollowUpdatesPageState extends AutomaticGlobalState<FollowUpdatesPage> {
               children: [
                 Icon(Icons.update),
                 const SizedBox(width: 8),
-                Text(
-                  "Updates".tl,
-                  style: ts.s18,
-                ),
+                Text("Updates".tl, style: ts.s18),
                 const Spacer(),
                 if (updatedComics.isNotEmpty)
                   IconButton(
@@ -299,7 +353,7 @@ class _FollowUpdatesPageState extends AutomaticGlobalState<FollowUpdatesPage> {
                             );
                           }
                           updateFollowUpdatesUI();
-                          appdata.saveData();
+                          appdata.saveDataInBackground();
                         },
                       );
                     },
@@ -311,10 +365,9 @@ class _FollowUpdatesPageState extends AutomaticGlobalState<FollowUpdatesPage> {
         if (updatedComics.isNotEmpty)
           SliverToBoxAdapter(
             child: Text(
-                    "The comic will be marked as no updates as soon as you read it."
-                        .tl)
-                .paddingHorizontal(16)
-                .paddingVertical(4),
+              "The comic will be marked as no updates as soon as you read it."
+                  .tl,
+            ).paddingHorizontal(16).paddingVertical(4),
           ),
         if (updatedComics.isNotEmpty)
           SliverGridComics(comics: updatedComics)
@@ -323,24 +376,23 @@ class _FollowUpdatesPageState extends AutomaticGlobalState<FollowUpdatesPage> {
             child: Row(
               children: [
                 Container(
-                  margin:
-                      const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-                  padding:
-                      const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+                  margin: const EdgeInsets.symmetric(
+                    horizontal: 16,
+                    vertical: 8,
+                  ),
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 12,
+                    vertical: 4,
+                  ),
                   decoration: BoxDecoration(
                     color: Theme.of(context).colorScheme.surfaceContainerLow,
                     borderRadius: BorderRadius.circular(16),
                   ),
                   child: Row(
                     mainAxisSize: MainAxisSize.min,
-                    children: [
-                      Text(
-                        "No updates found".tl,
-                        style: ts.s16,
-                      ),
-                    ],
+                    children: [Text("No updates found".tl, style: ts.s16)],
                   ),
-                )
+                ),
               ],
             ),
           ),
@@ -367,10 +419,7 @@ class _FollowUpdatesPageState extends AutomaticGlobalState<FollowUpdatesPage> {
               children: [
                 Icon(Icons.list),
                 const SizedBox(width: 8),
-                Text(
-                  "All Comics".tl,
-                  style: ts.s18,
-                ),
+                Text("All Comics".tl, style: ts.s18),
               ],
             ),
           ),
@@ -390,58 +439,65 @@ class _FollowUpdatesPageState extends AutomaticGlobalState<FollowUpdatesPage> {
     showDialog(
       context: App.rootContext,
       builder: (context) {
-        return StatefulBuilder(builder: (context, setState) {
-          return ContentDialog(
-            title: "Choose Folder".tl,
-            content: Column(
-              children: [
-                ListTile(
-                  title: Text("Folder".tl),
-                  trailing: Select(
-                    minWidth: 120,
-                    current: selectedFolder,
-                    values: folders,
-                    onTap: (i) {
-                      setState(() {
-                        selectedFolder = folders[i];
-                      });
-                    },
+        return StatefulBuilder(
+          builder: (context, setState) {
+            return ContentDialog(
+              title: "Choose Folder".tl,
+              content: Column(
+                children: [
+                  ListTile(
+                    title: Text("Folder".tl),
+                    trailing: Select(
+                      minWidth: 120,
+                      current: selectedFolder,
+                      values: folders,
+                      onTap: (i) {
+                        setState(() {
+                          selectedFolder = folders[i];
+                        });
+                      },
+                    ),
                   ),
+                ],
+              ),
+              actions: [
+                if (resolveFollowUpdatesFolder(
+                      appdata.settings["followUpdatesFolder"],
+                    ) !=
+                    null)
+                  TextButton(
+                    onPressed: () {
+                      disable();
+                      context.pop();
+                    },
+                    child: Text("Disable".tl),
+                  ),
+                FilledButton(
+                  onPressed: selectedFolder == null
+                      ? null
+                      : () {
+                          context.pop();
+                          setFolder(selectedFolder!);
+                        },
+                  child: Text("Confirm".tl),
                 ),
               ],
-            ),
-            actions: [
-              if (appdata.settings["followUpdatesFolder"] != null)
-                TextButton(
-                  onPressed: () {
-                    disable();
-                    context.pop();
-                  },
-                  child: Text("Disable".tl),
-                ),
-              FilledButton(
-                onPressed: selectedFolder == null
-                    ? null
-                    : () {
-                        context.pop();
-                        setFolder(selectedFolder!);
-                      },
-                child: Text("Confirm".tl),
-              ),
-            ],
-          );
-        });
+            );
+          },
+        );
       },
     );
   }
 
   void disable() {
+    _updateRequestId++;
     appdata.settings["followUpdatesFolder"] = null;
-    appdata.saveData();
+    appdata.saveDataInBackground();
     updateFollowUpdatesUI();
   }
 
   void setFolder(String folder) async {
+    final requestId = ++_updateRequestId;
     FollowUpdatesService._cancelChecking?.call();
     LocalFavoritesManager().prepareTableForFollowUpdates(folder);
 
@@ -461,26 +517,39 @@ class _FollowUpdatesPageState extends AutomaticGlobalState<FollowUpdatesPage> {
         message: "Updating comics...".tl,
       );
 
-      await for (var progress in updateFolder(folder, true)) {
-        if (isCanceled) {
-          return;
+      try {
+        await for (var progress in updateFolder(folder, true)) {
+          if (isCanceled) {
+            return;
+          }
+          loadingController.setProgress(followUpdateProgressRatio(progress));
         }
-        loadingController.setProgress(progress.current / progress.total);
+      } catch (e, s) {
+        if (!isCanceled && _shouldApplyUpdateResult(requestId)) {
+          Log.error("FollowUpdates", "Failed to set update folder: $e", s);
+        }
+        return;
+      } finally {
+        loadingController.close();
       }
-
-      loadingController.close();
     }
 
+    if (!_shouldApplyUpdateResult(requestId)) return;
     setState(() {
       appdata.settings["followUpdatesFolder"] = folder;
       updatedComics = [];
       allComics = LocalFavoritesManager().getComicsWithUpdatesInfo(folder);
       sortComics();
     });
-    appdata.saveData();
+    appdata.saveDataInBackground();
   }
 
   void checkNow() async {
+    final targetFolder = folder;
+    if (targetFolder == null) {
+      return;
+    }
+    final requestId = ++_updateRequestId;
     FollowUpdatesService._cancelChecking?.call();
 
     bool isCanceled = false;
@@ -498,16 +567,24 @@ class _FollowUpdatesPageState extends AutomaticGlobalState<FollowUpdatesPage> {
 
     int updated = 0;
 
-    await for (var progress in updateFolder(folder!, true)) {
-      if (isCanceled) {
-        return;
+    try {
+      await for (var progress in updateFolder(targetFolder, true)) {
+        if (isCanceled) {
+          return;
+        }
+        loadingController.setProgress(followUpdateProgressRatio(progress));
+        updated = progress.updated;
       }
-      loadingController.setProgress(progress.current / progress.total);
-      updated = progress.updated;
+    } catch (e, s) {
+      if (!isCanceled && _shouldApplyUpdateResult(requestId)) {
+        Log.error("FollowUpdates", "Failed to check updates: $e", s);
+      }
+      return;
+    } finally {
+      loadingController.close();
     }
 
-    loadingController.close();
-
+    if (!_shouldApplyUpdateResult(requestId)) return;
     if (updated > 0) {
       GlobalState.findOrNull<_FollowUpdatesWidgetState>()?.updateCount();
       updateComics();
@@ -515,6 +592,7 @@ class _FollowUpdatesPageState extends AutomaticGlobalState<FollowUpdatesPage> {
   }
 
   void updateComics() {
+    if (!mounted) return;
     if (folder == null) {
       setState(() {
         allComics = [];
@@ -529,6 +607,14 @@ class _FollowUpdatesPageState extends AutomaticGlobalState<FollowUpdatesPage> {
     });
   }
 
+  bool _shouldApplyUpdateResult(int requestId) {
+    return shouldApplyFollowUpdateActionResult(
+      mounted: mounted,
+      requestId: requestId,
+      activeRequestId: _updateRequestId,
+    );
+  }
+
   @override
   Object? get key => 'FollowUpdatesPage';
 }
@@ -541,11 +627,21 @@ abstract class FollowUpdatesService {
 
   static bool _isInitialized = false;
 
-  static void _check() async {
+  static Timer? _timer;
+
+  @visibleForTesting
+  static bool get isCheckerInitialized => _isInitialized;
+
+  @visibleForTesting
+  static bool get hasScheduledChecker => _timer?.isActive ?? false;
+
+  static Future<void> _check() async {
     if (_isChecking) {
       return;
     }
-    var folder = appdata.settings["followUpdatesFolder"];
+    var folder = resolveFollowUpdatesFolder(
+      appdata.settings["followUpdatesFolder"],
+    );
     if (folder == null) {
       return;
     }
@@ -556,18 +652,25 @@ abstract class FollowUpdatesService {
 
     _isChecking = true;
 
-    while (DataSync().isDownloading) {
-      await Future.delayed(const Duration(milliseconds: 100));
-    }
-
     int updated = 0;
     try {
+      while (shouldWaitForDataSyncBeforeFollowUpdate(
+        isDownloading: DataSync().isDownloading,
+        isCanceled: isCanceled,
+      )) {
+        await Future.delayed(const Duration(milliseconds: 100));
+      }
+      if (isCanceled) {
+        return;
+      }
       await for (var progress in updateFolder(folder, false)) {
         if (isCanceled) {
           return;
         }
         updated = progress.updated;
       }
+    } catch (e, s) {
+      Log.error("FollowUpdates", "Background update check failed: $e\n$s");
     } finally {
       _cancelChecking = null;
       _isChecking = false;
@@ -577,16 +680,40 @@ abstract class FollowUpdatesService {
     }
   }
 
+  static void _scheduleCheck() {
+    unawaited(_check());
+  }
+
   /// Initialize the checker.
-  static void initChecker() {
+  static void initChecker({
+    bool scheduleInitialCheck = true,
+    bool listenToDataSync = true,
+  }) {
     if (_isInitialized) return;
     _isInitialized = true;
-    _check();
-    DataSync().addListener(updateFollowUpdatesUI);
+    if (scheduleInitialCheck) {
+      _scheduleCheck();
+    }
+    if (listenToDataSync) {
+      DataSync().addListener(updateFollowUpdatesUI);
+    }
     // A short interval will not affect the performance since every comic has a check time.
-    Timer.periodic(const Duration(minutes: 10), (timer) {
-      _check();
+    _timer = Timer.periodic(const Duration(minutes: 10), (timer) {
+      _scheduleCheck();
     });
+  }
+
+  @visibleForTesting
+  static void resetForTesting() {
+    _cancelChecking?.call();
+    _cancelChecking = null;
+    _isChecking = false;
+    _isInitialized = false;
+    _timer?.cancel();
+    _timer = null;
+    if (DataSync.instance != null) {
+      DataSync().removeListener(updateFollowUpdatesUI);
+    }
   }
 }
 

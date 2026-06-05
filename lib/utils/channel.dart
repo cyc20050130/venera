@@ -6,31 +6,47 @@ class Channel<T> {
 
   final int size;
 
-  Channel(this.size) : _queue = Queue<T>();
+  Channel(this.size) : _queue = Queue<T>() {
+    if (size <= 0) {
+      throw ArgumentError.value(size, 'size', 'must be greater than zero');
+    }
+  }
 
-  Completer? _releaseCompleter;
+  Completer<void>? _releaseCompleter;
 
-  Completer? _pushCompleter;
+  Completer<void>? _pushCompleter;
 
   var currentSize = 0;
 
   var isClosed = false;
 
   Future<void> push(T item) async {
-    if (currentSize >= size) {
+    while (currentSize >= size && !isClosed) {
       _releaseCompleter ??= Completer();
-      return _releaseCompleter!.future.then((_) {
-        if (isClosed) {
-          return;
-        }
-        _queue.addLast(item);
-        currentSize++;
-      });
+      await _releaseCompleter!.future;
+    }
+    if (isClosed) {
+      return;
     }
     _queue.addLast(item);
     currentSize++;
-    _pushCompleter?.complete();
+    _completePushWaiter();
+  }
+
+  void _completePushWaiter() {
+    final completer = _pushCompleter;
+    if (completer != null && !completer.isCompleted) {
+      completer.complete();
+    }
     _pushCompleter = null;
+  }
+
+  void _completeReleaseWaiter() {
+    final completer = _releaseCompleter;
+    if (completer != null && !completer.isCompleted) {
+      completer.complete();
+    }
+    _releaseCompleter = null;
   }
 
   Future<T?> pop() async {
@@ -44,15 +60,14 @@ class Channel<T> {
     var item = _queue.removeFirst();
     currentSize--;
     if (_releaseCompleter != null && currentSize < size) {
-      _releaseCompleter!.complete();
-      _releaseCompleter = null;
+      _completeReleaseWaiter();
     }
     return item;
   }
 
   void close() {
     isClosed = true;
-    _pushCompleter?.complete();
-    _releaseCompleter?.complete();
+    _completePushWaiter();
+    _completeReleaseWaiter();
   }
 }

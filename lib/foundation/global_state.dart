@@ -4,12 +4,15 @@ abstract class GlobalState {
   static final _state = <Pair<Object?, State>>[];
 
   static void register(State state, [Object? key]) {
+    unregister(state, key);
     _state.add(Pair(key, state));
   }
 
   static T find<T extends State>([Object? key]) {
     for (var pair in _state) {
-      if ((key == null || pair.left == key) && pair.right is T) {
+      if ((key == null || pair.left == key) &&
+          pair.right.mounted &&
+          pair.right is T) {
         return pair.right as T;
       }
     }
@@ -18,7 +21,9 @@ abstract class GlobalState {
 
   static T? findOrNull<T extends State>([Object? key]) {
     for (var pair in _state) {
-      if ((key == null || pair.left == key) && pair.right is T) {
+      if ((key == null || pair.left == key) &&
+          pair.right.mounted &&
+          pair.right is T) {
         return pair.right as T;
       }
     }
@@ -27,7 +32,8 @@ abstract class GlobalState {
 
   static void unregister(State state, [Object? key]) {
     _state.removeWhere(
-        (pair) => (key == null || pair.left == key) && pair.right == state);
+      (pair) => (key == null || pair.left == key) && pair.right == state,
+    );
   }
 }
 
@@ -38,8 +44,7 @@ class Pair<K, V> {
   Pair(this.left, this.right);
 }
 
-abstract class AutomaticGlobalState<T extends StatefulWidget>
-    extends State<T> {
+abstract class AutomaticGlobalState<T extends StatefulWidget> extends State<T> {
   @override
   @mustCallSuper
   void initState() {
@@ -50,13 +55,14 @@ abstract class AutomaticGlobalState<T extends StatefulWidget>
   @override
   @mustCallSuper
   void dispose() {
-    super.dispose();
     GlobalState.unregister(this, key);
+    super.dispose();
   }
 
   Object? get key;
 
   void update() {
+    if (!mounted) return;
     setState(() {});
   }
 

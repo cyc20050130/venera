@@ -45,6 +45,130 @@ part 'actions.dart';
 
 part 'cover_viewer.dart';
 
+@visibleForTesting
+List<String> normalizeFavoriteFolderIds(Object? value) {
+  if (value is! Iterable) {
+    return <String>[];
+  }
+  return value
+      .where((element) => element != null)
+      .map((element) => element.toString())
+      .where((element) => element.isNotEmpty)
+      .toList();
+}
+
+@visibleForTesting
+bool shouldApplyComicPageAsyncResult({
+  required bool mounted,
+  required int requestId,
+  required int activeRequestId,
+}) {
+  return mounted && requestId == activeRequestId;
+}
+
+@visibleForTesting
+bool shouldApplyNetworkFavoritePanelResult({
+  required bool mounted,
+  required int requestId,
+  required int activeRequestId,
+}) {
+  return shouldApplyComicPageAsyncResult(
+    mounted: mounted,
+    requestId: requestId,
+    activeRequestId: activeRequestId,
+  );
+}
+
+@visibleForTesting
+bool shouldEnableComicPageSourceAction(ComicSource? source) {
+  return source != null;
+}
+
+@visibleForTesting
+String? normalizeComicPaginationCursor(Object? value) {
+  if (value == null) {
+    return null;
+  }
+  final cursor = value.toString();
+  return cursor.isEmpty ? null : cursor;
+}
+
+@visibleForTesting
+bool shouldReverseChapterOrder(Object? value) {
+  return normalizeBoolSetting(value, false);
+}
+
+@visibleForTesting
+int comicDetailGroupedChapterTabCount(ComicChapters chapters) {
+  return chapters.groupCount;
+}
+
+@visibleForTesting
+bool shouldShowLocalFavoritesFirst(Object? value) {
+  return normalizeBoolSetting(value, true);
+}
+
+@visibleForTesting
+bool shouldAutoCloseFavoritePanel(Object? value) {
+  return normalizeBoolSetting(value, false);
+}
+
+@visibleForTesting
+String formatComicDetailTime(String time) {
+  final timestamp = int.tryParse(time);
+  if (timestamp != null) {
+    if (timestamp > 1000000000000) {
+      return DateTime.fromMillisecondsSinceEpoch(
+        timestamp,
+      ).toString().substring(0, 19);
+    }
+    return DateTime.fromMillisecondsSinceEpoch(
+      timestamp * 1000,
+    ).toString().substring(0, 19);
+  }
+  if (time.contains('T') || time.contains('Z')) {
+    final parsed = DateTime.tryParse(time);
+    if (parsed != null) {
+      return parsed.toString().substring(0, 19);
+    }
+  }
+  return time;
+}
+
+Future<Uint8List> _imageProviderToPngBytes(
+  ImageProvider imageProvider, {
+  ImageConfiguration configuration = const ImageConfiguration(),
+}) {
+  final imageStream = imageProvider.resolve(configuration);
+  final completer = Completer<Uint8List>();
+  late final ImageStreamListener listener;
+
+  void completeError(Object error, StackTrace? stackTrace) {
+    if (!completer.isCompleted) {
+      completer.completeError(error, stackTrace);
+    }
+    imageStream.removeListener(listener);
+  }
+
+  listener = ImageStreamListener((ImageInfo info, bool _) async {
+    try {
+      final byteData = await info.image.toByteData(format: ImageByteFormat.png);
+      if (byteData == null) {
+        completeError(StateError('Failed to encode image'), null);
+        return;
+      }
+      if (!completer.isCompleted) {
+        completer.complete(byteData.buffer.asUint8List());
+      }
+      imageStream.removeListener(listener);
+    } catch (e, s) {
+      completeError(e, s);
+    }
+  }, onError: completeError);
+  imageStream.addListener(listener);
+  return completer.future;
+}
+
 void refreshComicFavoriteStatusInBackground({
   required FavoriteData? favoriteData,
   required bool isLogged,
@@ -59,13 +183,19 @@ void refreshComicFavoriteStatusInBackground({
   }
   final favoriteLoader = favoriteData!.loadFolders!;
   unawaited(() async {
-    final res = await favoriteLoader(comicId);
-    if (!isMounted() || !isCurrentRequest(requestId) || res.error) {
-      return;
-    }
-    if (res.subData is List) {
-      final list = List<String>.from(res.subData);
+    try {
+      final res = await favoriteLoader(comicId);
+      if (!isMounted() || !isCurrentRequest(requestId) || res.error) {
+        return;
+      }
+      final list = normalizeFavoriteFolderIds(res.subData);
       onFavoriteLoaded(list.isNotEmpty);
+    } catch (e, s) {
+      Log.error(
+        "ComicPage",
+        "Failed to refresh favorite status for $comicId: $e",
+        s,
+      );
     }
   }());
 }
@@ -126,6 +256,12 @@ Widget buildComicCoverHero({required String heroTag, required Widget child}) {
 
 const bool comicPageReaderAllowSnapshotting = false;
 
+@visibleForTesting
+const double comicPageCoverLogicalHeight = 144;
+
+@visibleForTesting
+const double comicPageCoverLogicalWidth = comicPageCoverLogicalHeight * 0.72;
+
 Widget buildComicPageCoverCard(
   BuildContext context, {
   required String? cover,
@@ -139,6 +275,7 @@ Widget buildComicPageCoverCard(
 }) {
   Widget child;
   if (cover != null) {
+    final devicePixelRatio = MediaQuery.devicePixelRatioOf(context);
     child = AnimatedImage(
       image: CachedImageProvider(cover, sourceKey: sourceKey, cid: cid),
       width: double.infinity,
@@ -146,6 +283,14 @@ Widget buildComicPageCoverCard(
       fit: BoxFit.cover,
       animateOnFirstFrame: animateOnFirstFrame,
       gaplessPlayback: gaplessPlayback,
+      cacheWidth: resolveCoverDecodeDimension(
+        comicPageCoverLogicalWidth,
+        devicePixelRatio,
+      ),
+      cacheHeight: resolveCoverDecodeDimension(
+        comicPageCoverLogicalHeight,
+        devicePixelRatio,
+      ),
     );
   } else {
     child = const SizedBox();
@@ -163,8 +308,8 @@ Widget buildComicPageCoverCard(
         ),
       ],
     ),
-    height: 144,
-    width: 144 * 0.72,
+    height: comicPageCoverLogicalHeight,
+    width: comicPageCoverLogicalWidth,
     clipBehavior: Clip.antiAlias,
     child: child,
   );
@@ -224,6 +369,9 @@ class _ComicPageState extends LoadingState<ComicPage, ComicDetails>
 
   @override
   BuildContext get pageContext => context;
+
+  @override
+  bool get isPageMounted => mounted;
 
   @override
   void invalidateFavoriteStatusRefresh() {
@@ -315,11 +463,13 @@ class _ComicPageState extends LoadingState<ComicPage, ComicDetails>
   void dispose() {
     _routeAnimation?.removeStatusListener(_handleRouteAnimationStatusChanged);
     scrollController.removeListener(onScroll);
+    scrollController.dispose();
     super.dispose();
   }
 
   @override
   void update() {
+    if (!mounted) return;
     setState(() {});
   }
 
@@ -393,6 +543,9 @@ class _ComicPageState extends LoadingState<ComicPage, ComicDetails>
     if (!_hasLoggedFirstInteractiveFrame) {
       _hasLoggedFirstInteractiveFrame = true;
       WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted) {
+          return;
+        }
         _logPerf('first interactive frame');
         _scheduleDeferredSections();
       });
@@ -401,6 +554,7 @@ class _ComicPageState extends LoadingState<ComicPage, ComicDetails>
       floatingActionButton: showFAB
           ? FloatingActionButton(
               onPressed: () {
+                if (!scrollController.hasClients) return;
                 scrollController.animateTo(
                   0,
                   duration: const Duration(milliseconds: 200),
@@ -440,6 +594,7 @@ class _ComicPageState extends LoadingState<ComicPage, ComicDetails>
       var history = HistoryManager().find(widget.id, ComicType.local);
       if (isFirst) {
         Future.microtask(() {
+          if (!mounted) return;
           App.rootContext.to(() {
             return Reader(
               type: ComicType.local,
@@ -456,7 +611,7 @@ class _ComicPageState extends LoadingState<ComicPage, ComicDetails>
               tags: localComic.tags,
             );
           });
-          App.mainNavigatorKey!.currentContext!.pop();
+          App.mainNavigatorKey?.currentContext?.pop();
         });
         isFirst = false;
       }
@@ -505,10 +660,11 @@ class _ComicPageState extends LoadingState<ComicPage, ComicDetails>
 
   void _refreshFavoriteStatusInBackground() {
     _logPerf('favorite refresh scheduled');
+    final source = comicSource;
     final requestId = ++_favoriteStatusRequestId;
     refreshComicFavoriteStatusInBackground(
-      favoriteData: comicSource.favoriteData,
-      isLogged: comicSource.isLogged,
+      favoriteData: source?.favoriteData,
+      isLogged: source?.isLogged ?? false,
       comicId: comic.id,
       requestId: requestId,
       isMounted: () => mounted,
@@ -582,6 +738,7 @@ class _ComicPageState extends LoadingState<ComicPage, ComicDetails>
   Widget buildActions() {
     bool isMobile = context.width < changePoint;
     bool hasHistory = history != null && (history!.ep > 1 || history!.page > 1);
+    final source = comicSource;
     return SliverLazyToBoxAdapter(
       child: Column(
         children: [
@@ -633,7 +790,7 @@ class _ComicPageState extends LoadingState<ComicPage, ComicDetails>
                 onLongPressed: quickFavorite,
                 iconColor: context.useTextColor(Colors.purple),
               ),
-              if (comicSource.commentsLoader != null)
+              if (source?.commentsLoader != null)
                 _ActionButton(
                   icon: const Icon(Icons.comment),
                   text: (comic.commentCount ?? 'Comments'.tl).toString(),
@@ -824,26 +981,6 @@ class _ComicPageState extends LoadingState<ComicPage, ComicDetails>
       }
     }
 
-    String formatTime(String time) {
-      if (int.tryParse(time) != null) {
-        var t = int.tryParse(time);
-        if (t! > 1000000000000) {
-          return DateTime.fromMillisecondsSinceEpoch(
-            t,
-          ).toString().substring(0, 19);
-        } else {
-          return DateTime.fromMillisecondsSinceEpoch(
-            t * 1000,
-          ).toString().substring(0, 19);
-        }
-      }
-      if (time.contains('T') || time.contains('Z')) {
-        var t = DateTime.parse(time);
-        return t.toString().substring(0, 19);
-      }
-      return time;
-    }
-
     Widget buildWrap({required List<Widget> children}) {
       return Wrap(
         runSpacing: 8,
@@ -852,8 +989,11 @@ class _ComicPageState extends LoadingState<ComicPage, ComicDetails>
       ).paddingHorizontal(16).paddingBottom(8);
     }
 
+    final source = comicSource;
     bool enableTranslation =
-        App.locale.languageCode == 'zh' && comicSource.enableTagsTranslate;
+        App.locale.languageCode == 'zh' &&
+        (source?.enableTagsTranslate ?? false);
+    final sourceKey = source?.key ?? comic.sourceKey;
 
     return SliverLazyToBoxAdapter(
       child: Column(
@@ -872,7 +1012,7 @@ class _ComicPageState extends LoadingState<ComicPage, ComicDetails>
             buildWrap(
               children: [
                 if (e.value.isNotEmpty)
-                  buildTag(text: e.key.ts(comicSource.key), isTitle: true),
+                  buildTag(text: e.key.ts(sourceKey), isTitle: true),
                 for (var tag in e.value)
                   buildTag(
                     text: enableTranslation
@@ -896,14 +1036,14 @@ class _ComicPageState extends LoadingState<ComicPage, ComicDetails>
             buildWrap(
               children: [
                 buildTag(text: 'Upload Time'.tl, isTitle: true),
-                buildTag(text: formatTime(comic.uploadTime!)),
+                buildTag(text: formatComicDetailTime(comic.uploadTime!)),
               ],
             ),
           if (comic.updateTime != null)
             buildWrap(
               children: [
                 buildTag(text: 'Update Time'.tl, isTitle: true),
-                buildTag(text: formatTime(comic.updateTime!)),
+                buildTag(text: formatComicDetailTime(comic.updateTime!)),
               ],
             ),
           if (comic.maxPage != null)
@@ -931,7 +1071,7 @@ class _ComicPageState extends LoadingState<ComicPage, ComicDetails>
   }
 
   Widget buildThumbnails() {
-    if (comic.thumbnails == null && comicSource.loadComicThumbnail == null) {
+    if (comic.thumbnails == null && comicSource?.loadComicThumbnail == null) {
       return const SliverPadding(padding: EdgeInsets.zero);
     }
     return const _ComicThumbnails(enabled: true);
@@ -1050,21 +1190,7 @@ class _ComicPageState extends LoadingState<ComicPage, ComicDetails>
         cid: comic.id,
       );
 
-      final imageStream = imageProvider.resolve(const ImageConfiguration());
-      final completer = Completer<Uint8List>();
-
-      imageStream.addListener(
-        ImageStreamListener((ImageInfo info, bool _) async {
-          final byteData = await info.image.toByteData(
-            format: ImageByteFormat.png,
-          );
-          if (byteData != null) {
-            completer.complete(byteData.buffer.asUint8List());
-          }
-        }),
-      );
-
-      final data = await completer.future;
+      final data = await _imageProviderToPngBytes(imageProvider);
       final fileType = detectFileType(data);
       await saveFile(filename: "cover${fileType.ext}", data: data);
     } catch (e) {

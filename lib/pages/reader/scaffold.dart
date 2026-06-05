@@ -1,5 +1,25 @@
 part of 'reader.dart';
 
+@visibleForTesting
+int? normalizeSelectedReaderImageIndex({
+  required int? index,
+  required int imageCount,
+}) {
+  if (index == null || index < 0 || index >= imageCount) {
+    return null;
+  }
+  return index;
+}
+
+@visibleForTesting
+bool shouldUseReaderImageSelectionResult({
+  required bool mounted,
+  required bool imageViewControllerUnchanged,
+  required Offset? location,
+}) {
+  return mounted && imageViewControllerUnchanged && location != null;
+}
+
 class _ReaderScaffold extends StatefulWidget {
   const _ReaderScaffold({required this.child});
 
@@ -11,6 +31,11 @@ class _ReaderScaffold extends StatefulWidget {
 
 class _ReaderScaffoldState extends State<_ReaderScaffold> {
   bool _isOpen = false;
+
+  late final ReaderSelectImageOverlayController _selectImageOverlayController =
+      ReaderSelectImageOverlayController(
+        overlayProvider: () => Overlay.of(context),
+      );
 
   static const kTopBarHeight = 56.0;
 
@@ -113,13 +138,17 @@ class _ReaderScaffoldState extends State<_ReaderScaffold> {
 
   @override
   void dispose() {
+    _selectImageOverlayController.dispose();
     sliderFocus.dispose();
     super.dispose();
   }
 
   void openOrClose() {
     final nextOpen = !_isOpen;
-    if (nextOpen || appdata.settings['showSystemStatusBar']) {
+    if (nextOpen ||
+        shouldShowReaderSystemStatusBar(
+          appdata.settings['showSystemStatusBar'],
+        )) {
       SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
     } else {
       SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersive);
@@ -132,6 +161,9 @@ class _ReaderScaffoldState extends State<_ReaderScaffold> {
   bool? rotation;
 
   void update() {
+    if (!mounted) {
+      return;
+    }
     setState(() {});
   }
 
@@ -283,6 +315,7 @@ class _ReaderScaffoldState extends State<_ReaderScaffold> {
       int maxPage = context.reader.images!.length;
       int? page = await selectImage();
       if (page == null) return;
+      if (!mounted) return;
       page += 1;
       String sourceKey = context.reader.type.sourceKey;
       String imageKey = context.reader.images![page - 1];
@@ -397,7 +430,9 @@ class _ReaderScaffoldState extends State<_ReaderScaffold> {
       update();
     } catch (e, stackTrace) {
       Log.error("Image Favorite", e, stackTrace);
-      showToast(message: e.toString(), context: context, seconds: 1);
+      if (mounted) {
+        showToast(message: e.toString(), context: context, seconds: 1);
+      }
     }
   }
 
@@ -668,7 +703,9 @@ class _ReaderScaffoldState extends State<_ReaderScaffold> {
   }
 
   Widget buildStatusInfo() {
-    if (appdata.settings['enableClockAndBatteryInfoInReader']) {
+    if (shouldShowReaderClockAndBatteryInfo(
+      appdata.settings['enableClockAndBatteryInfoInReader'],
+    )) {
       return Positioned(
         bottom: 13,
         right: 25,
@@ -703,6 +740,7 @@ class _ReaderScaffoldState extends State<_ReaderScaffold> {
     if (result == null) {
       return;
     }
+    if (!mounted) return;
     var (imageIndex, data) = result;
     var fileType = detectFileType(data);
     // Save file name: ComicName_EP{chapter}_P{page}.{ext} to avoid conflict.
@@ -721,6 +759,7 @@ class _ReaderScaffoldState extends State<_ReaderScaffold> {
     if (result == null) {
       return;
     }
+    if (!mounted) return;
     var (imageIndex, data) = result;
     var fileType = detectFileType(data);
     var filename =
@@ -744,10 +783,12 @@ class _ReaderScaffoldState extends State<_ReaderScaffold> {
             );
           }
           if (key == "enableTurnPageByVolumeKey") {
-            if (appdata.settings.getReaderSetting(
-              context.reader.cid,
-              context.reader.type.sourceKey,
-              key,
+            if (shouldEnableReaderVolumeKey(
+              appdata.settings.getReaderSetting(
+                context.reader.cid,
+                context.reader.type.sourceKey,
+                key,
+              ),
             )) {
               context.reader.handleVolumeEvent();
             } else {
@@ -758,10 +799,12 @@ class _ReaderScaffoldState extends State<_ReaderScaffold> {
             addDragListener();
           }
           if (key == "showSystemStatusBar") {
-            final showStatusBar = appdata.settings.getReaderSetting(
-              context.reader.cid,
-              context.reader.type.sourceKey,
-              key,
+            final showStatusBar = shouldShowReaderSystemStatusBar(
+              appdata.settings.getReaderSetting(
+                context.reader.cid,
+                context.reader.type.sourceKey,
+                key,
+              ),
             );
             if (isOpen || showStatusBar) {
               SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
@@ -911,6 +954,10 @@ class _ReaderScaffoldState extends State<_ReaderScaffold> {
   /// The return value is the index of the selected image.
   Future<int?> selectImage() async {
     var reader = context.reader;
+    final images = reader.images;
+    if (images == null || images.isEmpty) {
+      return null;
+    }
     var imageViewController = context.reader._imageViewController;
 
     bool needsSelection = false;
@@ -923,46 +970,90 @@ class _ReaderScaffoldState extends State<_ReaderScaffold> {
         int actualImageCount = endIndex - startIndex;
         if (actualImageCount == 1) {
           needsSelection = false;
-          singleImageIndex = startIndex;
+          singleImageIndex = normalizeSelectedReaderImageIndex(
+            index: startIndex,
+            imageCount: images.length,
+          );
         } else {
           needsSelection = true;
         }
       }
     } else if (imageViewController is _ContinuousModeState) {
       needsSelection = false;
-      singleImageIndex = reader.page - 1;
+      singleImageIndex = normalizeSelectedReaderImageIndex(
+        index: reader.page - 1,
+        imageCount: images.length,
+      );
     }
 
     if (!needsSelection && singleImageIndex != null) {
       return singleImageIndex;
     } else {
       var location = await _showSelectImageOverlay();
-      if (location == null) {
+      if (!shouldUseReaderImageSelectionResult(
+        mounted: mounted,
+        imageViewControllerUnchanged:
+            reader._imageViewController == imageViewController,
+        location: location,
+      )) {
         return null;
       }
-      var imageKey = imageViewController!.getImageKeyByOffset(location);
+      if (imageViewController == null) {
+        return null;
+      }
+      var imageKey = imageViewController.getImageKeyByOffset(location!);
       if (imageKey == null) {
         return null;
       }
-      return reader.images!.indexOf(imageKey);
+      return normalizeSelectedReaderImageIndex(
+        index: images.indexOf(imageKey),
+        imageCount: images.length,
+      );
     }
   }
 
   /// Same as [selectImage], but return the image data with its index.
   /// Returns (imageIndex, imageData) or null if cancelled.
   Future<(int, Uint8List)?> selectImageToData() async {
+    final reader = context.reader;
     var i = await selectImage();
+    if (!mounted) {
+      return null;
+    }
     if (i == null) {
       return null;
     }
-    var imageKey = context.reader.images![i];
+    final images = reader.images;
+    i = normalizeSelectedReaderImageIndex(
+      index: i,
+      imageCount: images?.length ?? 0,
+    );
+    if (i == null || images == null) {
+      return null;
+    }
+    var imageKey = images[i];
     Uint8List data;
-    if (imageKey.startsWith("file://")) {
-      data = await File(imageKey.substring(7)).readAsBytes();
-    } else {
-      data = await (await CacheManager().findCache(
-        "$imageKey@${context.reader.type.sourceKey}@${context.reader.cid}@${context.reader.eid}",
-      ))!.readAsBytes();
+    try {
+      if (imageKey.startsWith("file://")) {
+        data = await File(localFilePathFromUri(imageKey)).readAsBytes();
+      } else {
+        final cache = await CacheManager().findCache(
+          "$imageKey@${reader.type.sourceKey}@${reader.cid}@${reader.eid}",
+        );
+        if (!mounted) {
+          return null;
+        }
+        if (cache == null) {
+          return null;
+        }
+        data = await cache.readAsBytes();
+      }
+    } catch (e, s) {
+      Log.error("Reader", "Failed to read selected image: $e", s);
+      return null;
+    }
+    if (!mounted) {
+      return null;
     }
     return (i, data);
   }
@@ -972,30 +1063,78 @@ class _ReaderScaffoldState extends State<_ReaderScaffold> {
       openOrClose();
     }
 
-    var completer = Completer<Offset?>();
+    return _selectImageOverlayController.show();
+  }
+}
 
-    var overlay = Overlay.of(context);
-    OverlayEntry? entry;
+@visibleForTesting
+class ReaderSelectImageOverlayController {
+  ReaderSelectImageOverlayController({
+    required OverlayState Function() overlayProvider,
+  }) : _overlayProvider = overlayProvider;
+
+  final OverlayState Function() _overlayProvider;
+  OverlayEntry? _entry;
+  Completer<Offset?>? _completer;
+
+  Future<Offset?> show() {
+    final activeCompleter = _completer;
+    if (activeCompleter != null) {
+      return activeCompleter.future;
+    }
+
+    final completer = Completer<Offset?>();
+    _completer = completer;
+
+    late final OverlayEntry entry;
     entry = OverlayEntry(
       builder: (context) {
         return Positioned.fill(
           child: _SelectImageOverlayContent(
-            onTap: (offset) {
-              completer.complete(offset);
-              entry!.remove();
-            },
+            onTap: (offset) => _finish(offset),
             onDispose: () {
-              if (!completer.isCompleted) {
-                completer.complete(null);
+              if (identical(_entry, entry)) {
+                _entry = null;
+                _complete(null);
               }
             },
           ),
         );
       },
     );
-    overlay.insert(entry);
+
+    _entry = entry;
+    _overlayProvider().insert(entry);
 
     return completer.future;
+  }
+
+  @visibleForTesting
+  bool get isShowing => _entry != null;
+
+  void dispose() {
+    _finish(null);
+  }
+
+  void _finish(Offset? result) {
+    final entry = _entry;
+    if (entry == null) {
+      _complete(result);
+      return;
+    }
+
+    _entry = null;
+    _complete(result);
+    entry.remove();
+    entry.dispose();
+  }
+
+  void _complete(Offset? result) {
+    final completer = _completer;
+    _completer = null;
+    if (completer != null && !completer.isCompleted) {
+      completer.complete(result);
+    }
   }
 }
 
@@ -1022,12 +1161,14 @@ class _BatteryWidgetState extends State<_BatteryWidget> {
     try {
       _batteryLevel = await _battery.batteryLevel;
       state = await _battery.batteryState;
+      if (!mounted) return;
       if (_batteryLevel > 0 && state != BatteryState.unknown) {
         setState(() {
           _hasBattery = true;
         });
         _timer = Timer.periodic(const Duration(seconds: 1), (timer) {
           _battery.batteryLevel.then((level) {
+            if (!mounted) return;
             if (_batteryLevel != level) {
               setState(() {
                 _batteryLevel = level;
@@ -1137,6 +1278,9 @@ class _ClockWidgetState extends State<_ClockWidget> {
     _timer = Timer.periodic(const Duration(seconds: 1), (timer) {
       final time = _getCurrentTime();
       if (_currentTime != time) {
+        if (!mounted) {
+          return;
+        }
         setState(() {
           _currentTime = time;
         });
@@ -1222,11 +1366,15 @@ class _SelectImageOverlayContentState
                 const SizedBox(width: 8),
                 const Icon(Icons.info_outline),
                 const SizedBox(width: 16),
-                Text(
-                  "Click to select an image".tl,
-                  style: TextStyle(
-                    fontSize: 16,
-                    color: context.colorScheme.onSurface,
+                Expanded(
+                  child: Text(
+                    "Click to select an image".tl,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(
+                      fontSize: 16,
+                      color: context.colorScheme.onSurface,
+                    ),
                   ),
                 ),
               ],

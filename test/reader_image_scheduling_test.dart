@@ -281,6 +281,45 @@ void main() {
     },
   );
 
+  test('lifecycle resume quiet defers prefetches but not visible images', () {
+    final now = DateTime(2026, 6, 3, 20);
+    ImageDownloader.debugSetReaderLifecycleQuietUntil(
+      now.add(const Duration(milliseconds: 900)),
+    );
+
+    expect(
+      ImageDownloader.shouldDeferReaderImageLoadForLifecycle(
+        ReaderImageLoadPriority.sameChapterPrefetch,
+        now: now,
+      ),
+      isTrue,
+    );
+    expect(
+      ImageDownloader.shouldDeferReaderImageLoadForLifecycle(
+        ReaderImageLoadPriority.nextChapterPrefetch,
+        now: now,
+      ),
+      isTrue,
+    );
+    expect(
+      ImageDownloader.shouldDeferReaderImageLoadForLifecycle(
+        ReaderImageLoadPriority.foregroundVisible,
+        now: now,
+      ),
+      isFalse,
+    );
+
+    ImageDownloader.markReaderLifecyclePaused();
+
+    expect(
+      ImageDownloader.shouldDeferReaderImageLoadForLifecycle(
+        ReaderImageLoadPriority.sameChapterPrefetch,
+        now: now,
+      ),
+      isFalse,
+    );
+  });
+
   test('cancelReaderPrefetches cancels started prefetch streams', () async {
     final starts = <String>[];
     final prefetchCancelled = Completer<void>();

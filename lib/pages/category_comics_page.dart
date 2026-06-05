@@ -2,7 +2,42 @@ import "package:flutter/material.dart";
 import "package:venera/components/components.dart";
 import "package:venera/foundation/app.dart";
 import "package:venera/foundation/comic_source/comic_source.dart";
+import "package:venera/foundation/log.dart";
+import "package:venera/foundation/res.dart";
 import "package:venera/utils/translations.dart";
+
+@visibleForTesting
+bool shouldApplyCategoryOptionsLoad({
+  required bool mounted,
+  required int requestId,
+  required int currentRequestId,
+}) {
+  return mounted && requestId == currentRequestId;
+}
+
+@visibleForTesting
+List<String> normalizeCategoryOptionsValue(
+  List<String> current,
+  List<CategoryComicsOptions>? options,
+) {
+  if (options == null) {
+    return current;
+  }
+  return List<String>.generate(options.length, (index) {
+    final optionList = options[index];
+    final fallback = optionList.options.keys.firstOrNull ?? '';
+    final currentValue = current.elementAtOrNull(index);
+    if (currentValue != null && optionList.options.containsKey(currentValue)) {
+      return currentValue;
+    }
+    return fallback;
+  });
+}
+
+@visibleForTesting
+String categoryOptionsLoadExceptionMessage(Object error) {
+  return error.toString();
+}
 
 class CategoryComicsPage extends StatefulWidget {
   const CategoryComicsPage({
@@ -32,6 +67,7 @@ class _CategoryComicsPageState extends State<CategoryComicsPage> {
   late List<String> optionsValue;
   late String sourceKey;
   String? error;
+  int _optionsLoadRequestId = 0;
 
   void findData() {
     for (final source in ComicSource.all()) {
@@ -66,21 +102,38 @@ class _CategoryComicsPageState extends State<CategoryComicsPage> {
 
   void resetOptionsValue() {
     if (options == null) return;
-    var defaultOptionsValue = options!
-        .map((e) => e.options.keys.first)
-        .toList();
-    if (optionsValue.length != options!.length) {
-      var newOptionsValue = List<String>.filled(options!.length, "");
-      for (var i = 0; i < options!.length; i++) {
-        newOptionsValue[i] =
-            optionsValue.elementAtOrNull(i) ?? defaultOptionsValue[i];
-      }
-      optionsValue = newOptionsValue;
-    }
+    optionsValue = normalizeCategoryOptionsValue(optionsValue, options);
   }
 
   void loadOptions() async {
-    final res = await optionsLoader!(widget.category, widget.param);
+    final requestId = ++_optionsLoadRequestId;
+    final Res<List<CategoryComicsOptions>> res;
+    try {
+      res = await optionsLoader!(widget.category, widget.param);
+    } catch (e, s) {
+      if (shouldApplyCategoryOptionsLoad(
+        mounted: mounted,
+        requestId: requestId,
+        currentRequestId: _optionsLoadRequestId,
+      )) {
+        Log.error(
+          "CategoryComicsPage",
+          "Failed to load category options: $e",
+          s,
+        );
+        setState(() {
+          error = categoryOptionsLoadExceptionMessage(e);
+        });
+      }
+      return;
+    }
+    if (!shouldApplyCategoryOptionsLoad(
+      mounted: mounted,
+      requestId: requestId,
+      currentRequestId: _optionsLoadRequestId,
+    )) {
+      return;
+    }
     if (res.error) {
       setState(() {
         error = res.errorMessage;
@@ -103,6 +156,12 @@ class _CategoryComicsPageState extends State<CategoryComicsPage> {
     }
     findData();
     super.initState();
+  }
+
+  @override
+  void dispose() {
+    _optionsLoadRequestId++;
+    super.dispose();
   }
 
   @override
@@ -162,20 +221,20 @@ class _CategoryComicsPageState extends State<CategoryComicsPage> {
     List<Widget> children = [];
     var group = 0;
     for (var optionList in options!) {
+      if (optionList.options.isEmpty) {
+        group++;
+        continue;
+      }
       if (optionList.label.isNotEmpty) {
-        children.add(Padding(
-          padding: const EdgeInsets.only(
-            bottom: 8.0,
-            left: 4.0,
-          ),
-          child: Text(
-            optionList.label.ts(sourceKey),
-            style: TextStyle(
-              fontSize: 14,
-              fontWeight: FontWeight.bold,
+        children.add(
+          Padding(
+            padding: const EdgeInsets.only(bottom: 8.0, left: 4.0),
+            child: Text(
+              optionList.label.ts(sourceKey),
+              style: TextStyle(fontSize: 14, fontWeight: FontWeight.bold),
             ),
           ),
-        ));
+        );
       }
       if (optionList.options.length <= 8) {
         children.add(
@@ -184,28 +243,25 @@ class _CategoryComicsPageState extends State<CategoryComicsPage> {
             runSpacing: 8,
             children: [
               for (var option in optionList.options.entries)
-                buildOptionItem(
-                  option.value.tl,
-                  option.key,
-                  group,
-                  context,
-                ),
+                buildOptionItem(option.value.tl, option.key, group, context),
             ],
           ),
         );
       } else {
         var g = group;
-        children.add(Select(
-          current: optionList.options[optionsValue[g]],
-          values: optionList.options.values.toList(),
-          onTap: (i) {
-            var key = optionList.options.keys.elementAt(i);
-            if (key == optionsValue[g]) return;
-            setState(() {
-              optionsValue[g] = key;
-            });
-          },
-        ));
+        children.add(
+          Select(
+            current: optionList.options[optionsValue[g]],
+            values: optionList.options.values.toList(),
+            onTap: (i) {
+              var key = optionList.options.keys.elementAt(i);
+              if (key == optionsValue[g]) return;
+              setState(() {
+                optionsValue[g] = key;
+              });
+            },
+          ),
+        );
       }
       if (options!.last != optionList) {
         children.add(const SizedBox(height: 8));

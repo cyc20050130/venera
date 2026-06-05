@@ -15,6 +15,165 @@ import 'package:venera/utils/ext.dart';
 import 'package:venera/utils/io.dart';
 import 'package:venera/utils/translations.dart';
 
+@visibleForTesting
+Uri? parseCookieSaveUri(String url) {
+  if (_hasMalformedPercentEncoding(url)) {
+    return null;
+  }
+  final uri = Uri.tryParse(url);
+  if (uri == null || uri.host.isEmpty) {
+    return null;
+  }
+  return uri;
+}
+
+@visibleForTesting
+List<Map<String, dynamic>>? decodeComicSourceListPayload(String? data) {
+  if (data == null) {
+    return null;
+  }
+  try {
+    return parseComicSourceListPayload(jsonDecode(data));
+  } catch (_) {
+    return null;
+  }
+}
+
+@visibleForTesting
+List<Map<String, dynamic>>? parseComicSourceListPayload(Object? payload) {
+  if (payload is! List) {
+    return null;
+  }
+  final result = <Map<String, dynamic>>[];
+  for (final item in payload) {
+    if (item is! Map) {
+      continue;
+    }
+    final key = item['key'];
+    final name = item['name'];
+    final version = item['version'];
+    final fileName = item['fileName'];
+    if (key is! String ||
+        key.isEmpty ||
+        name is! String ||
+        name.isEmpty ||
+        version is! String ||
+        version.isEmpty ||
+        fileName is! String ||
+        fileName.isEmpty) {
+      continue;
+    }
+    result.add({
+      'key': key,
+      'name': name,
+      'version': version,
+      'fileName': fileName,
+      if (item['url'] is String) 'url': item['url'],
+      if (item['description'] is String) 'description': item['description'],
+    });
+  }
+  return result;
+}
+
+@visibleForTesting
+Map<String, dynamic>? normalizeComicSourceSettingItem(Object? value) {
+  final map = comicSourceMapOrNull(value);
+  if (map == null) {
+    return null;
+  }
+  final type = map['type'];
+  if (type is! String) {
+    return null;
+  }
+  final normalized = <String, dynamic>{
+    ...map,
+    'type': type,
+    'title': comicSourceString(map['title']),
+  };
+  switch (type) {
+    case 'select':
+      final options = comicSourceMapList(map['options'])
+          .map(
+            (option) => <String, dynamic>{
+              'value': comicSourceString(option['value']),
+              'text': comicSourceString(
+                option['text'],
+                fallback: comicSourceString(option['value']),
+              ),
+            },
+          )
+          .toList();
+      if (options.isEmpty) {
+        return null;
+      }
+      normalized['options'] = options;
+      normalized['default'] = comicSourceString(map['default']);
+    case 'switch':
+      normalized['default'] = comicSourceBool(map['default']) ?? false;
+    case 'input':
+      normalized['default'] = comicSourceString(map['default']);
+      if (map['validator'] is! String) {
+        normalized.remove('validator');
+      }
+    case 'callback':
+      normalized['buttonText'] = comicSourceString(
+        map['buttonText'],
+        fallback: 'Click',
+      );
+    default:
+      return null;
+  }
+  return normalized;
+}
+
+@visibleForTesting
+List<Map<String, String>> normalizeComicSourceSettingOptions(Object? value) {
+  return comicSourceMapList(value)
+      .map(
+        (option) => <String, String>{
+          'value': comicSourceString(option['value']),
+          'text': comicSourceString(
+            option['text'],
+            fallback: comicSourceString(option['value']),
+          ),
+        },
+      )
+      .toList();
+}
+
+@visibleForTesting
+Map<String, dynamic> normalizeComicSourceRuntimeSettings(Object? value) {
+  return comicSourceMapOrNull(value) ?? <String, dynamic>{};
+}
+
+@visibleForTesting
+List<MapEntry<String, String>> filterAvailableComicSourceUpdates(
+  Map<String, String> updates,
+  bool Function(String key) hasSource,
+) {
+  return updates.entries.where((entry) => hasSource(entry.key)).toList();
+}
+
+bool _hasMalformedPercentEncoding(String value) {
+  for (var i = 0; i < value.length; i++) {
+    if (value.codeUnitAt(i) != 0x25) {
+      continue;
+    }
+    if (i + 2 >= value.length ||
+        !_isHexDigit(value.codeUnitAt(i + 1)) ||
+        !_isHexDigit(value.codeUnitAt(i + 2))) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool _isHexDigit(int codeUnit) {
+  return (codeUnit >= 0x30 && codeUnit <= 0x39) ||
+      (codeUnit >= 0x41 && codeUnit <= 0x46) ||
+      (codeUnit >= 0x61 && codeUnit <= 0x66);
+}
+
 class ComicSourcePage extends StatelessWidget {
   const ComicSourcePage({super.key});
 
@@ -52,9 +211,7 @@ class ComicSourcePage extends StatelessWidget {
       controller?.close();
       await ComicSourceParser().parse(res.data!, source.filePath);
       await io.File(source.filePath).writeAsString(res.data!);
-      if (ComicSourceManager().availableUpdates.containsKey(source.key)) {
-        ComicSourceManager().availableUpdates.remove(source.key);
-      }
+      ComicSourceManager().removeAvailableUpdates([source.key]);
     } catch (e) {
       if (cancel) return;
       if (showLoading) {
@@ -78,7 +235,10 @@ class ComicSourcePage extends StatelessWidget {
     if (res.statusCode != 200) {
       return -1;
     }
-    var list = jsonDecode(res.data!) as List;
+    var list = decodeComicSourceListPayload(res.data);
+    if (list == null) {
+      return -1;
+    }
     var versions = <String, String>{};
     for (var source in list) {
       versions[source['key']] = source['version'];
@@ -117,6 +277,7 @@ class _BodyState extends State<_Body> {
   var url = "";
 
   void updateUI() {
+    if (!mounted) return;
     setState(() {});
   }
 
@@ -128,8 +289,8 @@ class _BodyState extends State<_Body> {
 
   @override
   void dispose() {
-    super.dispose();
     ComicSourceManager().removeListener(updateUI);
+    super.dispose();
   }
 
   @override
@@ -198,7 +359,9 @@ class _BodyState extends State<_Body> {
     context.to(
       () => _EditFilePage(source.filePath, () async {
         await ComicSourceManager().reload();
-        setState(() {});
+        if (mounted) {
+          setState(() {});
+        }
       }),
     );
   }
@@ -271,9 +434,11 @@ class _BodyState extends State<_Body> {
   void _selectFile() async {
     final file = await selectFile(ext: ["js"]);
     if (file == null) return;
+    if (!mounted) return;
     try {
       var fileName = file.name;
       var bytes = await file.readAsBytes();
+      if (!mounted) return;
       var content = utf8.decode(bytes);
       await addSource(content, fileName);
     } catch (e, s) {
@@ -310,12 +475,15 @@ class _BodyState extends State<_Body> {
         ),
       );
       if (cancel) return;
-      controller.close();
       await addSource(res.data!, fileName);
     } catch (e, s) {
       if (cancel) return;
-      context.showMessage(message: e.toString());
+      if (mounted) {
+        context.showMessage(message: e.toString());
+      }
       Log.error("Add comic source", "$e\n$s");
+    } finally {
+      controller.close();
     }
   }
 
@@ -323,7 +491,7 @@ class _BodyState extends State<_Body> {
     var comicSource = await ComicSourceParser().createAndParse(js, fileName);
     ComicSourceManager().add(comicSource);
     _addAllPagesWithComicSource(comicSource);
-    appdata.saveData();
+    appdata.saveDataInBackground();
     App.forceRebuild();
   }
 }
@@ -338,11 +506,13 @@ class _ComicSourceList extends StatefulWidget {
 }
 
 class _ComicSourceListState extends State<_ComicSourceList> {
-  List? json;
+  List<Map<String, dynamic>>? json;
   bool changed = false;
   var controller = TextEditingController();
+  int _loadRequestId = 0;
 
   void load() async {
+    final requestId = ++_loadRequestId;
     if (json != null) {
       setState(() {
         json = null;
@@ -360,14 +530,18 @@ class _ComicSourceListState extends State<_ComicSourceList> {
       if (res.statusCode != 200) {
         throw "error";
       }
-      if (mounted) {
+      if (mounted && requestId == _loadRequestId) {
+        final parsed = decodeComicSourceListPayload(res.data);
+        if (parsed == null) {
+          throw "error";
+        }
         setState(() {
-          json = jsonDecode(res.data!);
+          json = parsed;
         });
       }
     } catch (e) {
-      context.showMessage(message: "Network error".tl);
-      if (mounted) {
+      if (mounted && requestId == _loadRequestId) {
+        context.showMessage(message: "Network error".tl);
         setState(() {
           json = [];
         });
@@ -384,11 +558,12 @@ class _ComicSourceListState extends State<_ComicSourceList> {
 
   @override
   void dispose() {
-    super.dispose();
     if (changed) {
       appdata.settings['comicSourceListUrl'] = controller.text;
-      appdata.saveData();
+      appdata.saveDataInBackground();
     }
+    controller.dispose();
+    super.dispose();
   }
 
   @override
@@ -481,7 +656,8 @@ class _ComicSourceListState extends State<_ComicSourceList> {
                   var url = json![index]["url"];
                   if (url == null || !(url.toString()).isURL) {
                     var listUrl =
-                        appdata.settings['comicSourceListUrl'] as String;
+                        appdata.settings['comicSourceListUrl']?.toString() ??
+                        "";
                     if (listUrl
                         .replaceFirst("https://", "")
                         .replaceFirst("http://", "")
@@ -494,7 +670,9 @@ class _ComicSourceListState extends State<_ComicSourceList> {
                     }
                   }
                   await widget.onAdd(url);
-                  setState(() {});
+                  if (mounted) {
+                    setState(() {});
+                  }
                 },
               ).fixHeight(32);
 
@@ -514,9 +692,9 @@ class _ComicSourceListState extends State<_ComicSourceList> {
 }
 
 void _validatePages() {
-  List explorePages = appdata.settings['explore_pages'];
-  List categoryPages = appdata.settings['categories'];
-  List networkFavorites = appdata.settings['favorites'];
+  var explorePages = appdata.settings.stringList('explore_pages');
+  var categoryPages = appdata.settings.stringList('categories');
+  var networkFavorites = appdata.settings.stringList('favorites');
 
   var totalExplorePages = ComicSource.all()
       .map((e) => e.explorePages.map((e) => e.title))
@@ -553,14 +731,14 @@ void _validatePages() {
   appdata.settings['categories'] = categoryPages.toSet().toList();
   appdata.settings['favorites'] = networkFavorites.toSet().toList();
 
-  appdata.saveData();
+  appdata.saveDataInBackground();
 }
 
 void _addAllPagesWithComicSource(ComicSource source) {
-  var explorePages = appdata.settings['explore_pages'];
-  var categoryPages = appdata.settings['categories'];
-  var networkFavorites = appdata.settings['favorites'];
-  var searchPages = appdata.settings['searchSources'];
+  var explorePages = appdata.settings.stringList('explore_pages');
+  var categoryPages = appdata.settings.stringList('categories');
+  var networkFavorites = appdata.settings.stringList('favorites');
+  var searchPages = appdata.settings.stringList('searchSources');
 
   if (source.explorePages.isNotEmpty) {
     for (var page in source.explorePages) {
@@ -586,7 +764,7 @@ void _addAllPagesWithComicSource(ComicSource source) {
   appdata.settings['favorites'] = networkFavorites.toSet().toList();
   appdata.settings['searchSources'] = searchPages.toSet().toList();
 
-  appdata.saveData();
+  appdata.saveDataInBackground();
 }
 
 class _EditFilePage extends StatefulWidget {
@@ -650,6 +828,7 @@ class _CheckUpdatesButtonState extends State<_CheckUpdatesButton> {
       isLoading = true;
     });
     var count = await ComicSourcePage.checkComicSourceUpdate();
+    if (!mounted) return;
     if (count == -1) {
       context.showMessage(message: "Network error".tl);
     } else if (count == 0) {
@@ -663,11 +842,33 @@ class _CheckUpdatesButtonState extends State<_CheckUpdatesButton> {
   }
 
   void showUpdateDialog() async {
-    var text = ComicSourceManager().availableUpdates.entries
-        .map((e) {
-          return "${ComicSource.find(e.key)!.name}: ${e.value}";
-        })
-        .join("\n");
+    final updates = ComicSourceManager().availableUpdates;
+    final liveUpdates = filterAvailableComicSourceUpdates(
+      updates,
+      (key) => ComicSource.find(key) != null,
+    );
+    final staleKeys = updates.keys
+        .where((key) => !liveUpdates.any((entry) => entry.key == key))
+        .toList();
+    ComicSourceManager().removeAvailableUpdates(staleKeys);
+    if (liveUpdates.isEmpty) {
+      context.showMessage(message: "No updates".tl);
+      return;
+    }
+    final updateLines = <String>[];
+    for (final update in liveUpdates) {
+      final source = ComicSource.find(update.key);
+      if (source == null) {
+        ComicSourceManager().removeAvailableUpdates([update.key]);
+        continue;
+      }
+      updateLines.add("${source.name}: ${update.value}");
+    }
+    if (updateLines.isEmpty) {
+      context.showMessage(message: "No updates".tl);
+      return;
+    }
+    var text = updateLines.join("\n");
     bool doUpdate = false;
     await showDialog(
       context: App.rootContext,
@@ -687,6 +888,7 @@ class _CheckUpdatesButtonState extends State<_CheckUpdatesButton> {
         );
       },
     );
+    if (!mounted) return;
     if (doUpdate) {
       var loadingController = showLoadingDialog(
         context,
@@ -694,19 +896,26 @@ class _CheckUpdatesButtonState extends State<_CheckUpdatesButton> {
         withProgress: true,
       );
       int current = 0;
-      int total = ComicSourceManager().availableUpdates.length;
+      int total = liveUpdates.length;
       try {
-        var shouldUpdate = ComicSourceManager().availableUpdates.keys.toList();
-        for (var key in shouldUpdate) {
-          var source = ComicSource.find(key)!;
+        for (var update in liveUpdates) {
+          var source = ComicSource.find(update.key);
+          if (source == null) {
+            ComicSourceManager().removeAvailableUpdates([update.key]);
+            continue;
+          }
           await ComicSourcePage.update(source, false);
+          if (!mounted) return;
           current++;
           loadingController.setProgress(current / total);
         }
       } catch (e) {
-        context.showMessage(message: e.toString());
+        if (mounted) {
+          context.showMessage(message: e.toString());
+        }
+      } finally {
+        loadingController.close();
       }
-      loadingController.close();
     }
   }
 
@@ -740,15 +949,27 @@ class _CallbackSetting extends StatefulWidget {
 class _CallbackSettingState extends State<_CallbackSetting> {
   String get key => widget.setting.key;
 
-  String get buttonText => widget.setting.value['buttonText'] ?? "Click";
+  String get buttonText =>
+      comicSourceString(widget.setting.value['buttonText'], fallback: "Click");
 
-  String get title => widget.setting.value['title'] ?? key;
+  String get title =>
+      comicSourceString(widget.setting.value['title'], fallback: key);
 
   bool isLoading = false;
 
   Future<void> onClick() async {
     var func = widget.setting.value['callback'];
-    var result = func([]);
+    dynamic result;
+    try {
+      result = func([]);
+    } catch (e, s) {
+      Log.error(
+        "ComicSourcePage",
+        "Failed to run source setting callback: $e",
+        s,
+      );
+      return;
+    }
     if (result is Future) {
       setState(() {
         isLoading = true;
@@ -756,9 +977,11 @@ class _CallbackSettingState extends State<_CallbackSetting> {
       try {
         await result;
       } finally {
-        setState(() {
-          isLoading = false;
-        });
+        if (mounted) {
+          setState(() {
+            isLoading = false;
+          });
+        }
       }
     }
   }
@@ -899,68 +1122,78 @@ class _SliverComicSourceState extends State<_SliverComicSource> {
   Iterable<Widget> buildSourceSettings() sync* {
     // Try to get dynamic settings first (for getters), fall back to cached settings
     var settingsMap = source.getSettingsDynamic() ?? source.settings;
-    
+
     if (settingsMap == null) {
       return;
-    } else if (source.data['settings'] == null) {
-      source.data['settings'] = {};
     }
+    final sourceSettings = normalizeComicSourceRuntimeSettings(
+      source.data['settings'],
+    );
+    source.data['settings'] = sourceSettings;
     for (var item in settingsMap.entries) {
       var key = item.key;
-      String type = item.value['type'];
+      final setting = normalizeComicSourceSettingItem(item.value);
+      if (setting == null) {
+        continue;
+      }
+      final type = comicSourceString(setting['type']);
+      final title = comicSourceString(setting['title'], fallback: key);
       try {
         if (type == "select") {
-          var current = source.data['settings'][key];
-          if (current == null) {
-            var d = item.value['default'];
-            for (var option in item.value['options']) {
-              if (option['value'] == d) {
-                current = option['text'] ?? option['value'];
-                break;
-              }
-            }
-          } else {
-            current =
-                item.value['options'].firstWhere(
-                  (e) => e['value'] == current,
-                )['text'] ??
-                current;
+          var current = sourceSettings[key];
+          final options = normalizeComicSourceSettingOptions(
+            setting['options'],
+          );
+          if (options.isEmpty) {
+            continue;
           }
+          final defaultValue = comicSourceString(setting['default']);
+          final currentOption = options.firstWhereOrNull(
+            (option) => option['value'] == (current ?? defaultValue),
+          );
+          current = comicSourceString(
+            currentOption?['text'] ?? currentOption?['value'] ?? current,
+          );
           yield ListTile(
-            title: Text((item.value['title'] as String).ts(source.key)),
+            title: Text(title.ts(source.key)),
             trailing: Select(
-              current: (current as String).ts(source.key),
-              values: (item.value['options'] as List)
+              current: current.ts(source.key),
+              values: options
                   .map<String>(
-                    (e) => ((e['text'] ?? e['value']) as String).ts(source.key),
+                    (option) => comicSourceString(
+                      option['text'] ?? option['value'],
+                    ).ts(source.key),
                   )
                   .toList(),
               onTap: (i) {
-                source.data['settings'][key] =
-                    item.value['options'][i]['value'];
-                source.saveData();
+                sourceSettings[key] = options[i]['value'] ?? defaultValue;
+                source.saveDataInBackground();
                 setState(() {});
               },
             ),
           );
         } else if (type == "switch") {
-          var current = source.data['settings'][key] ?? item.value['default'];
+          var current =
+              comicSourceBool(sourceSettings[key]) ??
+              (comicSourceBool(setting['default']) ?? false);
           yield ListTile(
-            title: Text((item.value['title'] as String).ts(source.key)),
+            title: Text(title.ts(source.key)),
             trailing: Switch(
               value: current,
               onChanged: (v) {
-                source.data['settings'][key] = v;
-                source.saveData();
+                sourceSettings[key] = v;
+                source.saveDataInBackground();
                 setState(() {});
               },
             ),
           );
         } else if (type == "input") {
-          var current =
-              source.data['settings'][key] ?? item.value['default'] ?? '';
+          var current = comicSourceString(
+            sourceSettings[key],
+            fallback: comicSourceString(setting['default']),
+          );
           yield ListTile(
-            title: Text((item.value['title'] as String).ts(source.key)),
+            title: Text(title.ts(source.key)),
             subtitle: Text(
               current,
               maxLines: 1,
@@ -969,16 +1202,26 @@ class _SliverComicSourceState extends State<_SliverComicSource> {
             trailing: IconButton(
               icon: const Icon(Icons.edit),
               onPressed: () {
+                RegExp? inputValidator;
+                final validator = setting['validator'];
+                if (validator is String && validator.isNotEmpty) {
+                  try {
+                    inputValidator = RegExp(validator);
+                  } catch (e, s) {
+                    Log.error(
+                      "ComicSourcePage",
+                      "Invalid source setting validator\n$e\n$s",
+                    );
+                  }
+                }
                 showInputDialog(
                   context: context,
-                  title: (item.value['title'] as String).ts(source.key),
+                  title: title.ts(source.key),
                   initialValue: current,
-                  inputValidator: item.value['validator'] == null
-                      ? null
-                      : RegExp(item.value['validator']),
+                  inputValidator: inputValidator,
                   onConfirm: (value) {
-                    source.data['settings'][key] = value;
-                    source.saveData();
+                    sourceSettings[key] = value;
+                    source.saveDataInBackground();
                     setState(() {});
                     return null;
                   },
@@ -987,7 +1230,10 @@ class _SliverComicSourceState extends State<_SliverComicSource> {
             ),
           );
         } else if (type == "callback") {
-          yield _CallbackSetting(setting: item, sourceKey: source.key);
+          yield _CallbackSetting(
+            setting: MapEntry(key, setting),
+            sourceKey: source.key,
+          );
         }
       } catch (e, s) {
         Log.error("ComicSourcePage", "Failed to build a setting\n$e\n$s");
@@ -1009,7 +1255,8 @@ class _SliverComicSourceState extends State<_SliverComicSource> {
           await context.to(
             () => _LoginPage(config: source.account!, source: source),
           );
-          source.saveData();
+          if (!mounted) return;
+          source.saveDataInBackground();
           setState(() {});
         },
       );
@@ -1022,7 +1269,8 @@ class _SliverComicSourceState extends State<_SliverComicSource> {
           await context.to(
             () => _LoginPage(config: source.account!, source: source),
           );
-          source.saveData();
+          if (!mounted) return;
+          source.saveDataInBackground();
           setState(() {});
         },
       );
@@ -1039,21 +1287,25 @@ class _SliverComicSourceState extends State<_SliverComicSource> {
           );
         }
       }
-      if (source.data["account"] is List) {
+      if (source.data["account"] is List && source.account?.login != null) {
         bool loading = _reLogin[source.key] == true;
         yield ListTile(
           title: Text("Re-login".tl),
           subtitle: Text("Click if login expired".tl),
           onTap: () async {
-            if (source.data["account"] == null) {
+            final account = source.storedAccountCredentials;
+            if (account == null) {
               context.showMessage(message: "No data".tl);
               return;
             }
             setState(() {
               _reLogin[source.key] = true;
             });
-            final List account = source.data["account"];
-            var res = await source.account!.login!(account[0], account[1]);
+            var res = await source.account!.login!(
+              account.username,
+              account.password,
+            );
+            if (!mounted) return;
             if (res.error) {
               context.showMessage(message: res.errorMessage!);
             } else {
@@ -1076,7 +1328,7 @@ class _SliverComicSourceState extends State<_SliverComicSource> {
         onTap: () {
           source.data["account"] = null;
           source.account?.logout();
-          source.saveData();
+          source.saveDataInBackground();
           ComicSourceManager().notifyStateChange();
           setState(() {});
         },
@@ -1101,8 +1353,15 @@ class _LoginPageState extends State<_LoginPage> {
   String username = "";
   String password = "";
   bool loading = false;
+  int _loginRequestId = 0;
 
   final Map<String, String> _cookies = {};
+
+  @override
+  void dispose() {
+    _loginRequestId++;
+    super.dispose();
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -1206,7 +1465,9 @@ class _LoginPageState extends State<_LoginPage> {
     );
   }
 
-  void login() {
+  void login() async {
+    if (loading) return;
+    final requestId = ++_loginRequestId;
     if (widget.config.login != null) {
       if (username.isEmpty || password.isEmpty) {
         showToast(
@@ -1219,18 +1480,16 @@ class _LoginPageState extends State<_LoginPage> {
       setState(() {
         loading = true;
       });
-      widget.config.login!(username, password).then((value) {
-        if (value.error) {
-          context.showMessage(message: value.errorMessage!);
-          setState(() {
-            loading = false;
-          });
-        } else {
-          if (mounted) {
-            context.pop();
-          }
-        }
-      });
+      final value = await widget.config.login!(username, password);
+      if (!mounted || requestId != _loginRequestId) return;
+      if (value.error) {
+        context.showMessage(message: value.errorMessage!);
+        setState(() {
+          loading = false;
+        });
+      } else {
+        context.pop();
+      }
     } else if (widget.config.validateCookies != null) {
       setState(() {
         loading = true;
@@ -1238,19 +1497,19 @@ class _LoginPageState extends State<_LoginPage> {
       var cookies = widget.config.cookieFields!
           .map((e) => _cookies[e] ?? '')
           .toList();
-      widget.config.validateCookies!(cookies).then((value) {
-        if (value) {
-          widget.source.data['account'] = 'ok';
-          widget.source.clearLoginExpired();
-          widget.source.saveData();
-          context.pop();
-        } else {
-          context.showMessage(message: "Invalid cookies".tl);
-          setState(() {
-            loading = false;
-          });
-        }
-      });
+      final value = await widget.config.validateCookies!(cookies);
+      if (!mounted || requestId != _loginRequestId) return;
+      if (value) {
+        widget.source.data['account'] = 'ok';
+        widget.source.clearLoginExpired();
+        widget.source.saveDataInBackground();
+        context.pop();
+      } else {
+        context.showMessage(message: "Invalid cookies".tl);
+        setState(() {
+          loading = false;
+        });
+      }
     }
   }
 
@@ -1264,6 +1523,7 @@ class _LoginPageState extends State<_LoginPage> {
           widget.config.checkLoginStatus!(url, title)) {
         var cookies = (await c.getCookies(url)) ?? [];
         var localStorageItems = await c.webStorage.localStorage.getItems();
+        if (!mounted) return;
         var mappedLocalStorage = <String, dynamic>{};
         for (var item in localStorageItems) {
           if (item.key != null) {
@@ -1272,10 +1532,13 @@ class _LoginPageState extends State<_LoginPage> {
         }
         widget.source.data['_localStorage'] = mappedLocalStorage;
         await widget.source.saveData();
-        SingleInstanceCookieJar.instance?.saveFromResponse(
-          Uri.parse(url),
-          cookies,
-        );
+        if (!mounted) return;
+        final cookieUri = parseCookieSaveUri(url);
+        if (cookieUri == null) {
+          Log.warning("ComicSourcePage", "Skip cookies for invalid URL: $url");
+          return;
+        }
+        SingleInstanceCookieJar.instance?.saveFromResponse(cookieUri, cookies);
         success = true;
         widget.config.onLoginWithWebviewSuccess?.call();
         App.mainNavigatorKey?.currentContext?.pop();
@@ -1296,10 +1559,11 @@ class _LoginPageState extends State<_LoginPage> {
         },
       ),
     );
+    if (!mounted) return;
     if (success) {
       widget.source.data['account'] = 'ok';
       widget.source.clearLoginExpired();
-      widget.source.saveData();
+      widget.source.saveDataInBackground();
       context.pop();
     }
   }
@@ -1307,18 +1571,22 @@ class _LoginPageState extends State<_LoginPage> {
   // for linux
   void loginWithWebview2() async {
     if (!await DesktopWebview.isAvailable()) {
-      context.showMessage(message: "Webview is not available".tl);
+      if (mounted) {
+        context.showMessage(message: "Webview is not available".tl);
+      }
+      return;
     }
+    if (!mounted) return;
 
     var url = widget.config.loginWebsite!;
     var title = '';
     bool success = false;
 
     void onClose() {
-      if (success) {
+      if (success && mounted) {
         widget.source.data['account'] = 'ok';
         widget.source.clearLoginExpired();
-        widget.source.saveData();
+        widget.source.saveDataInBackground();
         context.pop();
       }
     }
@@ -1327,17 +1595,21 @@ class _LoginPageState extends State<_LoginPage> {
       if (widget.config.checkLoginStatus != null &&
           widget.config.checkLoginStatus!(url, title)) {
         var cookiesMap = await webview.getCookies(url);
+        if (!mounted) return;
         var cookies = <io.Cookie>[];
         cookiesMap.forEach((key, value) {
           cookies.add(io.Cookie(key, value));
         });
-        SingleInstanceCookieJar.instance?.saveFromResponse(
-          Uri.parse(url),
-          cookies,
-        );
+        final cookieUri = parseCookieSaveUri(url);
+        if (cookieUri == null) {
+          Log.warning("ComicSourcePage", "Skip cookies for invalid URL: $url");
+          return;
+        }
+        SingleInstanceCookieJar.instance?.saveFromResponse(cookieUri, cookies);
         var localStorageJson = await webview.evaluateJavascript(
           "JSON.stringify(window.localStorage);",
         );
+        if (!mounted) return;
         var localStorage = <String, dynamic>{};
         try {
           var decoded = jsonDecode(localStorageJson ?? '');
@@ -1349,6 +1621,7 @@ class _LoginPageState extends State<_LoginPage> {
         }
         widget.source.data['_localStorage'] = localStorage;
         await widget.source.saveData();
+        if (!mounted) return;
         widget.source.clearLoginExpired();
         success = true;
         widget.config.onLoginWithWebviewSuccess?.call();

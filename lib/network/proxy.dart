@@ -19,10 +19,12 @@ Future<String?> getProxy() async {
 }
 
 Future<String?> _getProxy() async {
-  if ((appdata.settings['proxy'] as String).removeAllBlank == "direct") {
+  final proxySetting = appdata.settings['proxy'];
+  final proxy = proxySetting is String ? proxySetting : 'system';
+  if (proxy.removeAllBlank == "direct") {
     return null;
   }
-  if (appdata.settings['proxy'] != "system") return appdata.settings['proxy'];
+  if (proxy != "system") return proxy;
 
   String res;
   if (!App.isLinux) {
