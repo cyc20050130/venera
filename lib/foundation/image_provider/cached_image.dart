@@ -19,6 +19,7 @@ class CachedImageProvider
     this.sourceKey,
     this.cid,
     this.fallbackToLocalCover = false,
+    this.loadPriority = ThumbnailLoadPriority.foregroundVisible,
   });
 
   final String url;
@@ -32,17 +33,45 @@ class CachedImageProvider
   // Use local cover if network image fails to load.
   final bool fallbackToLocalCover;
 
-  static int loadingCount = 0;
+  final ThumbnailLoadPriority loadPriority;
 
-  static const _kMaxLoadingCount = 8;
+  @visibleForTesting
+  static int get debugMaxLoadingCount =>
+      ImageDownloader.debugMaxThumbnailLoadingCount;
+
+  @visibleForTesting
+  static void debugResetLoadingState() {
+    ImageDownloader.debugResetThumbnailLoadingState();
+  }
+
+  @visibleForTesting
+  static Future<void> debugAcquireLoadingSlot(
+    void Function() checkStop, {
+    ThumbnailLoadPriority priority = ThumbnailLoadPriority.foregroundVisible,
+  }) {
+    return ImageDownloader.debugAcquireThumbnailLoadingSlot(
+      checkStop,
+      priority: priority,
+    );
+  }
+
+  @visibleForTesting
+  static void debugReleaseLoadingSlot({
+    ThumbnailLoadPriority priority = ThumbnailLoadPriority.foregroundVisible,
+  }) {
+    ImageDownloader.debugReleaseThumbnailLoadingSlot(priority: priority);
+  }
+
+  @visibleForTesting
+  static int get loadingCount => ImageDownloader.thumbnailLoadingCount;
+
+  @visibleForTesting
+  static set loadingCount(int value) {
+    ImageDownloader.thumbnailLoadingCount = value;
+  }
 
   @override
   Future<Uint8List> load(chunkEvents, checkStop) async {
-    while (loadingCount >= _kMaxLoadingCount) {
-      await Future.delayed(const Duration(milliseconds: 100));
-      checkStop();
-    }
-    loadingCount++;
     try {
       if (url.startsWith("file://")) {
         var file = File(localFilePathFromUri(url));
@@ -52,6 +81,8 @@ class CachedImageProvider
         url,
         sourceKey,
         cid,
+        loadPriority,
+        checkStop,
       )) {
         checkStop();
         chunkEvents.add(
@@ -82,8 +113,6 @@ class CachedImageProvider
         }
       }
       rethrow;
-    } finally {
-      loadingCount = (loadingCount - 1).clamp(0, 1 << 20);
     }
   }
 

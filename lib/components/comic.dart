@@ -931,7 +931,7 @@ class _SliverGridComics extends StatelessWidget {
   Widget build(BuildContext context) {
     return SliverGrid(
       delegate: SliverChildBuilderDelegate((context, index) {
-        if (index == comics.length - 1) {
+        if (shouldTriggerComicListPreload(index, comics.length)) {
           onLastItemBuild?.call();
         }
         var badge = badgeBuilder?.call(comics[index]);
@@ -971,6 +971,18 @@ class _SliverGridComics extends StatelessWidget {
       gridDelegate: SliverGridDelegateWithComics(),
     );
   }
+}
+
+@visibleForTesting
+bool shouldTriggerComicListPreload(
+  int index,
+  int itemCount, {
+  int remainingItemThreshold = 8,
+}) {
+  if (itemCount <= 0 || index < 0) {
+    return false;
+  }
+  return index >= itemCount - remainingItemThreshold - 1;
 }
 
 /// return the first blocked keyword, or null if not blocked

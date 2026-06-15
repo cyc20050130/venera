@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:collection';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter_qjs/flutter_qjs.dart';
@@ -105,6 +106,20 @@ Future<List<int>?> runImageOnResponseCallback(
 }
 
 abstract class ImageDownloader {
+  static int thumbnailLoadingCount = 0;
+
+  static const _kMaxThumbnailLoadingCount = 8;
+  static const _kMaxBackgroundThumbnailLoadingCount = 6;
+  static const _kMaxConsecutiveForegroundThumbnailSlots = 8;
+  static const _kThumbnailLoadingSlotPollInterval = Duration(milliseconds: 16);
+
+  static final ListQueue<_ThumbnailLoadingSlotRequest>
+  _pendingThumbnailLoadingSlots = ListQueue();
+  static int _nextThumbnailLoadingSlotSequence = 0;
+  static int _activeBackgroundThumbnailLoadingCount = 0;
+  static int _activeForegroundThumbnailLoadingCount = 0;
+  static int _consecutiveForegroundThumbnailSlots = 0;
+
   static const _kReaderPrefetchPollInterval = Duration(milliseconds: 16);
   static const _kMaxConcurrentReaderPrefetches = 1;
   static const _kReaderLifecycleResumeQuietWindow = Duration(milliseconds: 900);
@@ -144,10 +159,37 @@ abstract class ImageDownloader {
   static final _loadingThumbnails =
       <String, _StreamWrapper<ImageDownloadProgress>>{};
 
+  static int get debugMaxThumbnailLoadingCount => _kMaxThumbnailLoadingCount;
+
+  static int get debugMaxBackgroundThumbnailLoadingCount =>
+      _kMaxBackgroundThumbnailLoadingCount;
+
+  static int get debugMaxConsecutiveForegroundThumbnailSlots =>
+      _kMaxConsecutiveForegroundThumbnailSlots;
+
+  static void debugResetThumbnailLoadingState() {
+    _resetThumbnailLoadingState(resetDebugLoader: true);
+  }
+
+  static Future<void> debugAcquireThumbnailLoadingSlot(
+    void Function() checkStop, {
+    ThumbnailLoadPriority priority = ThumbnailLoadPriority.foregroundVisible,
+  }) {
+    return _acquireThumbnailLoadingSlot(checkStop, priority: priority);
+  }
+
+  static void debugReleaseThumbnailLoadingSlot({
+    ThumbnailLoadPriority priority = ThumbnailLoadPriority.foregroundVisible,
+  }) {
+    _releaseThumbnailLoadingSlot(priority);
+  }
+
   static Stream<ImageDownloadProgress> loadThumbnail(
     String url,
     String? sourceKey, [
     String? cid,
+    ThumbnailLoadPriority priority = ThumbnailLoadPriority.foregroundVisible,
+    void Function()? checkStop,
   ]) async* {
     final cacheKey = "$url@$sourceKey${cid != null ? '@$cid' : ''}";
     final data = await _readNonEmptyImageCache(cacheKey);
@@ -161,7 +203,14 @@ abstract class ImageDownloader {
       return;
     }
 
-    yield* _thumbnailRefreshStream(cacheKey, url, sourceKey, cid);
+    yield* _thumbnailRefreshStream(
+      cacheKey,
+      url,
+      sourceKey,
+      cid,
+      priority,
+      checkStop ?? () {},
+    );
   }
 
   static Stream<ImageDownloadProgress> _thumbnailRefreshStream(
@@ -169,6 +218,8 @@ abstract class ImageDownloader {
     String url,
     String? sourceKey,
     String? cid,
+    ThumbnailLoadPriority priority,
+    void Function() checkStop,
   ) {
     var existing = _loadingThumbnails[cacheKey];
     if (existing != null && existing.isClosed) {
@@ -180,7 +231,7 @@ abstract class ImageDownloader {
     }
 
     final stream = _StreamWrapper<ImageDownloadProgress>(
-      _loadThumbnailRefresh(cacheKey, url, sourceKey, cid),
+      _loadThumbnailRefresh(cacheKey, url, sourceKey, cid, priority, checkStop),
       (wrapper) {
         if (_loadingThumbnails[cacheKey] == wrapper) {
           _loadingThumbnails.remove(cacheKey);
@@ -197,11 +248,49 @@ abstract class ImageDownloader {
     String url,
     String? sourceKey,
     String? cid,
+    ThumbnailLoadPriority priority,
+    void Function() checkStop,
   ) async* {
+    await _acquireThumbnailLoadingSlot(checkStop, priority: priority);
+    try {
+      yield* _loadThumbnailRefreshWithAcquiredSlot(
+        cacheKey,
+        url,
+        sourceKey,
+        cid,
+        priority,
+        checkStop,
+        redirectCount: 0,
+      );
+    } finally {
+      _releaseThumbnailLoadingSlot(priority);
+    }
+  }
+
+  static Stream<ImageDownloadProgress> _loadThumbnailRefreshWithAcquiredSlot(
+    String cacheKey,
+    String url,
+    String? sourceKey,
+    String? cid,
+    ThumbnailLoadPriority priority,
+    void Function() checkStop, {
+    required int redirectCount,
+  }) async* {
+    final cached = await _readNonEmptyImageCache(cacheKey);
+    if (cached != null) {
+      yield ImageDownloadProgress(
+        currentBytes: cached.length,
+        totalBytes: cached.length,
+        imageBytes: cached,
+      );
+      return;
+    }
+
     final debugLoader = debugThumbnailNetworkLoader;
     if (debugLoader != null) {
       Uint8List? imageBytes;
       await for (final progress in debugLoader(url, sourceKey, cid)) {
+        checkStop();
         if (progress.imageBytes != null) {
           imageBytes = progress.imageBytes;
         }
@@ -238,11 +327,23 @@ abstract class ImageDownloader {
           ) &&
           loadComicInfo != null &&
           comicId != null) {
+        if (redirectCount > 0) {
+          throw "Too many cover fallback redirects.";
+        }
         var comicInfo = await loadComicInfo(comicId);
         if (comicInfo.error) {
           throw comicInfo.errorMessage ?? "Failed to load comic cover";
         }
-        yield* loadThumbnail(comicInfo.data.cover, sourceKey, comicId);
+        final redirectCacheKey = "${comicInfo.data.cover}@$sourceKey@$comicId";
+        yield* _loadThumbnailRefreshWithAcquiredSlot(
+          redirectCacheKey,
+          comicInfo.data.cover,
+          sourceKey,
+          comicId,
+          priority,
+          checkStop,
+          redirectCount: redirectCount + 1,
+        );
         return;
       }
       Log.warning(
@@ -264,50 +365,189 @@ abstract class ImageDownloader {
     if (requestUrl.startsWith('//')) {
       requestUrl = 'https:$requestUrl';
     }
-    var req = await dio.request<ResponseBody>(
-      requestUrl,
-      data: configs['data'],
-    );
-    final body = req.data ?? (throw "Error: Empty response body.");
-    var stream = body.stream;
-    final expectedBytes = normalizeImageResponseContentLength(
-      body.contentLength,
-    );
-    var buffer = <int>[];
-    await for (var data in stream) {
-      buffer.addAll(data);
-      if (expectedBytes != null) {
-        yield ImageDownloadProgress(
-          currentBytes: buffer.length,
-          totalBytes: expectedBytes,
-        );
-      }
-    }
-
-    if (configs['onResponse'] is JSInvokable) {
-      final uint8List = Uint8List.fromList(buffer);
-      final onResponse = configs['onResponse'] as JSInvokable;
-      final processedBytes = await runImageOnResponseCallback(
-        () => onResponse([uint8List]),
-        release: onResponse.free,
-        label: 'thumbnail',
+    final cancelToken = CancelToken();
+    Timer? stopPoller;
+    try {
+      checkStop();
+      stopPoller = Timer.periodic(_kThumbnailLoadingSlotPollInterval, (_) {
+        try {
+          checkStop();
+        } catch (_) {
+          cancelToken.cancel('thumbnail request cancelled');
+        }
+      });
+      var req = await dio.request<ResponseBody>(
+        requestUrl,
+        data: configs['data'],
+        cancelToken: cancelToken,
       );
-      if (processedBytes != null) {
-        buffer = processedBytes;
+      final body = req.data ?? (throw "Error: Empty response body.");
+      var stream = body.stream;
+      final expectedBytes = normalizeImageResponseContentLength(
+        body.contentLength,
+      );
+      var buffer = <int>[];
+      await for (var data in stream) {
+        checkStop();
+        buffer.addAll(data);
+        if (expectedBytes != null) {
+          yield ImageDownloadProgress(
+            currentBytes: buffer.length,
+            totalBytes: expectedBytes,
+          );
+        }
+      }
+
+      if (configs['onResponse'] is JSInvokable) {
+        final uint8List = Uint8List.fromList(buffer);
+        final onResponse = configs['onResponse'] as JSInvokable;
+        final processedBytes = await runImageOnResponseCallback(
+          () => onResponse([uint8List]),
+          release: onResponse.free,
+          label: 'thumbnail',
+        );
+        if (processedBytes != null) {
+          buffer = processedBytes;
+        } else {
+          Log.warning(
+            "Network",
+            "Ignoring invalid thumbnail onResponse result",
+          );
+        }
+      }
+
+      if (buffer.isEmpty) {
+        throw "Error: Empty response body.";
+      }
+      _logThumbnailPerf('cover network complete', cacheKey);
+      await _writeThumbnailCache(cacheKey, buffer);
+      yield ImageDownloadProgress(
+        currentBytes: buffer.length,
+        totalBytes: buffer.length,
+        imageBytes: Uint8List.fromList(buffer),
+      );
+    } finally {
+      stopPoller?.cancel();
+    }
+  }
+
+  static Future<void> _acquireThumbnailLoadingSlot(
+    void Function() checkStop, {
+    required ThumbnailLoadPriority priority,
+  }) async {
+    final waiter = Completer<void>();
+    final request = _ThumbnailLoadingSlotRequest(
+      waiter: waiter,
+      priority: priority,
+      sequence: _nextThumbnailLoadingSlotSequence++,
+    );
+    var acquired = false;
+    _pendingThumbnailLoadingSlots.add(request);
+    try {
+      while (true) {
+        _drainThumbnailLoadingQueue();
+        if (waiter.isCompleted) {
+          acquired = true;
+          return;
+        }
+        await Future.any([
+          waiter.future,
+          Future<void>.delayed(_kThumbnailLoadingSlotPollInterval),
+        ]);
+        checkStop();
+      }
+    } catch (_) {
+      if (!acquired) {
+        if (!_pendingThumbnailLoadingSlots.remove(request) &&
+            waiter.isCompleted) {
+          _releaseThumbnailLoadingSlot(priority);
+        }
+      }
+      rethrow;
+    }
+  }
+
+  static void _releaseThumbnailLoadingSlot(ThumbnailLoadPriority priority) {
+    if (thumbnailLoadingCount > 0) {
+      thumbnailLoadingCount--;
+    }
+    if (priority == ThumbnailLoadPriority.background &&
+        _activeBackgroundThumbnailLoadingCount > 0) {
+      _activeBackgroundThumbnailLoadingCount--;
+    }
+    if (priority == ThumbnailLoadPriority.foregroundVisible &&
+        _activeForegroundThumbnailLoadingCount > 0) {
+      _activeForegroundThumbnailLoadingCount--;
+    }
+    _drainThumbnailLoadingQueue();
+  }
+
+  static void _drainThumbnailLoadingQueue() {
+    while (thumbnailLoadingCount < _kMaxThumbnailLoadingCount &&
+        _pendingThumbnailLoadingSlots.isNotEmpty) {
+      final request = _removeNextThumbnailLoadingRequest();
+      if (request == null) {
+        break;
+      }
+      thumbnailLoadingCount++;
+      if (request.priority == ThumbnailLoadPriority.background) {
+        _activeBackgroundThumbnailLoadingCount++;
+        _consecutiveForegroundThumbnailSlots = 0;
       } else {
-        Log.warning("Network", "Ignoring invalid thumbnail onResponse result");
+        _activeForegroundThumbnailLoadingCount++;
+        _consecutiveForegroundThumbnailSlots++;
+      }
+      request.waiter.complete();
+    }
+  }
+
+  static _ThumbnailLoadingSlotRequest? _removeNextThumbnailLoadingRequest() {
+    _ThumbnailLoadingSlotRequest? best;
+    for (final request in _pendingThumbnailLoadingSlots) {
+      if (!_canAcquireThumbnailLoadingSlot(request.priority)) {
+        continue;
+      }
+      if (_shouldReserveNextSlotForBackground(request.priority)) {
+        continue;
+      }
+      if (best == null ||
+          request.priority.index > best.priority.index ||
+          (request.priority.index == best.priority.index &&
+              request.sequence < best.sequence)) {
+        best = request;
       }
     }
-
-    if (buffer.isEmpty) {
-      throw "Error: Empty response body.";
+    if (best == null) {
+      return null;
     }
-    _logThumbnailPerf('cover network complete', cacheKey);
-    await _writeThumbnailCache(cacheKey, buffer);
-    yield ImageDownloadProgress(
-      currentBytes: buffer.length,
-      totalBytes: buffer.length,
-      imageBytes: Uint8List.fromList(buffer),
+    _pendingThumbnailLoadingSlots.remove(best);
+    return best.waiter.isCompleted ? null : best;
+  }
+
+  static bool _canAcquireThumbnailLoadingSlot(ThumbnailLoadPriority priority) {
+    if (thumbnailLoadingCount >= _kMaxThumbnailLoadingCount) {
+      return false;
+    }
+    if (priority == ThumbnailLoadPriority.background &&
+        _activeBackgroundThumbnailLoadingCount >=
+            _kMaxBackgroundThumbnailLoadingCount) {
+      return false;
+    }
+    return true;
+  }
+
+  static bool _shouldReserveNextSlotForBackground(
+    ThumbnailLoadPriority priority,
+  ) {
+    if (priority != ThumbnailLoadPriority.foregroundVisible ||
+        _consecutiveForegroundThumbnailSlots <
+            _kMaxConsecutiveForegroundThumbnailSlots) {
+      return false;
+    }
+    return _pendingThumbnailLoadingSlots.any(
+      (request) =>
+          request.priority == ThumbnailLoadPriority.background &&
+          _canAcquireThumbnailLoadingSlot(ThumbnailLoadPriority.background),
     );
   }
 
@@ -559,6 +799,12 @@ abstract class ImageDownloader {
       wrapper.cancel();
     }
     _loadingThumbnails.clear();
+    thumbnailLoadingCount = 0;
+    _pendingThumbnailLoadingSlots.clear();
+    _nextThumbnailLoadingSlotSequence = 0;
+    _activeBackgroundThumbnailLoadingCount = 0;
+    _activeForegroundThumbnailLoadingCount = 0;
+    _consecutiveForegroundThumbnailSlots = 0;
     if (resetDebugLoader) {
       debugThumbnailNetworkLoader = null;
       debugThumbnailCacheWriter = null;
@@ -1139,10 +1385,24 @@ enum ComicImageCacheStrategy {
   networkOnly,
 }
 
+enum ThumbnailLoadPriority { background, foregroundVisible }
+
 enum ReaderImageLoadPriority {
   foregroundVisible,
   sameChapterPrefetch,
   nextChapterPrefetch,
+}
+
+class _ThumbnailLoadingSlotRequest {
+  const _ThumbnailLoadingSlotRequest({
+    required this.waiter,
+    required this.priority,
+    required this.sequence,
+  });
+
+  final Completer<void> waiter;
+  final ThumbnailLoadPriority priority;
+  final int sequence;
 }
 
 class ImageDownloadProgress {

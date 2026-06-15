@@ -43,6 +43,7 @@ class FavoriteItem implements Comic {
   ComicType type;
   @override
   List<String> tags;
+  List<String>? translatedTags;
   @override
   String id;
   String coverPath;
@@ -55,6 +56,7 @@ class FavoriteItem implements Comic {
     required this.author,
     required this.type,
     required this.tags,
+    this.translatedTags,
     DateTime? favoriteTime,
   }) {
     var t = favoriteTime ?? DateTime.now();
@@ -66,6 +68,7 @@ class FavoriteItem implements Comic {
       author = row["author"]?.toString() ?? '',
       type = ComicType(normalizeRowType(row["type"], row["cover_path"])),
       tags = normalizeRowTags(row["tags"]),
+      translatedTags = normalizeRowTranslatedTags(row["translated_tags"]),
       id = row["id"]?.toString() ?? '',
       coverPath = row["cover_path"]?.toString() ?? '',
       time = normalizeRowTime(row["time"]);
@@ -191,6 +194,19 @@ class FavoriteItem implements Comic {
   }
 
   @visibleForTesting
+  static List<String>? normalizeRowTranslatedTags(Object? rawTags) {
+    final tags = rawTags?.toString();
+    if (tags == null || tags.isEmpty) {
+      return null;
+    }
+    return tags
+        .split(',')
+        .map((tag) => tag.trim())
+        .where((tag) => tag.isNotEmpty)
+        .toList();
+  }
+
+  @visibleForTesting
   static String normalizeRowTime(Object? rawTime) {
     final time = rawTime?.toString();
     if (time != null && time.length >= 10) {
@@ -290,6 +306,10 @@ class LocalFavoritesManager with ChangeNotifier {
 
   var _hashedIds = <int, int>{};
 
+  bool _translatedTagsBackfillNeeded = false;
+
+  Future<void>? _translatedTagsBackfillFuture;
+
   String get _dbPath => "${App.dataPath}/local_favorite.db";
 
   int get totalComics {
@@ -298,6 +318,15 @@ class LocalFavoritesManager with ChangeNotifier {
 
   int folderComics(String folder) {
     return counts[folder] ?? 0;
+  }
+
+  @visibleForTesting
+  void debugUseDatabaseForTest(Database db, {required bool needsTagBackfill}) {
+    _db = db;
+    _dbOpened = false;
+    counts = {};
+    _translatedTagsBackfillNeeded = needsTagBackfill;
+    _translatedTagsBackfillFuture = null;
   }
 
   Future<void> init() async {
@@ -318,31 +347,10 @@ class LocalFavoritesManager with ChangeNotifier {
       );
     """);
     var folderNames = _getFolderNamesWithDB();
-    for (var folder in folderNames) {
-      var columns = _db.select("""
-        pragma table_info("$folder");
-      """);
-      if (!columns.any((element) => element["name"] == "translated_tags")) {
-        _db.execute("""
-          alter table "$folder"
-          add column translated_tags TEXT;
-        """);
-        var comics = getFolderComics(folder);
-        for (var comic in comics) {
-          var translatedTags = _translateTags(comic.tags);
-          _db.execute(
-            """
-            update "$folder"
-            set translated_tags = ?
-            where id == ? and type == ?;
-          """,
-            [translatedTags, comic.id, comic.type.value],
-          );
-        }
-      } else {
-        break;
-      }
-    }
+    _translatedTagsBackfillNeeded = ensureTranslatedTagsColumns(
+      _db,
+      folderNames,
+    );
     await appdata.init();
     // Make sure the follow updates folder is ready
     var followUpdateFolder = appdata.settings['followUpdatesFolder'];
@@ -353,6 +361,93 @@ class LocalFavoritesManager with ChangeNotifier {
       appdata.settings['followUpdatesFolder'] = null;
     }
     initCounts();
+  }
+
+  Future<void> backfillTranslatedTagsIfNeeded() {
+    if (!_translatedTagsBackfillNeeded || !TagsTranslation.isReady) {
+      return Future.value();
+    }
+    return _translatedTagsBackfillFuture ??=
+        Future<void>(() {
+          backfillTranslatedTags(_db, folderNames);
+          _translatedTagsBackfillNeeded = false;
+        }).whenComplete(() {
+          _translatedTagsBackfillFuture = null;
+        });
+  }
+
+  void _backfillTranslatedTagsBeforeSearchIfNeeded() {
+    if (!_translatedTagsBackfillNeeded ||
+        _translatedTagsBackfillFuture != null ||
+        !TagsTranslation.isReady) {
+      return;
+    }
+    backfillTranslatedTags(_db, folderNames);
+    _translatedTagsBackfillNeeded = false;
+  }
+
+  @visibleForTesting
+  static bool ensureTranslatedTagsColumns(Database db, List<String> folders) {
+    var addedColumn = false;
+    for (var folder in folders) {
+      var columns = db.select("""
+        pragma table_info("$folder");
+      """);
+      if (!columns.any((element) => element["name"] == "translated_tags")) {
+        db.execute("""
+          alter table "$folder"
+          add column translated_tags TEXT;
+        """);
+        addedColumn = true;
+      }
+    }
+    return addedColumn;
+  }
+
+  @visibleForTesting
+  static int backfillTranslatedTags(Database db, List<String> folders) {
+    var updated = 0;
+    db.execute("BEGIN TRANSACTION");
+    try {
+      for (var folder in folders) {
+        var rows = db.select("""
+          select id, type, tags from "$folder";
+        """);
+        for (var row in rows) {
+          final tags = (row["tags"] as String)
+              .split(",")
+              .where((tag) => tag.isNotEmpty)
+              .toList();
+          final translatedTags = translateFavoriteTags(tags);
+          db.execute(
+            """
+            update "$folder"
+            set translated_tags = ?
+            where id == ? and type == ?;
+          """,
+            [translatedTags, row["id"], row["type"]],
+          );
+          updated++;
+        }
+      }
+      db.execute("COMMIT");
+    } catch (_) {
+      db.execute("ROLLBACK");
+      rethrow;
+    }
+    return updated;
+  }
+
+  @visibleForTesting
+  static String translateFavoriteTags(List<String> tags) {
+    var res = <String>[];
+    for (var tag in tags) {
+      var translated = tag.translateTagsToCN;
+      if (translated != tag) {
+        res.add(translated);
+      }
+    }
+    return res.join(",");
   }
 
   void initCounts() {
@@ -1215,6 +1310,7 @@ class LocalFavoritesManager with ChangeNotifier {
   }
 
   List<FavoriteItem> searchInFolder(String folder, String keyword) {
+    _backfillTranslatedTagsBeforeSearchIfNeeded();
     var keywordList = keyword.split(" ");
     keyword = keywordList.first;
     keyword = "%$keyword%";
@@ -1246,6 +1342,7 @@ class LocalFavoritesManager with ChangeNotifier {
   }
 
   List<FavoriteItem> search(String keyword) {
+    _backfillTranslatedTagsBeforeSearchIfNeeded();
     var keywordList = keyword.split(" ");
     keyword = keywordList.first;
     var comics = <FavoriteItem>{};

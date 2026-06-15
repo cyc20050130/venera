@@ -55,7 +55,13 @@ class LocalFavoriteImageProvider
       return cached;
     }
     checkStop();
-    await for (var progress in ImageDownloader.loadThumbnail(url, sourceKey)) {
+    await for (var progress in ImageDownloader.loadThumbnail(
+      url,
+      sourceKey,
+      id,
+      ThumbnailLoadPriority.foregroundVisible,
+      checkStop,
+    )) {
       checkStop();
       chunkEvents.add(
         ImageChunkEvent(

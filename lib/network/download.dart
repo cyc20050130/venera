@@ -408,6 +408,13 @@ class ImagesDownloadTask extends DownloadTask with _TransferSpeedMixin {
           await for (var progress in ImageDownloader.loadThumbnail(
             comic!.cover,
             source.key,
+            comicId,
+            ThumbnailLoadPriority.background,
+            () {
+              if (!_isRunning) {
+                throw "Download cancelled";
+              }
+            },
           )) {
             if (progress.imageBytes != null) {
               data = progress.imageBytes;

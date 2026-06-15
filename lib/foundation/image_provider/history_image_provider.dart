@@ -46,6 +46,8 @@ class HistoryImageProvider
       url,
       history.sourceKey,
       history.id,
+      ThumbnailLoadPriority.foregroundVisible,
+      checkStop,
     )) {
       checkStop();
       chunkEvents.add(

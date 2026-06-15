@@ -6,12 +6,19 @@ https://github.com/EhTagTranslation/Database/tree/master/database
 */
 
 import 'dart:convert';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:venera/foundation/app.dart';
 import 'package:venera/utils/ext.dart';
 
 extension TagsTranslation on String {
   static final Map<String, Map<String, String>> _data = {};
+  static int _dataVersion = 0;
+  static bool _isReady = false;
+  static final ValueNotifier<int> readyNotifier = ValueNotifier<int>(0);
+
+  static int get dataVersion => _dataVersion;
+  static bool get isReady => _isReady;
 
   static Future<void> readData() async {
     var fileName = App.locale.countryCode == 'TW'
@@ -47,6 +54,9 @@ extension TagsTranslation on String {
     _data
       ..clear()
       ..addAll(nextData);
+    _isReady = true;
+    _dataVersion++;
+    readyNotifier.value = _dataVersion;
   }
 
   static bool _haveNamespace(String key) {
@@ -73,7 +83,7 @@ extension TagsTranslation on String {
   }
 
   /// translate tag's text to chinese
-  String get translateTagsToCN => _translateTags(this);
+  String get translateTagsToCN => _isReady ? _translateTags(this) : this;
 
   String get translateTagIfNeed {
     var locale = App.locale;
@@ -85,6 +95,9 @@ extension TagsTranslation on String {
   }
 
   static String translateTag(String tag) {
+    if (!_isReady) {
+      return tag;
+    }
     if (tag.contains(':') && tag.indexOf(':') == tag.lastIndexOf(':')) {
       var [namespace, text] = tag.split(':');
       return translationTagWithNamespace(text, namespace);
@@ -125,7 +138,7 @@ extension TagsTranslation on String {
   String get categoryTextDynamic => _categoryTextDynamic(this);
 
   String get translateTagsCategoryToCN =>
-      tagsCategoryTranslations[this] ?? this;
+      _isReady ? tagsCategoryTranslations[this] ?? this : this;
 
   get tagsCategoryTranslations => switch (App.locale.countryCode) {
     "CN" => tagsCategoryTranslationsCN,

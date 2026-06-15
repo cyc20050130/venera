@@ -143,10 +143,7 @@ class CacheManager {
       }
       unawaited(
         _runInitialMaintenance().catchError((Object e, StackTrace s) {
-          Log.error(
-            "CacheManager",
-            "Initial cache maintenance failed: $e\n$s",
-          );
+          Log.error("CacheManager", "Initial cache maintenance failed: $e\n$s");
         }),
       );
     });
