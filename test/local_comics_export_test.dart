@@ -144,4 +144,15 @@ void main() {
       closeTo(0.9, 0.0001),
     );
   });
+
+  test('bulk archive failures expose grouped root causes', () {
+    expect(
+      summarizeLocalArchiveFailures([
+        const LocalArchiveException('writer unavailable'),
+        const LocalArchiveException('writer unavailable'),
+        const LocalArchiveException('unsafe path'),
+      ]),
+      '2× writer unavailable; 1× unsafe path',
+    );
+  });
 }

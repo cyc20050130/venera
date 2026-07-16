@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:isolate';
 
+import 'package:archive/archive_io.dart' as archive_io;
 import 'package:crypto/crypto.dart';
 import 'package:flutter/foundation.dart' show visibleForTesting;
 import 'package:path/path.dart' as p;
@@ -1113,10 +1114,11 @@ class LocalArchiveService {
     final sourceFiles = files
         .map((file) => file.file.path)
         .toList(growable: false);
-    // zip_flutter's addFilesAsync native worker can remain permanently busy
-    // when a ZIP is rebuilt immediately after extraction on Windows. The
-    // stable synchronous API avoids that native-thread race; an isolate keeps
-    // the filesystem and compression work off the UI thread.
+    // Use archive's streaming Dart IO writer instead of zip_flutter's native
+    // writer. The latter can fail for an entire Android library when native
+    // code cannot reopen app-readable source paths, and its async worker can
+    // remain permanently busy after extraction on Windows. InputFileStream
+    // keeps memory bounded while the isolate keeps compression off the UI.
     await Isolate.run(
       () => _writeZipSynchronously(output.path, names, sourceFiles),
     );
@@ -1618,14 +1620,30 @@ void _writeZipSynchronously(
   if (names.length != sourceFiles.length) {
     throw const LocalArchiveException('Archive input list length mismatch');
   }
-  ZipFile? zip;
+  final encoder = archive_io.ZipFileEncoder();
+  var opened = false;
+  Object? pendingError;
+  StackTrace? pendingStackTrace;
   try {
-    zip = ZipFile.open(outputPath, level: 1);
+    encoder.create(outputPath, level: 1);
+    opened = true;
     for (var index = 0; index < names.length; index++) {
-      zip.addFile(names[index], sourceFiles[index]);
+      encoder.addFileSync(File(sourceFiles[index]), names[index], 1);
     }
-  } finally {
-    zip?.close();
+  } catch (error, stackTrace) {
+    pendingError = error;
+    pendingStackTrace = stackTrace;
+  }
+  if (opened) {
+    try {
+      encoder.closeSync();
+    } catch (error, stackTrace) {
+      pendingError ??= error;
+      pendingStackTrace ??= stackTrace;
+    }
+  }
+  if (pendingError != null) {
+    Error.throwWithStackTrace(pendingError, pendingStackTrace!);
   }
 }
 

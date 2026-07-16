@@ -438,4 +438,41 @@ void main() {
     expect(page.existsSync(), isTrue);
     expect(service.archiveFileFor(comic).existsSync(), isFalse);
   });
+
+  test(
+    'streaming writer archives 85 comics with unicode paths',
+    () async {
+      final service = LocalArchiveService.forTesting(libraryRoot: library.path);
+      for (var index = 0; index < 85; index++) {
+        final root = await Directory(
+          '${library.path}${Platform.pathSeparator}漫画-$index',
+        ).create();
+        await File(
+          '${root.path}${Platform.pathSeparator}封面.jpg',
+        ).writeAsBytes(const [1, 2, 3]);
+        final chapter = await Directory(
+          '${root.path}${Platform.pathSeparator}章节-$index',
+        ).create();
+        await File(
+          '${chapter.path}${Platform.pathSeparator}页面-$index.jpg',
+        ).writeAsBytes(List<int>.generate(64, (value) => value));
+        final batchComic = LocalComic(
+          id: '批量-$index',
+          title: '漫画 $index',
+          subtitle: '',
+          tags: const [],
+          directory: root.path,
+          chapters: null,
+          cover: '封面.jpg',
+          comicType: ComicType.local,
+          downloadedChapters: const [],
+          createdAt: DateTime(2026, 7, 16),
+        );
+
+        final result = await service.compress(batchComic);
+        expect(result.state, LocalStorageState.archived, reason: '$index');
+      }
+    },
+    timeout: const Timeout(Duration(minutes: 2)),
+  );
 }

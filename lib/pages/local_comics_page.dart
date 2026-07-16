@@ -87,6 +87,31 @@ double localArchiveOperationProgress(LocalArchiveProgress progress) {
 }
 
 @visibleForTesting
+String summarizeLocalArchiveFailures(
+  Iterable<Object> failures, {
+  int maxReasons = 3,
+}) {
+  final counts = <String, int>{};
+  for (final failure in failures) {
+    final reason = failure
+        .toString()
+        .replaceFirst('LocalArchiveException: ', '')
+        .trim();
+    final key = reason.isEmpty ? 'Unknown archive error' : reason;
+    counts[key] = (counts[key] ?? 0) + 1;
+  }
+  final entries = counts.entries.toList()
+    ..sort((a, b) {
+      final byCount = b.value.compareTo(a.value);
+      return byCount != 0 ? byCount : a.key.compareTo(b.key);
+    });
+  return entries
+      .take(maxReasons.clamp(0, entries.length))
+      .map((entry) => '${entry.value}× ${entry.key}')
+      .join('; ');
+}
+
+@visibleForTesting
 bool isLocalArchivePathManaged({
   required String libraryPath,
   required String comicPath,
@@ -411,7 +436,11 @@ class _LocalComicsPageState extends State<LocalComicsPage> {
           break;
         } catch (error, stackTrace) {
           failures.add(error);
-          Log.error('Local Archive', error, stackTrace);
+          Log.error(
+            'Local Archive',
+            '${comic.title} (${comic.sourceKey}@${comic.id}): $error',
+            stackTrace,
+          );
         }
       }
     } on LocalArchiveCancelledException {
@@ -434,10 +463,10 @@ class _LocalComicsPageState extends State<LocalComicsPage> {
       return;
     }
     if (failures.isNotEmpty) {
-      final detail = failures.length == 1 ? ': ${failures.first}' : '';
+      final detail = summarizeLocalArchiveFailures(failures);
       context.showMessage(
         message:
-            '${'Archive failed for @count comics'.tlParams({'count': failures.length})}$detail',
+            '${'Archive failed for @count comics'.tlParams({'count': failures.length})}: $detail',
       );
       return;
     }
