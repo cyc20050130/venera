@@ -25,4 +25,23 @@ void main() {
       isTrue,
     );
   });
+
+  test('animated image retries transient failures with a bounded delay', () {
+    expect(
+      animatedImageRetryDelay(Exception('offline'), 0),
+      const Duration(seconds: 2),
+    );
+    expect(
+      animatedImageRetryDelay(Exception('offline'), 2),
+      const Duration(seconds: 10),
+    );
+    expect(
+      animatedImageRetryDelay(Exception('offline'), 99),
+      const Duration(seconds: 30),
+    );
+    expect(
+      animatedImageRetryDelay(Exception('Invalid Status Code: 404'), 0),
+      isNull,
+    );
+  });
 }

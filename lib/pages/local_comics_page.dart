@@ -302,7 +302,8 @@ class _LocalComicsPageState extends State<LocalComicsPage> {
   }
 
   String? _archiveBadgeFor(LocalComic comic) {
-    if (!_canArchive(comic)) return null;
+    final queued = LocalManager().isArchiveCompressionQueued(comic);
+    if (!_canArchive(comic) && !queued) return null;
     final key = _archiveKey(comic);
     final snapshot = _archiveSnapshots[key];
     return localArchiveBadgeKey(
@@ -310,12 +311,16 @@ class _LocalComicsPageState extends State<LocalComicsPage> {
           (comic.hasArchiveMetadataOnDisk && !comic.hasDirtyArchiveMarkerOnDisk
               ? LocalStorageState.archived
               : LocalStorageState.loose),
-      operationRunning: _activeArchiveKeys.contains(key),
+      operationRunning: queued || _activeArchiveKeys.contains(key),
     )?.tl;
   }
 
   List<MenuEntry> _archiveMenuEntries(LocalComic comic) {
-    if (!_canArchive(comic) || _archiveOperationRunning) return const [];
+    if (!_canArchive(comic) ||
+        _archiveOperationRunning ||
+        LocalManager().isArchiveCompressionQueued(comic)) {
+      return const [];
+    }
     final snapshot = _archiveSnapshots[_archiveKey(comic)];
     final action = localArchiveUiActionForState(
       snapshot?.state ??
@@ -369,6 +374,19 @@ class _LocalComicsPageState extends State<LocalComicsPage> {
     if (targets.isEmpty) {
       context.showMessage(
         message: 'Only Venera-managed comics can be compressed.'.tl,
+      );
+      return;
+    }
+
+    if (operation == _LocalArchiveUiOperation.compress) {
+      final added = LocalManager().enqueueArchiveCompression(targets);
+      if (!mounted) return;
+      context.showMessage(
+        message: added == 0
+            ? 'The selected comics are already queued.'.tl
+            : 'Added @count comics to compression queue.'.tlParams({
+                'count': added,
+              }),
       );
       return;
     }

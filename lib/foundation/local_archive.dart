@@ -767,6 +767,22 @@ class LocalArchiveService {
     });
   }
 
+  /// Deletes a managed comic directory after every archive operation and
+  /// active writer for the same comic has stopped.
+  Future<void> deleteManagedComicFiles(LocalComic comic) {
+    return _runExclusive(comic, () async {
+      final token = LocalArchiveCancellationToken();
+      final root = _comicRoot(comic);
+      _assertComicIdentity(root, comic);
+      await _waitForActiveWriters(root, token);
+      await _runHeavy(token, () async {
+        if (await root.exists()) {
+          await root.delete(recursive: true);
+        }
+      });
+    }, traceOperation: 'delete_comic_files');
+  }
+
   /// Marks an expanded archive as modified before an app-managed file write.
   Future<void> markDirty(LocalComic comic) {
     return _runExclusive(comic, () async {

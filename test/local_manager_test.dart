@@ -6,6 +6,7 @@ import 'dart:typed_data';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:sqlite3/sqlite3.dart';
 import 'package:venera/foundation/app.dart';
+import 'package:venera/foundation/appdata.dart';
 import 'package:venera/foundation/comic_source/comic_source.dart';
 import 'package:venera/foundation/comic_type.dart';
 import 'package:venera/foundation/history.dart';
@@ -1047,6 +1048,147 @@ void main() {
     expect(await snapshotFile().exists(), isFalse);
     expect(manager.downloadingTasks, isEmpty);
   });
+
+  test('compression tasks share the persisted download queue', () async {
+    await manager.init();
+    managerInitialized = true;
+    final comicDir = await Directory(
+      '${manager.path}${Platform.pathSeparator}compression-comic',
+    ).create(recursive: true);
+    await File(
+      '${comicDir.path}${Platform.pathSeparator}cover.jpg',
+    ).writeAsBytes([1, 2, 3]);
+    final comic = LocalComic(
+      id: 'compression-comic',
+      title: 'Compression Comic',
+      subtitle: '',
+      tags: const [],
+      directory: 'compression-comic',
+      chapters: null,
+      cover: 'cover.jpg',
+      comicType: ComicType.local,
+      downloadedChapters: const [],
+      createdAt: DateTime(2026, 7, 16),
+    );
+    await manager.add(comic);
+    manager.addTask(_FakeDownloadTask('queue-blocker'));
+
+    expect(manager.enqueueArchiveCompression([comic]), 1);
+    expect(manager.enqueueArchiveCompression([comic]), 0);
+    expect(manager.downloadingTasks, hasLength(2));
+    final compression = manager.downloadingTasks.last;
+    expect(compression, isA<ArchiveCompressionTask>());
+    expect(
+      DownloadTask.fromJson(compression.toJson()),
+      isA<ArchiveCompressionTask>(),
+    );
+  });
+
+  test(
+    'completed downloads put automatic compression before the next task',
+    () async {
+      await manager.init();
+      managerInitialized = true;
+      final oldSetting = appdata.settings['autoCompressDownloads'];
+      appdata.settings['autoCompressDownloads'] = true;
+      addTearDown(() {
+        appdata.settings['autoCompressDownloads'] = oldSetting;
+        manager.debugArchiveCompressionTaskFactory = null;
+      });
+      final comicDir = await Directory(
+        '${manager.path}${Platform.pathSeparator}auto-compression-comic',
+      ).create(recursive: true);
+      await File(
+        '${comicDir.path}${Platform.pathSeparator}cover.jpg',
+      ).writeAsBytes([1, 2, 3]);
+      final comic = LocalComic(
+        id: 'auto-compression-comic',
+        title: 'Auto Compression Comic',
+        subtitle: '',
+        tags: const [],
+        directory: 'auto-compression-comic',
+        chapters: null,
+        cover: 'cover.jpg',
+        comicType: ComicType.local,
+        downloadedChapters: const [],
+        createdAt: DateTime(2026, 7, 16),
+      );
+      final completed = _CompletingFakeDownloadTask(comic);
+      final next = _FakeDownloadTask('next-download');
+      late _PausedArchiveCompressionTask compression;
+      manager.debugArchiveCompressionTaskFactory = (value) {
+        compression = _PausedArchiveCompressionTask(value);
+        return compression;
+      };
+      manager.downloadingTasks.addAll([completed, next]);
+
+      manager.completeTask(completed);
+
+      expect(manager.downloadingTasks, [compression, next]);
+      expect(compression.resumeCount, 1);
+    },
+  );
+
+  test('deleting a comic cancels its queued compression task', () async {
+    await manager.init();
+    managerInitialized = true;
+    final comicDir = await Directory(
+      '${manager.path}${Platform.pathSeparator}delete-compression-comic',
+    ).create(recursive: true);
+    await File(
+      '${comicDir.path}${Platform.pathSeparator}cover.jpg',
+    ).writeAsBytes([1, 2, 3]);
+    final comic = LocalComic(
+      id: 'delete-compression-comic',
+      title: 'Delete Compression Comic',
+      subtitle: '',
+      tags: const [],
+      directory: 'delete-compression-comic',
+      chapters: null,
+      cover: 'cover.jpg',
+      comicType: ComicType.local,
+      downloadedChapters: const [],
+      createdAt: DateTime(2026, 7, 16),
+    );
+    await manager.add(comic);
+    manager.addTask(_FakeDownloadTask('queue-blocker'));
+    manager.enqueueArchiveCompression([comic]);
+
+    manager.batchDeleteComicsKeepFavoritesAndHistory([comic]);
+
+    expect(
+      manager.downloadingTasks.whereType<ArchiveCompressionTask>(),
+      isEmpty,
+    );
+    expect(manager.find(comic.id, comic.comicType), isNull);
+    final deadline = DateTime.now().add(const Duration(seconds: 2));
+    while (await comicDir.exists()) {
+      if (DateTime.now().isAfter(deadline)) {
+        fail('comic directory was not deleted after compression cancellation');
+      }
+      await Future<void>.delayed(const Duration(milliseconds: 20));
+    }
+  });
+}
+
+class _CompletingFakeDownloadTask extends _FakeDownloadTask {
+  _CompletingFakeDownloadTask(this.comic) : super(comic.id);
+
+  final LocalComic comic;
+
+  @override
+  LocalComic toLocalComic() => comic;
+}
+
+class _PausedArchiveCompressionTask extends ArchiveCompressionTask {
+  _PausedArchiveCompressionTask(super.comic);
+
+  int resumeCount = 0;
+
+  @override
+  void resume() {
+    resumeCount++;
+  }
 }
 
 class _FakeDownloadTask extends DownloadTask {

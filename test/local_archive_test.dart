@@ -133,6 +133,20 @@ void main() {
     },
   );
 
+  test('managed deletion waits for active comic writers', () async {
+    final service = LocalArchiveService.forTesting(libraryRoot: library.path);
+    final lease = await service.beginWrite(comic);
+
+    final deletion = service.deleteManagedComicFiles(comic);
+    await Future<void>.delayed(const Duration(milliseconds: 50));
+    expect(await comicDirectory.exists(), isTrue);
+
+    lease.close();
+    await deletion;
+
+    expect(await comicDirectory.exists(), isFalse);
+  });
+
   test(
     'first compression hashes each source only at deletion boundary',
     () async {

@@ -159,6 +159,7 @@ abstract class ImageDownloader {
 
   static final _loadingThumbnails =
       <String, _StreamWrapper<ImageDownloadProgress>>{};
+  static final _loadingThumbnailPriorities = <String, ThumbnailLoadPriority>{};
 
   static int get debugMaxThumbnailLoadingCount => _kMaxThumbnailLoadingCount;
 
@@ -176,7 +177,10 @@ abstract class ImageDownloader {
     void Function() checkStop, {
     ThumbnailLoadPriority priority = ThumbnailLoadPriority.foregroundVisible,
   }) {
-    return _acquireThumbnailLoadingSlot(checkStop, priority: priority);
+    return _acquireThumbnailLoadingSlot(
+      checkStop,
+      priority: priority,
+    ).then((_) {});
   }
 
   static void debugReleaseThumbnailLoadingSlot({
@@ -225,17 +229,21 @@ abstract class ImageDownloader {
     var existing = _loadingThumbnails[cacheKey];
     if (existing != null && existing.isClosed) {
       _loadingThumbnails.remove(cacheKey);
+      _loadingThumbnailPriorities.remove(cacheKey);
       existing = null;
     }
     if (existing != null) {
+      _promoteThumbnailLoad(cacheKey, priority);
       return existing.stream;
     }
 
+    _loadingThumbnailPriorities[cacheKey] = priority;
     final stream = _StreamWrapper<ImageDownloadProgress>(
       _loadThumbnailRefresh(cacheKey, url, sourceKey, cid, priority, checkStop),
       (wrapper) {
         if (_loadingThumbnails[cacheKey] == wrapper) {
           _loadingThumbnails.remove(cacheKey);
+          _loadingThumbnailPriorities.remove(cacheKey);
         }
       },
       replayLastValue: true,
@@ -252,19 +260,23 @@ abstract class ImageDownloader {
     ThumbnailLoadPriority priority,
     void Function() checkStop,
   ) async* {
-    await _acquireThumbnailLoadingSlot(checkStop, priority: priority);
+    final acquiredPriority = await _acquireThumbnailLoadingSlot(
+      checkStop,
+      priority: priority,
+      cacheKey: cacheKey,
+    );
     try {
       yield* _loadThumbnailRefreshWithAcquiredSlot(
         cacheKey,
         url,
         sourceKey,
         cid,
-        priority,
+        acquiredPriority,
         checkStop,
         redirectCount: 0,
       );
     } finally {
-      _releaseThumbnailLoadingSlot(priority);
+      _releaseThumbnailLoadingSlot(acquiredPriority);
     }
   }
 
@@ -434,24 +446,29 @@ abstract class ImageDownloader {
     }
   }
 
-  static Future<void> _acquireThumbnailLoadingSlot(
+  static Future<ThumbnailLoadPriority> _acquireThumbnailLoadingSlot(
     void Function() checkStop, {
     required ThumbnailLoadPriority priority,
+    String? cacheKey,
   }) async {
     final waiter = Completer<void>();
     final request = _ThumbnailLoadingSlotRequest(
       waiter: waiter,
-      priority: priority,
+      priority: _effectiveThumbnailPriority(cacheKey, priority),
       sequence: _nextThumbnailLoadingSlotSequence++,
+      cacheKey: cacheKey,
     );
     var acquired = false;
     _pendingThumbnailLoadingSlots.add(request);
     try {
       while (true) {
+        request.promote(
+          _effectiveThumbnailPriority(request.cacheKey, request.priority),
+        );
         _drainThumbnailLoadingQueue();
         if (waiter.isCompleted) {
           acquired = true;
-          return;
+          return request.priority;
         }
         await Future.any([
           waiter.future,
@@ -463,11 +480,35 @@ abstract class ImageDownloader {
       if (!acquired) {
         if (!_pendingThumbnailLoadingSlots.remove(request) &&
             waiter.isCompleted) {
-          _releaseThumbnailLoadingSlot(priority);
+          _releaseThumbnailLoadingSlot(request.priority);
         }
       }
       rethrow;
     }
+  }
+
+  static ThumbnailLoadPriority _effectiveThumbnailPriority(
+    String? cacheKey,
+    ThumbnailLoadPriority requested,
+  ) {
+    if (cacheKey == null) return requested;
+    final current = _loadingThumbnailPriorities[cacheKey];
+    if (current == null || requested.index > current.index) {
+      _loadingThumbnailPriorities[cacheKey] = requested;
+      return requested;
+    }
+    return current;
+  }
+
+  static void _promoteThumbnailLoad(
+    String cacheKey,
+    ThumbnailLoadPriority priority,
+  ) {
+    final effective = _effectiveThumbnailPriority(cacheKey, priority);
+    for (final request in _pendingThumbnailLoadingSlots) {
+      if (request.cacheKey == cacheKey) request.promote(effective);
+    }
+    _drainThumbnailLoadingQueue();
   }
 
   static void _releaseThumbnailLoadingSlot(ThumbnailLoadPriority priority) {
@@ -825,6 +866,7 @@ abstract class ImageDownloader {
       wrapper.cancel();
     }
     _loadingThumbnails.clear();
+    _loadingThumbnailPriorities.clear();
     thumbnailLoadingCount = 0;
     _pendingThumbnailLoadingSlots.clear();
     _nextThumbnailLoadingSlotSequence = 0;
@@ -1452,15 +1494,21 @@ enum ReaderImageLoadPriority {
 }
 
 class _ThumbnailLoadingSlotRequest {
-  const _ThumbnailLoadingSlotRequest({
+  _ThumbnailLoadingSlotRequest({
     required this.waiter,
     required this.priority,
     required this.sequence,
+    this.cacheKey,
   });
 
   final Completer<void> waiter;
-  final ThumbnailLoadPriority priority;
+  ThumbnailLoadPriority priority;
   final int sequence;
+  final String? cacheKey;
+
+  void promote(ThumbnailLoadPriority value) {
+    if (value.index > priority.index) priority = value;
+  }
 }
 
 class ImageDownloadProgress {

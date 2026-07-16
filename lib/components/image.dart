@@ -17,6 +17,22 @@ bool shouldHandleAnimatedImageStreamEvent({
   return true;
 }
 
+@visibleForTesting
+Duration? animatedImageRetryDelay(Object error, int attempt) {
+  final message = error.toString();
+  if (message.contains('Invalid Status Code: 403') ||
+      message.contains('Invalid Status Code: 404')) {
+    return null;
+  }
+  const delays = [
+    Duration(seconds: 2),
+    Duration(seconds: 5),
+    Duration(seconds: 10),
+    Duration(seconds: 30),
+  ];
+  return delays[attempt.clamp(0, delays.length - 1)];
+}
+
 class AnimatedImage extends StatefulWidget {
   /// show animation when loading is complete.
   AnimatedImage({
@@ -104,6 +120,8 @@ class _AnimatedImageState extends State<AnimatedImage>
   late DisposableBuildContext<State<AnimatedImage>> _scrollAwareContext;
   Object? _lastException;
   ImageStreamCompleterHandle? _completerHandle;
+  Timer? _retryTimer;
+  int _retryAttempt = 0;
 
   static final Map<int, Size> _cache = {};
 
@@ -121,6 +139,7 @@ class _AnimatedImageState extends State<AnimatedImage>
     assert(_imageStream != null);
     WidgetsBinding.instance.removeObserver(this);
     _stopListeningToStream();
+    _retryTimer?.cancel();
     _completerHandle?.dispose();
     _scrollAwareContext.dispose();
     _replaceImage(info: null);
@@ -145,6 +164,9 @@ class _AnimatedImageState extends State<AnimatedImage>
   void didUpdateWidget(AnimatedImage oldWidget) {
     super.didUpdateWidget(oldWidget);
     if (widget.image != oldWidget.image) {
+      _retryTimer?.cancel();
+      _retryTimer = null;
+      _retryAttempt = 0;
       _resolveImage();
     }
   }
@@ -169,7 +191,7 @@ class _AnimatedImageState extends State<AnimatedImage>
         SemanticsBinding.instance.accessibilityFeatures.invertColors;
   }
 
-  void _resolveImage() {
+  void _resolveImage({bool force = false}) {
     final ScrollAwareImageProvider provider = ScrollAwareImageProvider<Object>(
       context: _scrollAwareContext,
       imageProvider: widget.image,
@@ -182,7 +204,7 @@ class _AnimatedImageState extends State<AnimatedImage>
             : null,
       ),
     );
-    _updateSourceStream(newStream);
+    _updateSourceStream(newStream, force: force);
   }
 
   ImageStreamListener? _imageStreamListener;
@@ -211,6 +233,7 @@ class _AnimatedImageState extends State<AnimatedImage>
           setState(() {
             _lastException = error;
           });
+          _scheduleRetry(error);
         },
       );
     }
@@ -237,6 +260,9 @@ class _AnimatedImageState extends State<AnimatedImage>
       _frameNumber = _frameNumber == null ? 0 : _frameNumber! + 1;
       _wasSynchronouslyLoaded = _wasSynchronouslyLoaded | synchronousCall;
     });
+    _retryTimer?.cancel();
+    _retryTimer = null;
+    _retryAttempt = 0;
   }
 
   void _handleImageChunk(ImageChunkEvent event, Object? streamKey) {
@@ -264,8 +290,8 @@ class _AnimatedImageState extends State<AnimatedImage>
   // Updates _imageStream to newStream, and moves the stream listener
   // registration from the old stream to the new stream (if a listener was
   // registered).
-  void _updateSourceStream(ImageStream newStream) {
-    if (_imageStream?.key == newStream.key) {
+  void _updateSourceStream(ImageStream newStream, {bool force = false}) {
+    if (!force && _imageStream?.key == newStream.key) {
       return;
     }
 
@@ -289,6 +315,28 @@ class _AnimatedImageState extends State<AnimatedImage>
     if (_isListeningToStream) {
       _imageStream!.addListener(_getListener(recreateListener: true));
     }
+  }
+
+  void _scheduleRetry(Object error) {
+    if (_retryTimer != null) return;
+    final delay = animatedImageRetryDelay(error, _retryAttempt);
+    if (delay == null) return;
+    _retryAttempt++;
+    _retryTimer = Timer(delay, () {
+      _retryTimer = null;
+      unawaited(_retryFailedImage());
+    });
+  }
+
+  Future<void> _retryFailedImage() async {
+    if (!mounted || _lastException == null) return;
+    try {
+      await widget.image.evict();
+    } catch (_) {
+      // Resolving again is still useful when the failed key was not cached.
+    }
+    if (!mounted || _lastException == null) return;
+    _resolveImage(force: true);
   }
 
   void _listenToStream() {

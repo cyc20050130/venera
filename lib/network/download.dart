@@ -6,9 +6,11 @@ import 'package:flutter/widgets.dart' show ChangeNotifier;
 import 'package:flutter_saf/flutter_saf.dart';
 import 'package:venera/foundation/app.dart';
 import 'package:venera/foundation/appdata.dart';
+import 'package:venera/foundation/background_task_notification.dart';
 import 'package:venera/foundation/comic_source/comic_source.dart';
 import 'package:venera/foundation/comic_type.dart';
 import 'package:venera/foundation/local.dart';
+import 'package:venera/foundation/local_archive.dart';
 import 'package:venera/foundation/log.dart';
 import 'package:venera/foundation/res.dart';
 import 'package:venera/network/images.dart';
@@ -54,12 +56,46 @@ abstract class DownloadTask with ChangeNotifier {
 
   ComicType get comicType;
 
+  String get backgroundOperation => 'Downloading';
+
+  bool get hasDeterminateProgress => progress > 0 && progress.isFinite;
+
+  Duration? get estimatedRemaining => null;
+
+  String get backgroundTaskKey =>
+      '$runtimeType\u0000${comicType.value}\u0000$id';
+
+  @override
+  void notifyListeners() {
+    super.notifyListeners();
+    BackgroundTaskNotificationService.instance.report(
+      BackgroundTaskNotificationData(
+        taskKey: backgroundTaskKey,
+        operation: backgroundOperation,
+        title: title,
+        message: message,
+        progress: progress,
+        speed: speed,
+        isPaused: isPaused,
+        isError: isError,
+        estimatedRemaining: estimatedRemaining,
+        hasDeterminateProgress: hasDeterminateProgress,
+      ),
+    );
+  }
+
+  void clearBackgroundNotification() {
+    BackgroundTaskNotificationService.instance.clear(backgroundTaskKey);
+  }
+
   static DownloadTask? fromJson(Map<String, dynamic> json) {
     switch (json["type"]) {
       case "ImagesDownloadTask":
         return ImagesDownloadTask.fromJson(json);
       case "ArchiveDownloadTask":
         return ArchiveDownloadTask.fromJson(json);
+      case "ArchiveCompressionTask":
+        return ArchiveCompressionTask.fromJson(json);
       default:
         return null;
     }
@@ -74,6 +110,217 @@ abstract class DownloadTask with ChangeNotifier {
 
   @override
   int get hashCode => Object.hash(id, comicType);
+}
+
+class ArchiveCompressionTask extends DownloadTask {
+  ArchiveCompressionTask(this.comic) {
+    path = comic.baseDir;
+  }
+
+  final LocalComic comic;
+
+  LocalArchiveCancellationToken? _cancellationToken;
+  final Stopwatch _stopwatch = Stopwatch();
+  Duration _lastSpeedSample = Duration.zero;
+  Duration _lastNotifyAt = Duration.zero;
+  int? _lastCompletedBytes;
+  int _speed = 0;
+  int _runGeneration = 0;
+  double _progress = 0;
+  bool _isRunning = false;
+  bool _isError = false;
+  bool _hasProgress = false;
+  String _message = 'Waiting to compress';
+
+  @override
+  String get backgroundOperation => 'Compressing';
+
+  @override
+  String? get cover => comic.coverFile.uri.toString();
+
+  @override
+  ComicType get comicType => comic.comicType;
+
+  @override
+  Duration? get estimatedRemaining => estimateLocalArchiveRemaining(
+    elapsed: _stopwatch.elapsed,
+    progress: _progress,
+  );
+
+  @override
+  bool get hasDeterminateProgress => _hasProgress;
+
+  @override
+  String get id => comic.id;
+
+  @override
+  bool get isError => _isError;
+
+  @override
+  bool get isPaused => !_isRunning;
+
+  @override
+  String get message => _message;
+
+  @override
+  double get progress => _progress;
+
+  @override
+  int get speed => _speed;
+
+  @override
+  String get title => comic.title;
+
+  @override
+  void cancel() {
+    _runGeneration++;
+    _isRunning = false;
+    _cancellationToken?.cancel();
+    _stopwatch.stop();
+    _speed = 0;
+    clearBackgroundNotification();
+    LocalManager().removeTask(this);
+  }
+
+  @override
+  void pause() {
+    if (!_isRunning) return;
+    _runGeneration++;
+    _isRunning = false;
+    _cancellationToken?.cancel();
+    _stopwatch.stop();
+    _speed = 0;
+    _message = 'Paused';
+    notifyListeners();
+    LocalManager().saveCurrentDownloadingTasksInBackground(
+      reason: 'pause compression task',
+    );
+  }
+
+  @override
+  void resume() async {
+    if (_isRunning) return;
+    final current = LocalManager().find(id, comicType);
+    if (current == null) {
+      _setError('Error: Comic is no longer available');
+      return;
+    }
+    final generation = ++_runGeneration;
+    final token = LocalArchiveCancellationToken();
+    _cancellationToken = token;
+    _isRunning = true;
+    _isError = false;
+    _hasProgress = false;
+    _progress = 0;
+    _speed = 0;
+    _message = 'Preparing compression...';
+    _lastCompletedBytes = null;
+    _lastSpeedSample = Duration.zero;
+    _lastNotifyAt = Duration.zero;
+    _stopwatch
+      ..reset()
+      ..start();
+    notifyListeners();
+    try {
+      await LocalArchiveService().compress(
+        current,
+        cancellationToken: token,
+        onProgress: (value) {
+          if (generation != _runGeneration || !_isRunning) return;
+          _updateProgress(value);
+        },
+      );
+      if (generation != _runGeneration || !_isRunning) return;
+      _stopwatch.stop();
+      _progress = 1;
+      _hasProgress = true;
+      _speed = 0;
+      _message = 'Compression complete';
+      notifyListeners();
+      LocalManager().completeTask(this);
+    } on LocalArchiveCancelledException {
+      if (generation == _runGeneration && _isRunning) {
+        pause();
+      }
+    } catch (error, stackTrace) {
+      if (generation != _runGeneration) return;
+      Log.error('LocalArchive', error, stackTrace);
+      _setError('Error: $error');
+    }
+  }
+
+  void _updateProgress(LocalArchiveProgress value) {
+    final elapsed = _stopwatch.elapsed;
+    final nextProgress = localArchiveOverallProgress(
+      value,
+    ).clamp(_progress, 1.0);
+    final completedBytes = value.completedBytes;
+    if (completedBytes != null) {
+      final previousBytes = _lastCompletedBytes;
+      final sampleDuration = elapsed - _lastSpeedSample;
+      if (previousBytes != null &&
+          completedBytes >= previousBytes &&
+          sampleDuration >= const Duration(milliseconds: 400)) {
+        _speed =
+            ((completedBytes - previousBytes) *
+                    Duration.microsecondsPerSecond /
+                    sampleDuration.inMicroseconds)
+                .round();
+        _lastSpeedSample = elapsed;
+        _lastCompletedBytes = completedBytes;
+      } else if (previousBytes == null || completedBytes < previousBytes) {
+        _lastCompletedBytes = completedBytes;
+        _lastSpeedSample = elapsed;
+      }
+    }
+    final stage = localArchiveProgressStageKey(value.operation);
+    final fileProgress = value.totalFiles > 0
+        ? ' ${value.completedFiles}/${value.totalFiles}'
+        : '';
+    final stageChanged = !_message.startsWith(stage);
+    _message = '$stage$fileProgress';
+    _hasProgress = true;
+    final progressChanged = nextProgress - _progress >= 0.002;
+    _progress = nextProgress;
+    if (stageChanged ||
+        progressChanged ||
+        elapsed - _lastNotifyAt >= const Duration(milliseconds: 250) ||
+        nextProgress >= 1) {
+      _lastNotifyAt = elapsed;
+      notifyListeners();
+    }
+  }
+
+  void _setError(String value) {
+    _isRunning = false;
+    _isError = true;
+    _stopwatch.stop();
+    _speed = 0;
+    _message = value;
+    notifyListeners();
+    LocalManager().saveCurrentDownloadingTasksInBackground(
+      reason: 'compression task error',
+    );
+  }
+
+  @override
+  Map<String, dynamic> toJson() => {
+    'type': 'ArchiveCompressionTask',
+    'id': id,
+    'comicType': comicType.value,
+  };
+
+  @override
+  LocalComic toLocalComic() => LocalManager().find(id, comicType) ?? comic;
+
+  static ArchiveCompressionTask? fromJson(Map<String, dynamic> json) {
+    if (json['type'] != 'ArchiveCompressionTask') return null;
+    final id = _downloadNullableString(json['id']);
+    final typeValue = _downloadInt(json['comicType'], -1);
+    if (id == null || id.isEmpty || typeValue < 0) return null;
+    final comic = LocalManager().find(id, ComicType(typeValue));
+    return comic == null ? null : ArchiveCompressionTask(comic);
+  }
 }
 
 String? _downloadNullableString(dynamic value) {

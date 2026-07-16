@@ -1,4 +1,5 @@
 import 'dart:io';
+import 'dart:typed_data';
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:venera/foundation/app.dart';
@@ -128,6 +129,52 @@ void main() {
       );
     },
   );
+
+  test('visible subscriber promotes a shared background cover load', () async {
+    const sharedUrl = 'https://example.com/shared-cover.jpg';
+    const otherUrl = 'https://example.com/other-cover.jpg';
+    final started = <String>[];
+    ImageDownloader.thumbnailLoadingCount =
+        ImageDownloader.debugMaxThumbnailLoadingCount;
+    ImageDownloader.debugThumbnailNetworkLoader = (url, sourceKey, cid) async* {
+      started.add(url);
+      yield ImageDownloadProgress(
+        currentBytes: 3,
+        totalBytes: 3,
+        imageBytes: Uint8List.fromList([1, 2, 3]),
+      );
+    };
+
+    final sharedBackground = ImageDownloader.loadThumbnail(
+      sharedUrl,
+      null,
+      null,
+      ThumbnailLoadPriority.background,
+    ).last;
+    await Future<void>.delayed(const Duration(milliseconds: 30));
+    final otherBackground = ImageDownloader.loadThumbnail(
+      otherUrl,
+      null,
+      null,
+      ThumbnailLoadPriority.background,
+    ).last;
+    final sharedVisible = ImageDownloader.loadThumbnail(
+      sharedUrl,
+      null,
+      null,
+      ThumbnailLoadPriority.foregroundVisible,
+    ).last;
+
+    await Future<void>.delayed(const Duration(milliseconds: 30));
+    expect(started, isEmpty);
+    ImageDownloader.thumbnailLoadingCount =
+        ImageDownloader.debugMaxThumbnailLoadingCount - 1;
+
+    await sharedVisible.timeout(const Duration(seconds: 2));
+    await sharedBackground.timeout(const Duration(seconds: 2));
+    await otherBackground.timeout(const Duration(seconds: 2));
+    expect(started.first, sharedUrl);
+  });
 
   test(
     'cancelled cover loading waiter does not leak a thumbnail slot',

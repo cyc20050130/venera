@@ -198,12 +198,10 @@ class _DownloadTaskTileState extends State<_DownloadTaskTile> {
             clipBehavior: Clip.antiAlias,
             child: widget.task.cover == null
                 ? null
-                : Image(
-                    image: ResizeImage.resizeIfNeeded(
-                      coverCacheWidth,
-                      coverCacheHeight,
-                      CachedImageProvider(widget.task.cover!),
-                    ),
+                : AnimatedImage(
+                    image: CachedImageProvider(widget.task.cover!),
+                    cacheWidth: coverCacheWidth,
+                    cacheHeight: coverCacheHeight,
                     filterQuality: FilterQuality.medium,
                     fit: BoxFit.cover,
                   ),

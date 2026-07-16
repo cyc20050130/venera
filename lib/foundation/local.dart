@@ -1,15 +1,14 @@
 import 'dart:async';
 import 'dart:convert';
-import 'dart:isolate';
 
 import 'package:flutter/foundation.dart' show visibleForTesting;
 import 'package:flutter/widgets.dart' show ChangeNotifier;
-import 'package:flutter_saf/flutter_saf.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:sqlite3/sqlite3.dart';
 import 'package:venera/foundation/comic_source/comic_source.dart';
 import 'package:venera/foundation/comic_type.dart';
 import 'package:venera/foundation/favorites.dart';
+import 'package:venera/foundation/background_task_notification.dart';
 import 'package:venera/foundation/log.dart';
 import 'package:venera/network/download.dart';
 import 'package:venera/pages/reader/reader.dart';
@@ -832,6 +831,17 @@ class LocalManager with ChangeNotifier {
 
   List<DownloadTask> downloadingTasks = [];
 
+  bool _suspendQueueAutoResume = false;
+
+  @visibleForTesting
+  ArchiveCompressionTask Function(LocalComic comic)?
+  debugArchiveCompressionTaskFactory;
+
+  ArchiveCompressionTask _createArchiveCompressionTask(LocalComic comic) {
+    return debugArchiveCompressionTaskFactory?.call(comic) ??
+        ArchiveCompressionTask(comic);
+  }
+
   bool isDownloading(String id, ComicType type) {
     return downloadingTasks.any(
       (element) => element.id == id && element.comicType == type,
@@ -863,46 +873,89 @@ class LocalManager with ChangeNotifier {
   void completeTask(DownloadTask task) {
     final completedComic = task.toLocalComic();
     add(completedComic);
+    final shouldAutoCompress =
+        task is! ArchiveCompressionTask &&
+        appdata.settings.boolValue('autoCompressDownloads', fallback: true) &&
+        LocalArchiveService().canManage(completedComic);
     downloadingTasks.remove(task);
+    task.clearBackgroundNotification();
+    if (shouldAutoCompress &&
+        !downloadingTasks.any(
+          (queued) =>
+              queued.id == completedComic.id &&
+              queued.comicType == completedComic.comicType,
+        )) {
+      downloadingTasks.insert(0, _createArchiveCompressionTask(completedComic));
+    }
+    _syncBackgroundTaskNotification();
     notifyListeners();
     saveCurrentDownloadingTasksInBackground(reason: 'complete task');
     downloadingTasks.firstOrNull?.resume();
-    if (appdata.settings.boolValue('autoCompressDownloads', fallback: true)) {
-      // Compression uses the archive service's per-comic queue and bounded
-      // cross-comic concurrency. Deliberately do not await it here: the next
-      // download can start immediately, and an archive failure must never turn
-      // a successful download into a failure.
-      unawaited(_autoCompressCompletedComic(completedComic));
-    }
   }
 
-  Future<void> _autoCompressCompletedComic(LocalComic completedComic) async {
-    try {
-      final comic = find(completedComic.id, completedComic.comicType);
-      if (comic == null || !LocalArchiveService().canManage(comic)) {
-        return;
+  int enqueueArchiveCompression(Iterable<LocalComic> comics) {
+    final existing = downloadingTasks
+        .map((task) => '${task.comicType.value}\u0000${task.id}')
+        .toSet();
+    var added = 0;
+    for (final comic in comics) {
+      final key = '${comic.comicType.value}\u0000${comic.id}';
+      if (!existing.add(key) || !LocalArchiveService().canManage(comic)) {
+        continue;
       }
-      final result = await LocalArchiveService().compress(comic);
-      Log.info(
-        'LocalArchive',
-        'Auto-compressed ${comic.sourceKey}@${comic.id}: '
-            '${result.archiveBytes} bytes, saved ${result.savedBytes} bytes',
-      );
-      notifyListeners();
-    } catch (error, stackTrace) {
-      Log.error(
-        'LocalArchive',
-        'Auto-compression failed for '
-            '${completedComic.sourceKey}@${completedComic.id}: $error',
-        stackTrace,
-      );
+      downloadingTasks.add(_createArchiveCompressionTask(comic));
+      added++;
     }
+    if (added == 0) return 0;
+    _syncBackgroundTaskNotification();
+    notifyListeners();
+    saveCurrentDownloadingTasksInBackground(reason: 'queue compression');
+    downloadingTasks.firstOrNull?.resume();
+    return added;
+  }
+
+  bool isArchiveCompressionQueued(LocalComic comic) {
+    return downloadingTasks.any(
+      (task) =>
+          task is ArchiveCompressionTask &&
+          task.id == comic.id &&
+          task.comicType == comic.comicType,
+    );
   }
 
   void removeTask(DownloadTask task) {
+    final wasFirst = downloadingTasks.firstOrNull == task;
     downloadingTasks.remove(task);
+    task.clearBackgroundNotification();
+    _syncBackgroundTaskNotification();
     notifyListeners();
     saveCurrentDownloadingTasksInBackground(reason: 'remove task');
+    if (wasFirst && !_suspendQueueAutoResume) {
+      downloadingTasks.firstOrNull?.resume();
+    }
+  }
+
+  void _cancelTasksForComics(Iterable<LocalComic> comics) {
+    final identities = comics
+        .map((comic) => '${comic.comicType.value}\u0000${comic.id}')
+        .toSet();
+    final tasks = downloadingTasks
+        .where(
+          (task) =>
+              identities.contains('${task.comicType.value}\u0000${task.id}'),
+        )
+        .toList(growable: false);
+    if (tasks.isEmpty) return;
+
+    _suspendQueueAutoResume = true;
+    try {
+      for (final task in tasks) {
+        task.cancel();
+      }
+    } finally {
+      _suspendQueueAutoResume = false;
+    }
+    downloadingTasks.firstOrNull?.resume();
   }
 
   void moveToFirst(DownloadTask task) {
@@ -914,6 +967,7 @@ class LocalManager with ChangeNotifier {
       downloadingTasks.first.pause();
       downloadingTasks.remove(task);
       downloadingTasks.insert(0, task);
+      _syncBackgroundTaskNotification();
       notifyListeners();
       saveCurrentDownloadingTasksInBackground(reason: 'move task');
       if (shouldResume) {
@@ -1029,6 +1083,7 @@ class LocalManager with ChangeNotifier {
   /// Reopens the local index after either a committed import or a rollback.
   Future<void> reloadAfterFullDataImport({bool resumeFirst = false}) async {
     downloadingTasks.clear();
+    _syncBackgroundTaskNotification();
     _lastWrittenDownloadingTasksSnapshot = null;
     await init();
     if (resumeFirst) downloadingTasks.firstOrNull?.resume();
@@ -1039,13 +1094,17 @@ class LocalManager with ChangeNotifier {
   Future<void> reloadDownloadingTasksFromDisk() async {
     if (!_isInitialized) return;
     downloadingTasks.clear();
+    _syncBackgroundTaskNotification();
     _lastWrittenDownloadingTasksSnapshot = null;
     await _restoreDownloadingTasksOnInit();
     notifyListeners();
   }
 
   void resumeFirstDownloadingTask() {
-    if (_isInitialized) downloadingTasks.firstOrNull?.resume();
+    if (_isInitialized) {
+      _syncBackgroundTaskNotification();
+      downloadingTasks.firstOrNull?.resume();
+    }
   }
 
   void _trackDownloadingTasksFlush(Future<void> future, String snapshot) {
@@ -1139,13 +1198,22 @@ class LocalManager with ChangeNotifier {
     if (changed) {
       saveCurrentDownloadingTasksInBackground(reason: 'restore cleanup');
     }
+    _syncBackgroundTaskNotification();
   }
 
   void addTask(DownloadTask task) {
+    final wasEmpty = downloadingTasks.isEmpty;
     downloadingTasks.add(task);
+    _syncBackgroundTaskNotification();
     notifyListeners();
     saveCurrentDownloadingTasksInBackground(reason: 'add task');
-    downloadingTasks.first.resume();
+    if (wasEmpty) task.resume();
+  }
+
+  void _syncBackgroundTaskNotification() {
+    BackgroundTaskNotificationService.instance.setCurrentTaskKey(
+      downloadingTasks.firstOrNull?.backgroundTaskKey,
+    );
   }
 
   void markChapterDownloaded(LocalComic comic, String chapterId) {
@@ -1306,9 +1374,9 @@ class LocalManager with ChangeNotifier {
   }
 
   void deleteComic(LocalComic c, [bool removeFileOnDisk = true]) {
+    _cancelTasksForComics([c]);
     if (removeFileOnDisk && LocalArchiveService().canManage(c)) {
-      var dir = Directory(c.baseDir);
-      dir.deleteIgnoreError(recursive: true);
+      _deleteManagedComicFiles([c]);
     }
     // Deleting a local comic means that it's no longer available, thus both favorite and history should be deleted.
     if (c.comicType == ComicType.local) {
@@ -1387,15 +1455,13 @@ class LocalManager with ChangeNotifier {
       return;
     }
 
-    var shouldRemovedDirs = <Directory>[];
+    _cancelTasksForComics(comics);
+    var shouldRemoveFiles = <LocalComic>[];
     _db.execute('BEGIN TRANSACTION;');
     try {
       for (var c in comics) {
         if (removeFileOnDisk && LocalArchiveService().canManage(c)) {
-          var dir = Directory(c.baseDir);
-          if (dir.existsSync()) {
-            shouldRemovedDirs.add(dir);
-          }
+          shouldRemoveFiles.add(c);
         }
         _db.execute('DELETE FROM comics WHERE id = ? AND comic_type = ?;', [
           c.id,
@@ -1419,7 +1485,7 @@ class LocalManager with ChangeNotifier {
     notifyListeners();
 
     if (removeFileOnDisk) {
-      _deleteDirectories(shouldRemovedDirs);
+      _deleteManagedComicFiles(shouldRemoveFiles);
     }
   }
 
@@ -1427,20 +1493,21 @@ class LocalManager with ChangeNotifier {
     batchDeleteComics(comics, true, false);
   }
 
-  /// Deletes the directories in a separate isolate to avoid blocking the UI thread.
-  static void _deleteDirectories(List<Directory> directories) {
-    Isolate.run(() async {
-      await SAFTaskWorker().init();
-      for (var dir in directories) {
-        try {
-          if (dir.existsSync()) {
-            await dir.delete(recursive: true);
-          }
-        } catch (e) {
-          continue;
-        }
-      }
-    });
+  static void _deleteManagedComicFiles(List<LocalComic> comics) {
+    for (final comic in comics) {
+      unawaited(
+        LocalArchiveService().deleteManagedComicFiles(comic).catchError((
+          Object error,
+          StackTrace stackTrace,
+        ) {
+          Log.error(
+            'LocalManager',
+            'Failed to delete ${comic.baseDir}: $error',
+            stackTrace,
+          );
+        }),
+      );
+    }
   }
 
   static String getChapterDirectoryName(String name) {

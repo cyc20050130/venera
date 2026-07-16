@@ -10,6 +10,7 @@ import 'package:go_router/go_router.dart';
 import 'package:venera/core/providers/app_providers.dart';
 import 'package:venera/core/upgrade/rewrite_upgrade_coordinator.dart';
 import 'package:venera/foundation/bootstrap.dart';
+import 'package:venera/foundation/background_task_notification.dart';
 import 'package:venera/design_system/app_design_system.dart';
 import 'package:venera/foundation/log.dart';
 import 'package:venera/foundation/rewrite_upgrade.dart';
@@ -137,6 +138,7 @@ void main(List<String> args) {
     runZonedGuarded(
       () async {
         WidgetsFlutterBinding.ensureInitialized();
+        await BackgroundTaskNotificationService.instance.initialize();
         runApp(const ProviderScope(child: MyApp()));
         bootstrapController.start();
         if (App.isDesktop) {
