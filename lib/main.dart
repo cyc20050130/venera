@@ -7,6 +7,7 @@ import 'package:flutter/services.dart';
 import 'package:flutter_localizations/flutter_localizations.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
+import 'package:venera/core/providers/app_providers.dart';
 import 'package:venera/foundation/bootstrap.dart';
 import 'package:venera/design_system/app_design_system.dart';
 import 'package:venera/foundation/log.dart';
@@ -162,17 +163,18 @@ void main(List<String> args) {
   });
 }
 
-class MyApp extends StatefulWidget {
+class MyApp extends ConsumerStatefulWidget {
   const MyApp({super.key});
 
   @override
-  State<MyApp> createState() => _MyAppState();
+  ConsumerState<MyApp> createState() => _MyAppState();
 }
 
-class _MyAppState extends State<MyApp> with WidgetsBindingObserver {
+class _MyAppState extends ConsumerState<MyApp> with WidgetsBindingObserver {
   late final VoidCallback _forceRebuildCallback;
   late final GoRouter _router;
   bool _startupAuthorized = false;
+  bool _rewriteDatabaseRequested = false;
 
   @override
   void initState() {
@@ -214,6 +216,8 @@ class _MyAppState extends State<MyApp> with WidgetsBindingObserver {
     );
     _forceRebuildCallback = forceRebuild;
     App.registerForceRebuild(_forceRebuildCallback);
+    bootstrapController.addListener(_initializeRewriteDatabaseWhenReady);
+    _initializeRewriteDatabaseWhenReady();
     SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
     WidgetsBinding.instance.addObserver(this);
     WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -234,6 +238,7 @@ class _MyAppState extends State<MyApp> with WidgetsBindingObserver {
   @override
   void dispose() {
     App.unregisterForceRebuild(_forceRebuildCallback);
+    bootstrapController.removeListener(_initializeRewriteDatabaseWhenReady);
     WidgetsBinding.instance.removeObserver(this);
     final overlay = hideContentOverlay;
     hideContentOverlay = null;
@@ -242,6 +247,26 @@ class _MyAppState extends State<MyApp> with WidgetsBindingObserver {
     }
     _router.dispose();
     super.dispose();
+  }
+
+  void _initializeRewriteDatabaseWhenReady() {
+    if (_rewriteDatabaseRequested || !bootstrapController.phaseAReady) {
+      return;
+    }
+    _rewriteDatabaseRequested = true;
+    unawaited(() async {
+      try {
+        await ref.read(appDatabaseProvider.future);
+      } catch (error, stackTrace) {
+        // Legacy managers remain authoritative during gradual migration, so a
+        // rewrite-database failure is logged without blocking app startup.
+        Log.error(
+          'AppDatabase',
+          'Failed to initialize rewrite database: $error',
+          stackTrace,
+        );
+      }
+    }());
   }
 
   @override
@@ -428,97 +453,6 @@ class _MyAppState extends State<MyApp> with WidgetsBindingObserver {
               primary = light.primary;
               secondary = light.secondary;
               tertiary = light.tertiary;
-            }
-            if (!bootstrapController.phaseAReady) {
-              return MaterialApp.router(
-                title: "venera",
-                routerConfig: _router,
-                debugShowCheckedModeBanner: false,
-                theme: getTheme(primary, secondary, tertiary, Brightness.light),
-                darkTheme: getTheme(
-                  primary,
-                  secondary,
-                  tertiary,
-                  Brightness.dark,
-                ),
-                themeMode: switch (appdata.settings['theme_mode']) {
-                  'light' => ThemeMode.light,
-                  'dark' => ThemeMode.dark,
-                  _ => ThemeMode.system,
-                },
-                color: Colors.transparent,
-                localizationsDelegates: [
-                  GlobalMaterialLocalizations.delegate,
-                  GlobalCupertinoLocalizations.delegate,
-                ],
-                locale: () {
-                  var lang = appdata.settings['language'];
-                  if (lang == 'system') {
-                    return null;
-                  }
-                  return switch (lang) {
-                    'zh-CN' => const Locale('zh', 'CN'),
-                    'zh-TW' => const Locale('zh', 'TW'),
-                    'en-US' => const Locale('en'),
-                    _ => null,
-                  };
-                }(),
-                supportedLocales: const [
-                  Locale('zh', 'CN'),
-                  Locale('zh', 'TW'),
-                  Locale('en'),
-                ],
-                builder: (context, widget) {
-                  ErrorWidget.builder = (details) {
-                    Log.error(
-                      "Unhandled Exception",
-                      "${details.exception}\n${details.stack}",
-                    );
-                    return Material(
-                      child: Center(child: Text(details.exception.toString())),
-                    );
-                  };
-                  if (widget != null) {
-                    var isPaddingCheckError =
-                        MediaQuery.of(context).viewPadding.top <= 0 ||
-                        MediaQuery.of(context).viewPadding.top > 200;
-
-                    if (isPaddingCheckError && Platform.isAndroid) {
-                      widget = MediaQuery(
-                        data: MediaQuery.of(context).copyWith(
-                          viewPadding: const EdgeInsets.only(
-                            top: 15,
-                            bottom: 15,
-                          ),
-                          padding: const EdgeInsets.only(top: 15, bottom: 15),
-                        ),
-                        child: widget,
-                      );
-                    }
-
-                    widget = OverlayWidget(widget);
-                    if (App.isDesktop) {
-                      widget = Shortcuts(
-                        shortcuts: {
-                          LogicalKeySet(LogicalKeyboardKey.escape):
-                              VoidCallbackIntent(App.pop),
-                        },
-                        child: MouseBackDetector(
-                          onTapDown: App.pop,
-                          child: WindowFrame(widget),
-                        ),
-                      );
-                    }
-                    return _SystemUiProvider(
-                      Material(
-                        color: App.isLinux ? Colors.transparent : null,
-                        child: widget,
-                      ),
-                    );
-                  }
-                  throw ('widget is null');
-                },
-              );
             }
             return MaterialApp.router(
               title: "venera",

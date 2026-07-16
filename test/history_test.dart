@@ -104,6 +104,26 @@ void main() {
     },
   );
 
+  test('history time index covers recent-history ordering', () {
+    final db = sqlite3.open('${tempDir.path}/history.db');
+    addTearDown(db.close);
+
+    final indexes = db
+        .select("PRAGMA index_list('history');")
+        .map((row) => row['name'])
+        .whereType<String>()
+        .toSet();
+    expect(indexes, contains('history_time_index'));
+
+    final plan = db.select(
+      'EXPLAIN QUERY PLAN SELECT * FROM history ORDER BY time DESC LIMIT 20;',
+    );
+    expect(
+      plan.map((row) => row['detail'].toString()).join(' '),
+      contains('history_time_index'),
+    );
+  });
+
   test('silent history update persists without notifying listeners', () {
     final manager = HistoryManager();
     var notifications = 0;

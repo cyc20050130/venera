@@ -175,6 +175,24 @@ List<String> remoteDataFilesToRemoveBeforeUpload(
   return toRemove;
 }
 
+@visibleForTesting
+Future<void> uploadRemoteBackupSafely({
+  required Future<void> Function() upload,
+  required Iterable<String> filesToRemove,
+  required Future<void> Function(String fileName) remove,
+  void Function(String fileName, Object error, StackTrace stackTrace)?
+  onRemoveError,
+}) async {
+  await upload();
+  for (final fileName in filesToRemove) {
+    try {
+      await remove(fileName);
+    } catch (error, stackTrace) {
+      onRemoveError?.call(fileName, error, stackTrace);
+    }
+  }
+}
+
 class DataSync with ChangeNotifier {
   DataSync._() {
     LocalFavoritesManager().addListener(onDataChanged);
@@ -308,10 +326,20 @@ class DataSync with ChangeNotifier {
           fileNames,
           "$time-",
         );
-        for (final fileName in filesToRemove) {
-          await client.remove(fileName);
-        }
-        await client.write(filename, await data.readAsBytes());
+        await uploadRemoteBackupSafely(
+          upload: () async {
+            await client.write(filename, await data!.readAsBytes());
+          },
+          filesToRemove: filesToRemove,
+          remove: client.remove,
+          onRemoveError: (fileName, error, stackTrace) {
+            Log.warning(
+              'Upload Data',
+              'New backup was uploaded, but old remote backup '
+                  '$fileName could not be removed: $error\n$stackTrace',
+            );
+          },
+        );
         Log.info("Upload Data", "Data uploaded successfully");
         return const Res(true);
       } catch (e, s) {

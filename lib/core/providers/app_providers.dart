@@ -38,7 +38,12 @@ final class AppDatabaseNotifier extends AsyncNotifier<AppDatabase> {
   @override
   Future<AppDatabase> build() async {
     final database = AppDatabase(path: ref.watch(appDatabasePathProvider));
-    await database.initialize();
+    try {
+      await database.initialize();
+    } catch (error, stackTrace) {
+      await database.close();
+      Error.throwWithStackTrace(error, stackTrace);
+    }
     ref.onDispose(() => unawaited(database.close()));
     return database;
   }

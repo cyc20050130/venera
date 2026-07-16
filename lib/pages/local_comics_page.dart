@@ -7,8 +7,11 @@ import 'package:venera/components/components.dart';
 import 'package:venera/foundation/app.dart';
 import 'package:venera/foundation/appdata.dart';
 import 'package:venera/foundation/comic_type.dart';
+import 'package:venera/foundation/comic_source/comic_source.dart';
 import 'package:venera/foundation/local.dart';
 import 'package:venera/foundation/local_archive.dart';
+import 'package:venera/foundation/local_archive_batch.dart';
+import 'package:venera/foundation/local_archive_catalog.dart';
 import 'package:venera/foundation/log.dart';
 import 'package:venera/pages/comic_details_page/comic_page.dart';
 import 'package:venera/pages/downloading_page.dart';
@@ -37,12 +40,7 @@ LocalSortType normalizeLocalComicsSortType(Object? value) {
 }
 
 @visibleForTesting
-enum LocalArchiveUiAction {
-  compress,
-  recompress,
-  restore,
-  none,
-}
+enum LocalArchiveUiAction { compress, recompress, restore, none }
 
 @visibleForTesting
 LocalArchiveUiAction localArchiveUiActionForState(LocalStorageState? state) {
@@ -133,11 +131,20 @@ class _LocalComicsPageState extends State<LocalComicsPage> {
 
   final Map<String, LocalArchiveSnapshot> _archiveSnapshots = {};
 
+  final LocalArchiveCatalog _archiveCatalog = LocalArchiveCatalog();
+
+  final Set<String> _visibleArchiveKeys = <String>{};
+
+  final Map<String, LocalComic> _pendingVisibleArchiveRefresh =
+      <String, LocalComic>{};
+
   final Set<String> _activeArchiveKeys = {};
 
   int _archiveRefreshGeneration = 0;
 
   Timer? _archiveRefreshDebounce;
+
+  Timer? _visibleArchiveRefreshDebounce;
 
   bool _archiveOperationRunning = false;
 
@@ -164,6 +171,12 @@ class _LocalComicsPageState extends State<LocalComicsPage> {
     setState(() {
       comics = _queryComics();
     });
+    final currentKeys = comics.map(_archiveKey).toSet();
+    _visibleArchiveKeys.retainAll(currentKeys);
+    _pendingVisibleArchiveRefresh.removeWhere(
+      (key, _) => !currentKeys.contains(key),
+    );
+    _archiveCatalog.retainComics(comics);
     if (!_archiveOperationRunning) {
       _scheduleArchiveRefresh();
     }
@@ -176,19 +189,39 @@ class _LocalComicsPageState extends State<LocalComicsPage> {
     });
   }
 
+  void _onArchiveItemBuilt(Comic value) {
+    if (value is! LocalComic) return;
+    final key = _archiveKey(value);
+    final firstVisibleBuild = _visibleArchiveKeys.add(key);
+    if (!firstVisibleBuild && _archiveSnapshots.containsKey(key)) return;
+    _pendingVisibleArchiveRefresh[key] = value;
+    _visibleArchiveRefreshDebounce?.cancel();
+    _visibleArchiveRefreshDebounce = Timer(
+      const Duration(milliseconds: 16),
+      () {
+        if (!mounted || _pendingVisibleArchiveRefresh.isEmpty) return;
+        final targets = _pendingVisibleArchiveRefresh.values.toList(
+          growable: false,
+        );
+        _pendingVisibleArchiveRefresh.clear();
+        unawaited(_refreshArchiveStates(targetComics: targets));
+      },
+    );
+  }
+
   @override
   void initState() {
     super.initState();
     sortType = normalizeLocalComicsSortType(appdata.implicitData["local_sort"]);
     comics = LocalManager().getComics(sortType);
     LocalManager().addListener(update);
-    unawaited(_refreshArchiveStates());
   }
 
   @override
   void dispose() {
     _archiveRefreshGeneration++;
     _archiveRefreshDebounce?.cancel();
+    _visibleArchiveRefreshDebounce?.cancel();
     LocalManager().removeListener(update);
     super.dispose();
   }
@@ -197,25 +230,16 @@ class _LocalComicsPageState extends State<LocalComicsPage> {
     Iterable<LocalComic>? targetComics,
   }) async {
     final generation = ++_archiveRefreshGeneration;
-    final targets = (targetComics ?? comics).where(_canArchive).toList();
+    final targets =
+        (targetComics ??
+                comics.where(
+                  (comic) => _visibleArchiveKeys.contains(_archiveKey(comic)),
+                ))
+            .where(_canArchive)
+            .toList();
     final refreshed = <String, LocalArchiveSnapshot>{};
     for (final comic in targets) {
-      // Avoid recursively listing every page of every unarchived comic just
-      // to render a badge. Full scanning still happens when compression is
-      // requested; archived entries need inspection to distinguish expanded
-      // and dirty states.
-      if (!comic.hasArchiveMetadataOnDisk) {
-        refreshed[_archiveKey(comic)] = LocalArchiveSnapshot(
-          state: await Directory(comic.baseDir).exists()
-              ? LocalStorageState.loose
-              : LocalStorageState.missing,
-          archiveExists: false,
-          archiveBytes: 0,
-          looseBytes: 0,
-        );
-        continue;
-      }
-      final snapshot = await LocalArchiveService().inspect(comic);
+      final snapshot = await _archiveCatalog.inspectFast(comic);
       if (!mounted || generation != _archiveRefreshGeneration) return;
       refreshed[_archiveKey(comic)] = snapshot;
     }
@@ -280,16 +304,24 @@ class _LocalComicsPageState extends State<LocalComicsPage> {
   String? _archiveBadgeFor(LocalComic comic) {
     if (!_canArchive(comic)) return null;
     final key = _archiveKey(comic);
+    final snapshot = _archiveSnapshots[key];
     return localArchiveBadgeKey(
-      _archiveSnapshots[key]?.state,
+      snapshot?.state ??
+          (comic.hasArchiveMetadataOnDisk
+              ? LocalStorageState.archived
+              : LocalStorageState.loose),
       operationRunning: _activeArchiveKeys.contains(key),
     )?.tl;
   }
 
   List<MenuEntry> _archiveMenuEntries(LocalComic comic) {
     if (!_canArchive(comic) || _archiveOperationRunning) return const [];
+    final snapshot = _archiveSnapshots[_archiveKey(comic)];
     final action = localArchiveUiActionForState(
-      _archiveSnapshots[_archiveKey(comic)]?.state,
+      snapshot?.state ??
+          (comic.hasArchiveMetadataOnDisk
+              ? LocalStorageState.archived
+              : LocalStorageState.loose),
     );
     return switch (action) {
       LocalArchiveUiAction.compress => [
@@ -358,7 +390,7 @@ class _LocalComicsPageState extends State<LocalComicsPage> {
       withProgress: true,
       message: '@action @current/@total'.tlParams({
         'action': operationText,
-        'current': 1,
+        'current': 0,
         'total': targets.length,
       }),
       onCancel: token.cancel,
@@ -367,32 +399,82 @@ class _LocalComicsPageState extends State<LocalComicsPage> {
     final failures = <Object>[];
     var completed = 0;
     var cancelled = false;
-    var lastDisplayedProgress = -1.0;
+    var lastDisplayedProgress = 0.0;
     var lastMessageElapsed = Duration.zero;
+    LocalArchiveProgress? lastReportedProgress;
+    LocalArchiveBatchProgress? lastBatchProgress;
     final operationStopwatch = Stopwatch()..start();
-    try {
-      for (var index = 0; index < targets.length; index++) {
-        final comic = targets[index];
-        token.throwIfCancelled();
-        loadingController.setMessage(
-          '@action @current/@total'.tlParams({
-            'action': operationText,
-            'current': index + 1,
-            'total': targets.length,
-          }),
-        );
-        loadingController.setProgress(index / targets.length);
-        lastDisplayedProgress = index / targets.length;
+    String buildProgressMessage({required bool includeElapsed}) {
+      final base = '@action @current/@total'.tlParams({
+        'action': operationText,
+        'current': lastBatchProgress?.completedItems ?? 0,
+        'total': targets.length,
+      });
+      final progress = lastReportedProgress;
+      if (progress == null) {
+        return base;
+      }
+      final stage = localArchiveProgressStageKey(progress.operation).tl;
+      final remaining = estimateLocalArchiveRemaining(
+        elapsed: operationStopwatch.elapsed,
+        progress: lastDisplayedProgress,
+      );
+      final eta = remaining == null
+          ? ''
+          : ' · ${'Estimated remaining @time'.tlParams({'time': formatLocalArchiveRemaining(remaining)})}';
+      final elapsed = includeElapsed
+          ? ' · ${'Elapsed @time'.tlParams({'time': formatLocalArchiveRemaining(operationStopwatch.elapsed)})}'
+          : '';
+      return '$base · $stage$eta$elapsed';
+    }
 
-        void reportProgress(LocalArchiveProgress progress) {
-          final comicProgress = localArchiveOperationProgress(progress);
-          final overall = ((index + comicProgress) / targets.length).clamp(
-            0.0,
-            1.0,
-          );
-          final monotonic = overall > lastDisplayedProgress
-              ? overall
-              : lastDisplayedProgress.clamp(0.0, 1.0);
+    final heartbeat = Timer.periodic(const Duration(seconds: 1), (_) {
+      if (token.isCancelled || lastReportedProgress == null) {
+        return;
+      }
+      final elapsed = operationStopwatch.elapsed;
+      if (elapsed - lastMessageElapsed < const Duration(seconds: 2)) {
+        return;
+      }
+      lastMessageElapsed = elapsed;
+      loadingController.setMessage(buildProgressMessage(includeElapsed: true));
+    });
+    try {
+      final comicsByKey = <String, LocalComic>{
+        for (final comic in targets) _archiveKey(comic): comic,
+      };
+      final result = await runLocalArchiveBatch<LocalArchiveResult>(
+        tasks: targets
+            .map(
+              (comic) => LocalArchiveBatchTask<LocalArchiveResult>(
+                key: _archiveKey(comic),
+                run: (cancellationToken, reportProgress) => switch (operation) {
+                  _LocalArchiveUiOperation.compress =>
+                    LocalArchiveService().compress(
+                      comic,
+                      cancellationToken: cancellationToken,
+                      onProgress: reportProgress,
+                    ),
+                  _LocalArchiveUiOperation.restore =>
+                    LocalArchiveService().restore(
+                      comic,
+                      cancellationToken: cancellationToken,
+                      onProgress: reportProgress,
+                    ),
+                },
+              ),
+            )
+            .toList(growable: false),
+        maxConcurrency: App.isDesktop ? 2 : 1,
+        cancellationToken: token,
+        onProgress: (progress) {
+          if (!mounted) {
+            token.cancel();
+            return;
+          }
+          lastBatchProgress = progress;
+          lastReportedProgress = progress.latestProgress;
+          final monotonic = progress.fraction.clamp(lastDisplayedProgress, 1.0);
           final elapsed = operationStopwatch.elapsed;
           if (monotonic - lastDisplayedProgress >= 0.005 ||
               elapsed - lastMessageElapsed >=
@@ -401,56 +483,37 @@ class _LocalComicsPageState extends State<LocalComicsPage> {
             lastDisplayedProgress = monotonic;
             lastMessageElapsed = elapsed;
             loadingController.setProgress(monotonic);
-            final remaining = estimateLocalArchiveRemaining(
-              elapsed: elapsed,
-              progress: monotonic,
+            loadingController.setMessage(
+              buildProgressMessage(includeElapsed: false),
             );
-            final base = '@action @current/@total'.tlParams({
-              'action': operationText,
-              'current': index + 1,
-              'total': targets.length,
-            });
-            final stage = localArchiveProgressStageKey(progress.operation).tl;
-            final eta = remaining == null
-                ? ''
-                : ' · ${'Estimated remaining @time'.tlParams({'time': formatLocalArchiveRemaining(remaining)})}';
-            loadingController.setMessage('$base · $stage$eta');
           }
+        },
+      );
+      refreshed.addAll(result.values);
+      completed = result.values.length;
+      cancelled = result.cancelled;
+      for (final entry in result.values.entries) {
+        final comic = comicsByKey[entry.key];
+        if (comic != null) {
+          unawaited(_archiveCatalog.remember(comic, entry.value));
         }
-
-        try {
-          final result = switch (operation) {
-            _LocalArchiveUiOperation.compress =>
-              await LocalArchiveService().compress(
-                comic,
-                cancellationToken: token,
-                onProgress: reportProgress,
-              ),
-            _LocalArchiveUiOperation.restore =>
-              await LocalArchiveService().restore(
-                comic,
-                cancellationToken: token,
-                onProgress: reportProgress,
-              ),
-          };
-          refreshed[_archiveKey(comic)] = result;
-          completed++;
-          loadingController.setProgress((index + 1) / targets.length);
-        } on LocalArchiveCancelledException {
-          cancelled = true;
-          break;
-        } catch (error, stackTrace) {
-          failures.add(error);
-          Log.error(
-            'Local Archive',
-            '${comic.title} (${comic.sourceKey}@${comic.id}): $error',
-            stackTrace,
-          );
-        }
+      }
+      for (final entry in result.failures.entries) {
+        final comic = comicsByKey[entry.key];
+        final failure = entry.value;
+        failures.add(failure.error);
+        Log.error(
+          'Local Archive',
+          '${comic?.title ?? entry.key} '
+              '(${comic?.sourceKey ?? 'unknown'}@${comic?.id ?? 'unknown'}): '
+              '${failure.error}',
+          failure.stackTrace,
+        );
       }
     } on LocalArchiveCancelledException {
       cancelled = true;
     } finally {
+      heartbeat.cancel();
       loadingController.close();
       if (mounted) {
         setState(() {
@@ -689,6 +752,7 @@ class _LocalComicsPageState extends State<LocalComicsPage> {
           SliverGridComics(
             comics: comics,
             selections: selectedComics,
+            onItemBuild: _onArchiveItemBuilt,
             badgeBuilder: (comic) => _archiveBadgeFor(comic as LocalComic),
             onLongPressed: (c, heroTag) {
               setState(() {
@@ -842,10 +906,15 @@ class _LocalComicsPageState extends State<LocalComicsPage> {
     var outFile = buildComicsExportArchivePath(App.cachePath, operationId);
     bool canceled = false;
     bool archiveReadyForSave = false;
-    if (Directory(cacheDir).existsSync()) {
-      Directory(cacheDir).deleteSync(recursive: true);
+    final exportDirectory = Directory(cacheDir);
+    if (await exportDirectory.exists()) {
+      await exportDirectory.delete(recursive: true);
     }
-    Directory(cacheDir).createSync();
+    await exportDirectory.create(recursive: true);
+    if (!mounted) {
+      await exportDirectory.deleteIgnoreError(recursive: true);
+      return;
+    }
     var loadingController = showLoadingDialog(
       context,
       allowCancel: true,
@@ -891,7 +960,7 @@ class _LocalComicsPageState extends State<LocalComicsPage> {
       // For single comic, just save the file
       if (comics.length == 1) {
         await saveFile(file: File(fileName), filename: File(fileName).name);
-        Directory(cacheDir).deleteSync(recursive: true);
+        await exportDirectory.delete(recursive: true);
         return;
       }
       // For multiple comics, compress the folder
@@ -904,10 +973,7 @@ class _LocalComicsPageState extends State<LocalComicsPage> {
       archiveReadyForSave = true;
     } catch (e, s) {
       Log.error("Export Comics", e, s);
-      if (shouldApplyLocalComicsExportResult(
-        mounted: mounted,
-        canceled: canceled,
-      )) {
+      if (mounted && !canceled) {
         context.showMessage(message: e.toString());
       }
       return;
@@ -925,10 +991,7 @@ class _LocalComicsPageState extends State<LocalComicsPage> {
       await saveFile(file: File(outFile), filename: "comics_export.zip");
     } catch (e, s) {
       Log.error("Export Comics", "Failed to save exported comics: $e", s);
-      if (shouldApplyLocalComicsExportResult(
-        mounted: mounted,
-        canceled: canceled,
-      )) {
+      if (mounted && !canceled) {
         context.showMessage(message: e.toString());
       }
     } finally {
@@ -1039,25 +1102,30 @@ void showDeleteChaptersPopWindow(BuildContext context, LocalComic comic) {
                   children: [
                     FilledButton(
                       onPressed: () {
-                        Future.delayed(
-                          const Duration(milliseconds: 200),
-                          () async {
-                            try {
-                              await LocalManager().deleteComicChapters(
-                                comic,
-                                chapters,
-                              );
-                            } catch (error, stackTrace) {
-                              Log.error(
-                                'LocalArchive',
-                                'Failed to delete comic chapters: $error',
-                                stackTrace,
-                              );
-                              App.rootContext.showMessage(
-                                message: error.toString(),
-                              );
-                            }
-                          },
+                        final messageContext = App.rootContext;
+                        unawaited(
+                          Future.delayed(
+                            const Duration(milliseconds: 200),
+                            () async {
+                              try {
+                                await LocalManager().deleteComicChapters(
+                                  comic,
+                                  chapters,
+                                );
+                              } catch (error, stackTrace) {
+                                Log.error(
+                                  'LocalArchive',
+                                  'Failed to delete comic chapters: $error',
+                                  stackTrace,
+                                );
+                                if (messageContext.mounted) {
+                                  messageContext.showMessage(
+                                    message: error.toString(),
+                                  );
+                                }
+                              }
+                            },
+                          ),
                         );
                         App.rootContext.pop();
                       },

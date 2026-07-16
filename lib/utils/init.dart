@@ -6,6 +6,10 @@ import 'package:flutter/foundation.dart';
 abstract mixin class Init {
   bool _isInit = false;
 
+  Future<void>? _initFuture;
+
+  int _generation = 0;
+
   final _initCompleter = <Completer<void>>[];
 
   /// Ensure the class is initialized.
@@ -28,7 +32,9 @@ abstract mixin class Init {
 
   @protected
   void markUninitialized() {
+    _generation++;
     _isInit = false;
+    _initFuture = null;
     for (var completer in _initCompleter) {
       if (!completer.isCompleted) {
         completer.complete();
@@ -45,7 +51,36 @@ abstract mixin class Init {
     if (_isInit) {
       return;
     }
-    await doInit();
-    await _markInit();
+    final pending = _initFuture;
+    if (pending != null) {
+      return pending;
+    }
+    final generation = _generation;
+    late final Future<void> operation;
+    operation = () async {
+      try {
+        await doInit();
+        if (generation == _generation) {
+          await _markInit();
+        }
+      } catch (error, stackTrace) {
+        if (generation == _generation) {
+          final waiters = _initCompleter.toList(growable: false);
+          _initCompleter.clear();
+          for (final waiter in waiters) {
+            if (!waiter.isCompleted) {
+              waiter.completeError(error, stackTrace);
+            }
+          }
+        }
+        Error.throwWithStackTrace(error, stackTrace);
+      } finally {
+        if (identical(_initFuture, operation)) {
+          _initFuture = null;
+        }
+      }
+    }();
+    _initFuture = operation;
+    return operation;
   }
 }

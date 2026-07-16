@@ -1,6 +1,8 @@
 import 'dart:convert';
+import 'dart:isolate';
 import 'package:flutter/foundation.dart' show visibleForTesting;
 import 'package:flutter_7zip/flutter_7zip.dart';
+import 'package:path/path.dart' as p;
 import 'package:venera/foundation/app.dart';
 import 'package:venera/foundation/comic_source/comic_source.dart';
 import 'package:venera/foundation/comic_type.dart';
@@ -26,6 +28,73 @@ bool isSupportedCbzImageExtension(String extension) {
       ? extension.substring(1)
       : extension;
   return _supportedCbzImageExtensions.contains(normalized.toLowerCase());
+}
+
+typedef ComicArchiveEntry = ({String name, int size, bool isDirectory});
+
+@visibleForTesting
+String normalizeComicArchiveEntryName(String value) {
+  if (value.isEmpty || value.contains('\u0000')) {
+    throw const FormatException('Empty archive entry path');
+  }
+  final normalized = value.replaceAll('\\', '/');
+  if (normalized.startsWith('/') ||
+      RegExp(r'^[A-Za-z]:').hasMatch(normalized)) {
+    throw FormatException('Absolute archive entry path: $value');
+  }
+  final segments = normalized.split('/');
+  if (segments.any((segment) => segment == '..')) {
+    throw FormatException('Archive entry escapes destination: $value');
+  }
+  final clean = segments
+      .where((segment) => segment.isNotEmpty && segment != '.')
+      .toList(growable: false);
+  if (clean.isEmpty) {
+    throw FormatException('Empty archive entry path: $value');
+  }
+  return clean.join('/');
+}
+
+@visibleForTesting
+void validateComicArchiveEntries(
+  Iterable<ComicArchiveEntry> entries, {
+  required int archiveBytes,
+  int maxEntries = 100000,
+  int maxEntryBytes = 2 * 1024 * 1024 * 1024,
+  int maxExpandedBytes = 20 * 1024 * 1024 * 1024,
+  int maxCompressionRatio = 200,
+  int compressionRatioSlackBytes = 64 * 1024 * 1024,
+}) {
+  if (archiveBytes < 0) {
+    throw const FormatException('Invalid archive size');
+  }
+  final seen = <String>{};
+  var count = 0;
+  var expandedBytes = 0;
+  for (final entry in entries) {
+    count++;
+    if (count > maxEntries) {
+      throw const FormatException('Archive contains too many entries');
+    }
+    final name = normalizeComicArchiveEntryName(entry.name);
+    if (!seen.add(name.toLowerCase())) {
+      throw FormatException('Duplicate archive entry: $name');
+    }
+    if (entry.size < 0 || entry.size > maxEntryBytes) {
+      throw FormatException('Archive entry is too large: $name');
+    }
+    if (!entry.isDirectory) {
+      expandedBytes += entry.size;
+      if (expandedBytes > maxExpandedBytes) {
+        throw const FormatException('Archive expands beyond the size limit');
+      }
+    }
+  }
+  final ratioLimit =
+      archiveBytes * maxCompressionRatio + compressionRatioSlackBytes;
+  if (expandedBytes > ratioLimit) {
+    throw const FormatException('Archive compression ratio is unsafe');
+  }
 }
 
 class ComicMetaData {
@@ -208,11 +277,55 @@ abstract class CBZ {
   static Future<void> extractArchive(File file, Directory out) async {
     var fileType = await checkType(file);
     if (fileType.mime == 'application/zip') {
+      await Isolate.run(() {
+        final archive = ZipFile.openRead(file.path);
+        try {
+          validateComicArchiveEntries(
+            archive.getAllEntries().map(
+              (entry) => (
+                name: entry.name,
+                size: entry.size,
+                isDirectory: entry.isDir,
+              ),
+            ),
+            archiveBytes: file.lengthSync(),
+          );
+        } finally {
+          archive.close();
+        }
+      });
       await ZipFile.openAndExtractAsync(file.path, out.path, 4);
     } else if (fileType.mime == "application/x-7z-compressed") {
+      await Isolate.run(() {
+        final archive = SZArchive.open(file.path);
+        try {
+          final entries = <ComicArchiveEntry>[];
+          for (var index = 0; index < archive.numFiles; index++) {
+            final entry = archive.getFile(index);
+            entries.add((
+              name: entry.name,
+              size: entry.size,
+              isDirectory: entry.isDirectory,
+            ));
+          }
+          validateComicArchiveEntries(entries, archiveBytes: file.lengthSync());
+        } finally {
+          archive.dispose();
+        }
+      });
       await SZArchive.extractIsolates(file.path, out.path, 4);
     } else {
       throw Exception('Unsupported archive type');
+    }
+    final outputRoot = p.normalize(p.absolute(out.path));
+    await for (final entity in out.list(recursive: true, followLinks: false)) {
+      final entityPath = p.normalize(p.absolute(entity.path));
+      if (!p.isWithin(outputRoot, entityPath)) {
+        throw const FormatException('Archive entry escapes destination');
+      }
+      if (entity is Link) {
+        throw FormatException('Archive contains a link: ${entity.path}');
+      }
     }
   }
 

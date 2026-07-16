@@ -13,6 +13,7 @@ import 'package:venera/foundation/favorites.dart';
 import 'package:venera/foundation/log.dart';
 import 'package:venera/network/download.dart';
 import 'package:venera/pages/reader/reader.dart';
+import 'package:venera/utils/atomic_file.dart';
 import 'package:venera/utils/io.dart';
 import 'package:venera/utils/translations.dart';
 
@@ -202,16 +203,47 @@ class LocalComic with HistoryMixin implements Comic {
       final stopwatch = Stopwatch()..start();
       var lastProgress = -1.0;
       var lastMessageElapsed = Duration.zero;
+      LocalArchiveProgress? lastReportedProgress;
       final loadingController = showAppProgressDialog(
         App.rootContext,
         message: 'Opening compressed comic'.tl,
         onCancel: token.cancel,
       );
+      String buildProgressMessage({required bool includeElapsed}) {
+        final progress = lastReportedProgress;
+        final stage = progress == null
+            ? 'Opening compressed comic'.tl
+            : localArchiveProgressStageKey(progress.operation).tl;
+        final remaining = estimateLocalArchiveRemaining(
+          elapsed: stopwatch.elapsed,
+          progress: lastProgress,
+        );
+        final eta = remaining == null
+            ? ''
+            : ' · ${'Estimated remaining @time'.tlParams({'time': formatLocalArchiveRemaining(remaining)})}';
+        final elapsed = includeElapsed
+            ? ' · ${'Elapsed @time'.tlParams({'time': formatLocalArchiveRemaining(stopwatch.elapsed)})}'
+            : '';
+        return '$stage$eta$elapsed';
+      }
+
+      final heartbeat = Timer.periodic(const Duration(seconds: 1), (_) {
+        if (token.isCancelled ||
+            stopwatch.elapsed - lastMessageElapsed <
+                const Duration(seconds: 2)) {
+          return;
+        }
+        lastMessageElapsed = stopwatch.elapsed;
+        loadingController.setMessage(
+          buildProgressMessage(includeElapsed: true),
+        );
+      });
       try {
         await LocalArchiveService().restore(
           this,
           cancellationToken: token,
           onProgress: (progress) {
+            lastReportedProgress = progress;
             final value = localArchiveOverallProgress(
               progress,
             ).clamp(lastProgress < 0 ? 0.0 : lastProgress, 1.0);
@@ -225,15 +257,9 @@ class LocalComic with HistoryMixin implements Comic {
             lastProgress = value;
             lastMessageElapsed = elapsed;
             loadingController.setProgress(value);
-            final remaining = estimateLocalArchiveRemaining(
-              elapsed: elapsed,
-              progress: value,
+            loadingController.setMessage(
+              buildProgressMessage(includeElapsed: false),
             );
-            final stage = localArchiveProgressStageKey(progress.operation).tl;
-            final eta = remaining == null
-                ? ''
-                : ' · ${'Estimated remaining @time'.tlParams({'time': formatLocalArchiveRemaining(remaining)})}';
-            loadingController.setMessage('$stage$eta');
           },
         );
       } on LocalArchiveCancelledException {
@@ -249,6 +275,7 @@ class LocalComic with HistoryMixin implements Comic {
         );
         return;
       } finally {
+        heartbeat.cancel();
         loadingController.close();
       }
     }
@@ -456,6 +483,16 @@ class LocalManager with ChangeNotifier {
         PRIMARY KEY (id, comic_type)
       );
     ''');
+    _db.execute('''
+      CREATE INDEX IF NOT EXISTS comics_created_at_index
+        ON comics(created_at DESC);
+      CREATE INDEX IF NOT EXISTS comics_title_index
+        ON comics(title);
+      CREATE INDEX IF NOT EXISTS comics_directory_index
+        ON comics(directory);
+      CREATE INDEX IF NOT EXISTS comics_numeric_id_index
+        ON comics(comic_type, CAST(id AS INTEGER) DESC);
+    ''');
     if (File(FilePath.join(App.dataPath, 'local_path')).existsSync()) {
       path = File(FilePath.join(App.dataPath, 'local_path')).readAsStringSync();
       if (!directory.existsSync()) {
@@ -480,19 +517,18 @@ class LocalManager with ChangeNotifier {
 
   Future<bool> _restoreDownloadingTasksOnInit() async {
     final file = File(FilePath.join(App.dataPath, 'downloading_tasks.json'));
-    if (!file.existsSync()) {
-      return false;
-    }
+    final store = AtomicFileStore(file);
     try {
-      final decoded = jsonDecode(file.readAsStringSync());
-      if (decoded is! List) {
-        file.deleteIgnoreError();
-        Log.error(
-          "LocalManager",
-          "Failed to restore downloading tasks: invalid snapshot format",
-        );
-        return false;
-      }
+      final decoded = await store.readParsed((value) {
+        final result = jsonDecode(value);
+        if (result is! List) {
+          throw const FormatException(
+            'Downloading task snapshot is not a list',
+          );
+        }
+        return result;
+      });
+      if (decoded == null) return false;
       final tasks = decoded
           .whereType<Map>()
           .cast<Map<String, dynamic>>()
@@ -507,11 +543,11 @@ class LocalManager with ChangeNotifier {
       if (shouldEnsureSources) {
         await ComicSourceManager().ensureInit();
       }
-      restoreDownloadingTasks();
+      _restoreDownloadingTasksFromList(decoded);
       return true;
-    } catch (e) {
-      file.deleteIgnoreError();
-      Log.error("LocalManager", "Failed to restore downloading tasks: $e");
+    } catch (e, s) {
+      await store.delete();
+      Log.error("LocalManager", "Failed to restore downloading tasks: $e", s);
       return false;
     }
   }
@@ -560,7 +596,7 @@ class LocalManager with ChangeNotifier {
     return add(comic, id);
   }
 
-  void remove(String id, ComicType comicType) async {
+  void remove(String id, ComicType comicType) {
     _db.execute('DELETE FROM comics WHERE id = ? AND comic_type = ?;', [
       id,
       comicType.value,
@@ -822,9 +858,10 @@ class LocalManager with ChangeNotifier {
     saveCurrentDownloadingTasksInBackground(reason: 'complete task');
     downloadingTasks.firstOrNull?.resume();
     if (appdata.settings.boolValue('autoCompressDownloads', fallback: true)) {
-      // Compression uses the archive service's serialized queue. Deliberately
-      // do not await it here: the next download can start immediately, and an
-      // archive failure must never turn a successful download into a failure.
+      // Compression uses the archive service's per-comic queue and bounded
+      // cross-comic concurrency. Deliberately do not await it here: the next
+      // download can start immediately, and an archive failure must never turn
+      // a successful download into a failure.
       unawaited(_autoCompressCompletedComic(completedComic));
     }
   }
@@ -1003,62 +1040,48 @@ class LocalManager with ChangeNotifier {
             return;
           }
           await debugBeforeDownloadingTasksSnapshotWrite?.call();
-          await File(
-            FilePath.join(App.dataPath, 'downloading_tasks.json'),
-          ).writeAsString(data);
+          await AtomicFileStore(
+            File(FilePath.join(App.dataPath, 'downloading_tasks.json')),
+          ).writeString(data);
           _lastWrittenDownloadingTasksSnapshot = data;
         });
     return _downloadingTasksSaveChain;
   }
 
-  void restoreDownloadingTasks() {
-    var file = File(FilePath.join(App.dataPath, 'downloading_tasks.json'));
-    if (file.existsSync()) {
-      try {
-        final decoded = jsonDecode(file.readAsStringSync());
-        if (decoded is! List) {
-          throw const FormatException(
-            'Downloading task snapshot is not a list',
-          );
+  void _restoreDownloadingTasksFromList(List<dynamic> decoded) {
+    var changed = false;
+    for (var e in decoded) {
+      Map<String, dynamic>? map;
+      if (e is Map) {
+        try {
+          map = Map<String, dynamic>.from(e);
+        } catch (_) {
+          changed = true;
         }
-        var changed = false;
-        for (var e in decoded) {
-          Map<String, dynamic>? map;
-          if (e is Map) {
-            try {
-              map = Map<String, dynamic>.from(e);
-            } catch (_) {
-              changed = true;
-            }
-          }
-          if (map == null) {
-            changed = true;
-            continue;
-          }
-          DownloadTask? task;
-          try {
-            task = DownloadTask.fromJson(map);
-          } catch (e, s) {
-            changed = true;
-            Log.warning(
-              "LocalManager",
-              "Skip invalid downloading task snapshot: $e\n$s",
-            );
-            continue;
-          }
-          if (task != null) {
-            downloadingTasks.add(task);
-          } else {
-            changed = true;
-          }
-        }
-        if (changed) {
-          saveCurrentDownloadingTasksInBackground(reason: 'restore cleanup');
-        }
-      } catch (e) {
-        file.deleteIgnoreError();
-        Log.error("LocalManager", "Failed to restore downloading tasks: $e");
       }
+      if (map == null) {
+        changed = true;
+        continue;
+      }
+      DownloadTask? task;
+      try {
+        task = DownloadTask.fromJson(map);
+      } catch (e, s) {
+        changed = true;
+        Log.warning(
+          "LocalManager",
+          "Skip invalid downloading task snapshot: $e\n$s",
+        );
+        continue;
+      }
+      if (task != null) {
+        downloadingTasks.add(task);
+      } else {
+        changed = true;
+      }
+    }
+    if (changed) {
+      saveCurrentDownloadingTasksInBackground(reason: 'restore cleanup');
     }
   }
 
@@ -1131,28 +1154,25 @@ class LocalManager with ChangeNotifier {
 
   void repairAllDownloadedState() {
     var changed = false;
-    for (var comic in getComics(LocalSortType.timeDesc)) {
-      if (comic.chapters == null) {
-        continue;
+    _db.execute('BEGIN TRANSACTION;');
+    try {
+      for (var comic in getComics(LocalSortType.timeDesc)) {
+        if (comic.chapters == null) {
+          continue;
+        }
+        var validDownloaded = comic.downloadedChapters
+            .where((chapterId) => _chapterDirectoryHasImages(comic, chapterId))
+            .toList();
+        if (validDownloaded.length == comic.downloadedChapters.length) {
+          continue;
+        }
+        changed = true;
+        _writeDownloadedStateRepair(comic, validDownloaded);
       }
-      var validDownloaded = comic.downloadedChapters
-          .where((chapterId) => _chapterDirectoryHasImages(comic, chapterId))
-          .toList();
-      if (validDownloaded.length == comic.downloadedChapters.length) {
-        continue;
-      }
-      changed = true;
-      if (validDownloaded.isEmpty) {
-        _db.execute('DELETE FROM comics WHERE id = ? AND comic_type = ?;', [
-          comic.id,
-          comic.comicType.value,
-        ]);
-      } else {
-        _db.execute(
-          'UPDATE comics SET downloadedChapters = ? WHERE id = ? AND comic_type = ?;',
-          [jsonEncode(validDownloaded), comic.id, comic.comicType.value],
-        );
-      }
+      _db.execute('COMMIT;');
+    } catch (_) {
+      _db.execute('ROLLBACK;');
+      rethrow;
     }
     if (changed) {
       notifyListeners();
@@ -1166,6 +1186,8 @@ class LocalManager with ChangeNotifier {
     assert(batchSize > 0);
     var changed = false;
     var processed = 0;
+    final pendingRepairs =
+        <({LocalComic comic, List<String> downloadedChapters})>[];
     for (var comic in getComics(LocalSortType.timeDesc)) {
       if (comic.chapters == null) {
         continue;
@@ -1175,20 +1197,12 @@ class LocalManager with ChangeNotifier {
           .toList();
       if (validDownloaded.length != comic.downloadedChapters.length) {
         changed = true;
-        if (validDownloaded.isEmpty) {
-          _db.execute('DELETE FROM comics WHERE id = ? AND comic_type = ?;', [
-            comic.id,
-            comic.comicType.value,
-          ]);
-        } else {
-          _db.execute(
-            'UPDATE comics SET downloadedChapters = ? WHERE id = ? AND comic_type = ?;',
-            [jsonEncode(validDownloaded), comic.id, comic.comicType.value],
-          );
-        }
+        pendingRepairs.add((comic: comic, downloadedChapters: validDownloaded));
       }
       processed++;
       if (processed % batchSize == 0) {
+        _writeDownloadedStateRepairBatch(pendingRepairs);
+        pendingRepairs.clear();
         Log.info(
           'LocalManager',
           '[perf] local repair batch complete processed=$processed',
@@ -1196,9 +1210,43 @@ class LocalManager with ChangeNotifier {
         await Future<void>.delayed(Duration.zero);
       }
     }
+    _writeDownloadedStateRepairBatch(pendingRepairs);
     if (changed && notify) {
       notifyListeners();
     }
+  }
+
+  void _writeDownloadedStateRepairBatch(
+    List<({LocalComic comic, List<String> downloadedChapters})> repairs,
+  ) {
+    if (repairs.isEmpty) return;
+    _db.execute('BEGIN TRANSACTION;');
+    try {
+      for (final repair in repairs) {
+        _writeDownloadedStateRepair(repair.comic, repair.downloadedChapters);
+      }
+      _db.execute('COMMIT;');
+    } catch (_) {
+      _db.execute('ROLLBACK;');
+      rethrow;
+    }
+  }
+
+  void _writeDownloadedStateRepair(
+    LocalComic comic,
+    List<String> validDownloaded,
+  ) {
+    if (validDownloaded.isEmpty) {
+      _db.execute('DELETE FROM comics WHERE id = ? AND comic_type = ?;', [
+        comic.id,
+        comic.comicType.value,
+      ]);
+      return;
+    }
+    _db.execute(
+      'UPDATE comics SET downloadedChapters = ? WHERE id = ? AND comic_type = ?;',
+      [jsonEncode(validDownloaded), comic.id, comic.comicType.value],
+    );
   }
 
   void deleteComic(LocalComic c, [bool removeFileOnDisk = true]) {
@@ -1364,7 +1412,7 @@ class LocalManager with ChangeNotifier {
     // Archived chapters are still downloaded. Treating the intentionally
     // absent loose directory as corruption would otherwise delete the comic
     // row and its reading progress during startup repair.
-    if (comic.hasArchiveOnDisk) {
+    if (comic.hasArchiveMetadataOnDisk) {
       return true;
     }
     var dir = Directory(

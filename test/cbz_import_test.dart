@@ -14,6 +14,49 @@ void main() {
     expect(isSupportedCbzImageExtension('txt'), isFalse);
   });
 
+  test('comic archive entry validation rejects unsafe paths', () {
+    for (final name in [
+      '../outside.jpg',
+      '/absolute.jpg',
+      r'C:\absolute.jpg',
+      'chapter/../../outside.jpg',
+      '',
+    ]) {
+      expect(
+        () => normalizeComicArchiveEntryName(name),
+        throwsFormatException,
+        reason: name,
+      );
+    }
+    expect(normalizeComicArchiveEntryName(r'chapter\1.jpg'), 'chapter/1.jpg');
+  });
+
+  test('comic archive limits reject duplicates and expansion bombs', () {
+    expect(
+      () => validateComicArchiveEntries(const [
+        (name: 'A.jpg', size: 10, isDirectory: false),
+        (name: 'a.jpg', size: 10, isDirectory: false),
+      ], archiveBytes: 100),
+      throwsFormatException,
+    );
+    expect(
+      () => validateComicArchiveEntries(
+        const [(name: 'page.bmp', size: 1000, isDirectory: false)],
+        archiveBytes: 1,
+        maxExpandedBytes: 2000,
+        maxCompressionRatio: 1,
+        compressionRatioSlackBytes: 0,
+      ),
+      throwsFormatException,
+    );
+    expect(
+      () => validateComicArchiveEntries(const [
+        (name: 'page.jpg', size: 100, isDirectory: false),
+      ], archiveBytes: 100),
+      returnsNormally,
+    );
+  });
+
   test('ComicMetaData.fromJson tolerates malformed optional metadata', () {
     final metadata = ComicMetaData.fromJson({
       'title': 1,

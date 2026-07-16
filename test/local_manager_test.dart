@@ -302,6 +302,40 @@ void main() {
     expect(manager.findValidId(ComicType.local), '8');
   });
 
+  test('local database indexes cover list and numeric id queries', () async {
+    await manager.init();
+    managerInitialized = true;
+
+    final db = sqlite3.open('${tempDir.path}/local.db');
+    addTearDown(db.close);
+    final indexes = db
+        .select("PRAGMA index_list('comics');")
+        .map((row) => row['name'])
+        .whereType<String>()
+        .toSet();
+
+    expect(indexes, contains('comics_created_at_index'));
+    expect(indexes, contains('comics_title_index'));
+    expect(indexes, contains('comics_directory_index'));
+    expect(indexes, contains('comics_numeric_id_index'));
+
+    final recentPlan = db.select(
+      'EXPLAIN QUERY PLAN SELECT * FROM comics ORDER BY created_at DESC LIMIT 20;',
+    );
+    expect(
+      recentPlan.map((row) => row['detail'].toString()).join(' '),
+      contains('comics_created_at_index'),
+    );
+    final idPlan = db.select(
+      'EXPLAIN QUERY PLAN SELECT id FROM comics WHERE comic_type = 0 '
+      'ORDER BY CAST(id AS INTEGER) DESC LIMIT 1;',
+    );
+    expect(
+      idPlan.map((row) => row['detail'].toString()).join(' '),
+      contains('comics_numeric_id_index'),
+    );
+  });
+
   test('find tolerates malformed legacy local comic row fields', () async {
     await manager.init();
     managerInitialized = true;

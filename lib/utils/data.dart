@@ -5,6 +5,7 @@ import 'dart:isolate';
 import 'package:flutter/foundation.dart' show visibleForTesting;
 import 'package:sqlite3/sqlite3.dart';
 import 'package:venera/core/database/app_database.dart';
+import 'package:venera/core/database/backup_import_coordinator.dart';
 import 'package:venera/core/database/backup_v2_importer.dart';
 import 'package:venera/foundation/app.dart';
 import 'package:venera/foundation/appdata.dart';
@@ -154,16 +155,17 @@ List<({String archiveName, String path})> buildAppDataExportEntries(
   String dataPath, {
   required bool sync,
 }) {
+  final syncAppdataPath = FilePath.join(dataPath, 'syncdata.json');
+  final appdataPath = sync && File(syncAppdataPath).existsSync()
+      ? syncAppdataPath
+      : FilePath.join(dataPath, 'appdata.json');
   final entries = [
     (archiveName: "history.db", path: FilePath.join(dataPath, "history.db")),
     (
       archiveName: "local_favorite.db",
       path: FilePath.join(dataPath, "local_favorite.db"),
     ),
-    (
-      archiveName: "appdata.json",
-      path: FilePath.join(dataPath, sync ? "syncdata.json" : "appdata.json"),
-    ),
+    (archiveName: "appdata.json", path: appdataPath),
     (archiveName: "cookie.db", path: FilePath.join(dataPath, "cookie.db")),
   ];
   return entries.where((entry) => File(entry.path).existsSync()).toList();
@@ -226,9 +228,10 @@ Future<void> _extractDataArchiveSafely(
         if (relative == null) {
           throw FormatException('Unsafe archive entry: ${entry.name}');
         }
-        final duplicateKey = Platform.isWindows
-            ? relative.toLowerCase()
-            : relative;
+        // Backup files are portable across case-sensitive and
+        // case-insensitive filesystems. Reject case-only duplicates before
+        // extraction so they cannot overwrite one another after migration.
+        final duplicateKey = relative.toLowerCase();
         if (!seen.add(duplicateKey)) {
           throw FormatException('Duplicate archive entry: ${entry.name}');
         }
@@ -263,8 +266,13 @@ Directory buildAppDataImportDirectory(
 Future<File> exportAppData([bool sync = true]) async {
   var cacheFile = buildAppDataExportFile(App.cachePath);
   var tempFile = File('${cacheFile.path}.tmp');
+  final snapshotDirectory = buildAppDataImportDirectory(
+    App.cachePath,
+    'appdata-export-snapshot',
+  );
   var dataPath = App.dataPath;
   var exported = false;
+  await appdata.saveData(false);
   if (HistoryManager().isInitialized) {
     HistoryManager().flush();
   }
@@ -272,12 +280,21 @@ Future<File> exportAppData([bool sync = true]) async {
     await tempFile.deleteIgnoreError();
     await cacheFile.deleteIgnoreError();
     await Isolate.run(() async {
+      await _createAppDataExportSnapshot(
+        sourceDataPath: dataPath,
+        snapshotPath: snapshotDirectory.path,
+      );
       await zip_flutter.loadLibrary();
       var zipFile = zip_flutter.ZipFile.open(tempFile.path);
-      for (final entry in buildAppDataExportEntries(dataPath, sync: sync)) {
+      for (final entry in buildAppDataExportEntries(
+        snapshotDirectory.path,
+        sync: sync,
+      )) {
         zipFile.addFile(entry.archiveName, entry.path);
       }
-      final comicSourceDir = Directory(FilePath.join(dataPath, "comic_source"));
+      final comicSourceDir = Directory(
+        FilePath.join(snapshotDirectory.path, "comic_source"),
+      );
       if (comicSourceDir.existsSync()) {
         for (var file in comicSourceDir.listSync()) {
           if (file is File) {
@@ -286,7 +303,7 @@ Future<File> exportAppData([bool sync = true]) async {
         }
       }
       final logical = buildBackupV2Payload(
-        dataPath: dataPath,
+        dataPath: snapshotDirectory.path,
         appVersion: App.version,
         useSyncAppdata: sync,
       );
@@ -304,6 +321,7 @@ Future<File> exportAppData([bool sync = true]) async {
     return cacheFile;
   } finally {
     await tempFile.deleteIgnoreError();
+    await snapshotDirectory.deleteIgnoreError(recursive: true);
     if (!exported) {
       await cacheFile.deleteIgnoreError();
     }
@@ -319,6 +337,12 @@ Future<void> importAppData(File file, [bool checkVersion = false]) {
 Future<void> _importAppDataLocked(File file, bool checkVersion) async {
   var cacheDir = buildAppDataImportDirectory(App.cachePath, 'appdata-import');
   var cacheDirPath = cacheDir.path;
+  final rewriteStagingFile = File(
+    FilePath.join(
+      App.cachePath,
+      'venera-import-${_nextAppDataOperationId()}.db',
+    ),
+  );
   cacheDir.createSync();
   try {
     await _extractDataArchiveSafely(file.path, cacheDirPath);
@@ -346,48 +370,96 @@ Future<void> _importAppDataLocked(File file, bool checkVersion) async {
         return;
       }
     }
-    if (await historyFile.exists()) {
-      HistoryManager().close();
-      File(FilePath.join(App.dataPath, "history.db")).deleteIfExistsSync();
-      historyFile.renameSync(FilePath.join(App.dataPath, "history.db"));
-      await HistoryManager().init();
-      HistoryManager().updateCache();
+    if (backupV2Manifest != null) {
+      await _buildImportedRewriteDatabase(cacheDir, rewriteStagingFile);
     }
-    if (await localFavoriteFile.exists()) {
-      LocalFavoritesManager().close();
-      File(
-        FilePath.join(App.dataPath, "local_favorite.db"),
-      ).deleteIfExistsSync();
-      localFavoriteFile.renameSync(
-        FilePath.join(App.dataPath, "local_favorite.db"),
+
+    final comicSourceDirectory = Directory(
+      FilePath.join(cacheDirPath, 'comic_source'),
+    );
+    final importSources = <BackupImportSource>[
+      if (await historyFile.exists())
+        BackupImportSource(relativePath: 'history.db', source: historyFile),
+      if (await localFavoriteFile.exists())
+        BackupImportSource(
+          relativePath: 'local_favorite.db',
+          source: localFavoriteFile,
+        ),
+      if (await cookieFile.exists())
+        BackupImportSource(relativePath: 'cookie.db', source: cookieFile),
+      if (await comicSourceDirectory.exists())
+        BackupImportSource(
+          relativePath: 'comic_source',
+          source: comicSourceDirectory,
+        ),
+    ];
+
+    final importsHistory = importSources.any(
+      (source) => source.relativePath == 'history.db',
+    );
+    final importsFavorites = importSources.any(
+      (source) => source.relativePath == 'local_favorite.db',
+    );
+    final importsCookies = importSources.any(
+      (source) => source.relativePath == 'cookie.db',
+    );
+    final importsSources = importSources.any(
+      (source) => source.relativePath == 'comic_source',
+    );
+
+    if (importSources.isNotEmpty) {
+      final coordinator = BackupImportCoordinator(
+        Directory(App.dataPath),
+        operationId: _nextAppDataOperationId(),
       );
-      LocalFavoritesManager().init();
-    }
-    if (await cookieFile.exists()) {
-      SingleInstanceCookieJar.instance?.dispose();
-      File(FilePath.join(App.dataPath, "cookie.db")).deleteIfExistsSync();
-      cookieFile.renameSync(FilePath.join(App.dataPath, "cookie.db"));
-      SingleInstanceCookieJar.instance = SingleInstanceCookieJar(
-        FilePath.join(App.dataPath, "cookie.db"),
-      )..init();
-    }
-    var comicSourceDir = FilePath.join(cacheDirPath, "comic_source");
-    if (Directory(comicSourceDir).existsSync()) {
-      Directory(
-        FilePath.join(App.dataPath, "comic_source"),
-      ).deleteIfExistsSync(recursive: true);
-      Directory(FilePath.join(App.dataPath, "comic_source")).createSync();
-      for (var file in Directory(comicSourceDir).listSync()) {
-        if (file is File) {
-          var targetFile = FilePath.join(
-            App.dataPath,
-            "comic_source",
-            file.name,
+      final prepared = await coordinator.prepare(importSources);
+
+      if (importsHistory) HistoryManager().close();
+      if (importsFavorites) LocalFavoritesManager().close();
+      if (importsCookies) {
+        SingleInstanceCookieJar.instance?.dispose();
+        SingleInstanceCookieJar.instance = null;
+      }
+      try {
+        await coordinator.commit(
+          prepared,
+          verify: () => _verifyInstalledBackupDatabases(
+            importSources.map((source) => source.relativePath),
+          ),
+        );
+      } finally {
+        if (importsHistory) {
+          await HistoryManager().init();
+          HistoryManager().updateCache();
+        }
+        if (importsFavorites) {
+          await LocalFavoritesManager().init();
+        }
+        if (importsCookies) {
+          SingleInstanceCookieJar.instance = SingleInstanceCookieJar(
+            FilePath.join(App.dataPath, 'cookie.db'),
           );
-          await file.copy(targetFile);
+        }
+        if (importsSources) {
+          await ComicSourceManager().reload();
         }
       }
-      await ComicSourceManager().reload();
+    }
+    if (backupV2Manifest != null) {
+      // The rewrite database is already kept open by its Riverpod provider.
+      // Import through a second SQLite connection and one write transaction
+      // instead of replacing the live file (which is not portable on Windows).
+      // The staging database above validates migrations and the full projection
+      // before any authoritative legacy file is committed.
+      final rewriteDatabase = AppDatabase(
+        path: FilePath.join(App.dataPath, AppDatabase.fileName),
+      );
+      try {
+        await rewriteDatabase.initialize();
+        await BackupV2Importer(rewriteDatabase).importDirectory(cacheDir);
+      } finally {
+        await rewriteDatabase.close();
+      }
     }
     if (await appdataFile.exists()) {
       var content = await appdataFile.readAsString();
@@ -399,19 +471,146 @@ Future<void> _importAppDataLocked(File file, bool checkVersion) async {
         await _sanitizeImportedSourceSettings();
       }
     }
-    if (backupV2Manifest != null) {
-      final rewriteDatabase = AppDatabase(
-        path: FilePath.join(App.dataPath, AppDatabase.fileName),
-      );
+  } finally {
+    await rewriteStagingFile.deleteIgnoreError();
+    await File('${rewriteStagingFile.path}-wal').deleteIgnoreError();
+    await File('${rewriteStagingFile.path}-shm').deleteIgnoreError();
+    await cacheDir.deleteIgnoreError(recursive: true);
+  }
+}
+
+Future<void> _createAppDataExportSnapshot({
+  required String sourceDataPath,
+  required String snapshotPath,
+}) async {
+  final snapshotDirectory = Directory(snapshotPath);
+  await snapshotDirectory.deleteIfExists(recursive: true);
+  await snapshotDirectory.create(recursive: true);
+
+  const databaseNames = [
+    'history.db',
+    'local_favorite.db',
+    'cookie.db',
+    'local.db',
+  ];
+  for (final name in databaseNames) {
+    final source = File(FilePath.join(sourceDataPath, name));
+    if (!await source.exists()) continue;
+    final destination = File(FilePath.join(snapshotPath, name));
+    try {
+      final sourceDatabase = sqlite3.open(source.path, mode: OpenMode.readOnly);
+      final destinationDatabase = sqlite3.open(destination.path);
       try {
-        await rewriteDatabase.initialize();
-        await BackupV2Importer(rewriteDatabase).importDirectory(cacheDir);
+        await sourceDatabase.backup(destinationDatabase, nPage: -1).drain();
       } finally {
-        await rewriteDatabase.close();
+        destinationDatabase.close();
+        sourceDatabase.close();
+      }
+    } catch (_) {
+      // Preserve malformed legacy databases byte-for-byte. Logical V2 parsing
+      // remains defensive and the compatibility importer may still understand
+      // a database produced by an older application version.
+      await destination.deleteIgnoreError();
+      await source.copy(destination.path);
+    }
+  }
+
+  for (final name in ['appdata.json', 'syncdata.json', 'local_path']) {
+    final source = File(FilePath.join(sourceDataPath, name));
+    if (await source.exists()) {
+      await source.copy(FilePath.join(snapshotPath, name));
+    }
+  }
+
+  final sourceDocuments = Directory(
+    FilePath.join(sourceDataPath, 'comic_source'),
+  );
+  if (await sourceDocuments.exists()) {
+    final snapshotDocuments = Directory(
+      FilePath.join(snapshotPath, 'comic_source'),
+    );
+    await snapshotDocuments.create(recursive: true);
+    await for (final entity in sourceDocuments.list(followLinks: false)) {
+      if (entity is File) {
+        await entity.copy(FilePath.join(snapshotDocuments.path, entity.name));
       }
     }
-  } finally {
-    await cacheDir.deleteIgnoreError(recursive: true);
+  }
+}
+
+Future<void> _buildImportedRewriteDatabase(
+  Directory extractedDirectory,
+  File stagingFile,
+) async {
+  await stagingFile.deleteIgnoreError();
+  final currentFile = File(FilePath.join(App.dataPath, AppDatabase.fileName));
+  Future<void> snapshotCurrentDatabase() async {
+    if (!await currentFile.exists()) {
+      return;
+    }
+    // Copying only the main SQLite file can omit committed WAL pages while the
+    // rewrite database is open. SQLite backup produces a consistent snapshot
+    // without replacing or closing the live Windows connection.
+    final sourceDatabase = sqlite3.open(
+      currentFile.path,
+      mode: OpenMode.readOnly,
+    );
+    final stagingDatabase = sqlite3.open(stagingFile.path);
+    try {
+      await sourceDatabase.backup(stagingDatabase, nPage: -1).drain();
+    } finally {
+      stagingDatabase.close();
+      sourceDatabase.close();
+    }
+  }
+
+  Future<void> importIntoStaging() async {
+    final rewriteDatabase = AppDatabase(path: stagingFile.path);
+    try {
+      await rewriteDatabase.initialize();
+      await BackupV2Importer(
+        rewriteDatabase,
+      ).importDirectory(extractedDirectory);
+    } finally {
+      await rewriteDatabase.close();
+    }
+  }
+
+  try {
+    await snapshotCurrentDatabase();
+    await importIntoStaging();
+  } catch (error, stackTrace) {
+    if (!await currentFile.exists()) {
+      Error.throwWithStackTrace(error, stackTrace);
+    }
+    Log.warning(
+      'Import Data',
+      'Existing rewrite database could not be reused; rebuilding it: $error',
+    );
+    await stagingFile.deleteIgnoreError();
+    await File('${stagingFile.path}-wal').deleteIgnoreError();
+    await File('${stagingFile.path}-shm').deleteIgnoreError();
+    await importIntoStaging();
+  }
+}
+
+Future<void> _verifyInstalledBackupDatabases(
+  Iterable<String> relativePaths,
+) async {
+  const databaseNames = {'history.db', 'local_favorite.db', 'cookie.db'};
+  for (final relativePath in relativePaths.where(databaseNames.contains)) {
+    final path = FilePath.join(App.dataPath, relativePath);
+    final database = sqlite3.open(path, mode: OpenMode.readOnly);
+    try {
+      final result = database.select('PRAGMA quick_check;');
+      if (result.isEmpty || result.first.values.first != 'ok') {
+        throw FormatException(
+          'Imported database failed validation: $relativePath',
+        );
+      }
+    } finally {
+      database.close();
+    }
   }
 }
 

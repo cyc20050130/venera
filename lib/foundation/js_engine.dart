@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:math' as math;
@@ -166,13 +167,19 @@ class JsEngine with _JSEngineApi, JsUiApi, Init {
 
   bool _closed = true;
 
+  int _lifecycleGeneration = 0;
+
   Dio? _dio;
 
   static void reset() {
     final previous = _cache;
     _cache = null;
     previous?.dispose();
-    JsEngine().init();
+    unawaited(
+      JsEngine().init().catchError((Object error, StackTrace stackTrace) {
+        Log.error('JS Engine', 'JS Engine reset failed: $error', stackTrace);
+      }),
+    );
   }
 
   void resetDio() {
@@ -196,6 +203,8 @@ class JsEngine with _JSEngineApi, JsUiApi, Init {
     if (!_closed) {
       return;
     }
+    final lifecycleGeneration = _lifecycleGeneration;
+    FlutterQjs? engine;
     try {
       if (App.isInitialized) {
         _cookieJar ??= await SingleInstanceCookieJar.createInstance();
@@ -206,10 +215,9 @@ class JsEngine with _JSEngineApi, JsUiApi, Init {
           validateStatus: (status) => true,
         ),
       );
-      _closed = false;
-      _engine = FlutterQjs();
-      _engine!.dispatch();
-      var setGlobalFunc = _engine!.evaluate(
+      engine = FlutterQjs();
+      engine.dispatch();
+      var setGlobalFunc = engine.evaluate(
         "(key, value) => { this[key] = value; }",
       );
       (setGlobalFunc as JSInvokable)(["sendMessage", _messageReceiver]);
@@ -222,9 +230,27 @@ class JsEngine with _JSEngineApi, JsUiApi, Init {
         var buffer = await rootBundle.load("assets/init.js");
         jsInit = buffer.buffer.asUint8List();
       }
-      _engine!.evaluate(utf8.decode(jsInit), name: "<init>");
+      engine.evaluate(utf8.decode(jsInit), name: "<init>");
+      if (lifecycleGeneration != _lifecycleGeneration) {
+        throw StateError('JS Engine was disposed during initialization');
+      }
+      _engine = engine;
+      _closed = false;
     } catch (e, s) {
       Log.error('JS Engine', 'JS Engine Init Error:\n$e\n$s');
+      _engine = null;
+      _closed = true;
+      try {
+        engine?.close();
+        engine?.port.close();
+      } catch (cleanupError, cleanupStackTrace) {
+        Log.error(
+          'JS Engine',
+          'Failed to clean up incomplete JS engine: $cleanupError',
+          cleanupStackTrace,
+        );
+      }
+      Error.throwWithStackTrace(e, s);
     }
   }
 
@@ -439,15 +465,22 @@ class JsEngine with _JSEngineApi, JsUiApi, Init {
   }
 
   dynamic runCode(String js, [String? name]) {
-    return _engine!.evaluate(js, name: name);
+    final engine = _engine;
+    if (_closed || engine == null) {
+      throw StateError('JS Engine is not initialized');
+    }
+    return engine.evaluate(js, name: name);
   }
 
   void dispose() {
     _cache = null;
+    _lifecycleGeneration++;
     _closed = true;
     markUninitialized();
-    _engine?.close();
-    _engine?.port.close();
+    final engine = _engine;
+    _engine = null;
+    engine?.close();
+    engine?.port.close();
   }
 }
 

@@ -8,6 +8,7 @@ import 'package:flutter/foundation.dart' show visibleForTesting;
 import 'package:path/path.dart' as p;
 import 'package:uuid/uuid.dart';
 import 'package:venera/foundation/local.dart';
+import 'package:venera/foundation/perf_trace.dart';
 import 'package:venera/utils/io.dart';
 import 'package:zip_flutter/zip_flutter.dart';
 
@@ -337,20 +338,37 @@ String normalizeLocalArchiveEntryPath(String value) {
 
 /// Owns the versioned archive stored under `<comic>/.venera/archive.zip`.
 ///
-/// Operations are globally serialized so compression, opening, download
-/// writes, and destructive cleanup cannot interleave. The cover and `.venera`
+/// Operations for the same comic are serialized so compression, opening,
+/// download writes, and destructive cleanup cannot interleave. Heavy work is
+/// bounded across comics to avoid saturating storage. The cover and `.venera`
 /// metadata directory are never added to the compressed file.
 class LocalArchiveService {
-  LocalArchiveService._({String? libraryRootOverride})
-    : _libraryRootOverride = libraryRootOverride;
+  LocalArchiveService._({
+    String? libraryRootOverride,
+    int? maxConcurrentOperations,
+    void Function(File file)? debugOnSourceHash,
+  }) : _libraryRootOverride = libraryRootOverride,
+       _debugOnSourceHash = debugOnSourceHash,
+       _heavyOperations = _AsyncSemaphore(
+         maxConcurrentOperations ??
+             ((Platform.isAndroid || Platform.isIOS) ? 1 : 2),
+       );
 
   static final LocalArchiveService _instance = LocalArchiveService._();
 
   factory LocalArchiveService() => _instance;
 
   @visibleForTesting
-  factory LocalArchiveService.forTesting({required String libraryRoot}) {
-    return LocalArchiveService._(libraryRootOverride: libraryRoot);
+  factory LocalArchiveService.forTesting({
+    required String libraryRoot,
+    int maxConcurrentOperations = 2,
+    void Function(File file)? onSourceHash,
+  }) {
+    return LocalArchiveService._(
+      libraryRootOverride: libraryRoot,
+      maxConcurrentOperations: maxConcurrentOperations,
+      debugOnSourceHash: onSourceHash,
+    );
   }
 
   static const metadataDirectoryName = '.venera';
@@ -358,11 +376,13 @@ class LocalArchiveService {
   static const manifestFileName = 'manifest.json';
 
   final String? _libraryRootOverride;
-  Future<void> _operationQueue = Future<void>.value();
+  final void Function(File file)? _debugOnSourceHash;
+  final _AsyncSemaphore _heavyOperations;
+  final Map<String, Future<void>> _operationQueues = {};
   final Map<String, _ActiveWriterState> _activeWriters = {};
 
   Future<LocalArchiveSnapshot> inspect(LocalComic comic) {
-    return _runExclusive(() async {
+    return _runExclusive(comic, () async {
       try {
         final root = _comicRoot(comic);
         if (await root.exists()) {
@@ -379,7 +399,7 @@ class LocalArchiveService {
           errorMessage: error.toString(),
         );
       }
-    });
+    }, traceOperation: 'inspect');
   }
 
   Future<LocalArchiveResult> compress(
@@ -387,58 +407,31 @@ class LocalArchiveService {
     LocalArchiveCancellationToken? cancellationToken,
     LocalArchiveProgressCallback? onProgress,
   }) {
-    return _runExclusive(() async {
+    return _runExclusive(comic, () async {
       final token = cancellationToken ?? LocalArchiveCancellationToken();
       final root = _comicRoot(comic);
       _assertComicIdentity(root, comic);
       await _waitForActiveWriters(root, token);
-      if (!await root.exists()) {
-        throw const LocalArchiveException('Comic directory does not exist');
-      }
-      await _recoverInterruptedCommit(root, comic);
-      token.throwIfCancelled();
+      return _runHeavy(token, () async {
+        if (!await root.exists()) {
+          throw const LocalArchiveException('Comic directory does not exist');
+        }
+        await _recoverInterruptedCommit(root, comic);
+        token.throwIfCancelled();
 
-      final pair = await _readValidPair(root, comic, throwOnInvalid: true);
-      var files = await _scanLooseFiles(
-        root,
-        comic,
-        hashFiles: pair != null,
-        cancellationToken: token,
-        // For a new compressed file this is only a quick inventory pass; the
-        // following hash pass reports the real scan progress. Reporting both
-        // would jump to 15% and then appear frozen while hashing.
-        onProgress: pair == null ? null : onProgress,
-        operation: LocalArchiveOperation.inspect,
-      );
-
-      if (pair != null && files.isEmpty) {
-        await _clearStateMarkers(root);
-        return _resultFromSnapshot(
-          await _inspectRoot(root, comic),
-          rebuiltArchive: false,
+        final pair = await _readValidPair(root, comic, throwOnInvalid: true);
+        var files = await _scanLooseFiles(
+          root,
+          comic,
+          hashFiles: pair != null,
+          cancellationToken: token,
+          // A first compression no longer performs a second source-hash pass,
+          // so this quick inventory can report the complete inspect stage.
+          onProgress: onProgress,
+          operation: LocalArchiveOperation.inspect,
         );
-      }
 
-      if (pair != null) {
-        final relation = _compareFiles(files, pair.manifest, requireAll: true);
-        final dirty = await _dirtyMarker(root).exists();
-        final cleanupMatches = await _markerMatches(
-          _cleanupMarker(root),
-          pair.manifest.identity,
-        );
-        final safePartialCleanup =
-            cleanupMatches &&
-            _compareFiles(files, pair.manifest, requireAll: false);
-        if (!dirty && (relation || safePartialCleanup)) {
-          await _writeMarker(_cleanupMarker(root), pair.manifest.identity);
-          await _deleteVerifiedLooseFiles(
-            root,
-            comic,
-            files,
-            pair.manifest,
-            token,
-            onProgress,
-          );
+        if (pair != null && files.isEmpty) {
           await _clearStateMarkers(root);
           return _resultFromSnapshot(
             await _inspectRoot(root, comic),
@@ -446,131 +439,180 @@ class LocalArchiveService {
           );
         }
 
-        // A previous verified cleanup may have removed part of the old loose
-        // tree before another writer marked the comic dirty. A marker-free
-        // mismatch can also come from an external file copy/edit that bypassed
-        // [prepareForWrite]. In both cases restore missing archived files first
-        // (while preserving loose edits), so rebuilding cannot silently drop
-        // chapters that currently exist only in the retained ZIP.
-        if (cleanupMatches || !dirty) {
-          await _restorePair(
-            root,
-            comic,
-            pair,
-            token,
-            onProgress,
-            preserveExisting: true,
+        if (pair != null) {
+          final relation = _compareFiles(
+            files,
+            pair.manifest,
+            requireAll: true,
           );
-          await _cleanupMarker(root).deleteIgnoreError();
-          files = await _scanLooseFiles(
+          final dirty = await _dirtyMarker(root).exists();
+          final cleanupMatches = await _markerMatches(
+            _cleanupMarker(root),
+            pair.manifest.identity,
+          );
+          final safePartialCleanup =
+              cleanupMatches &&
+              _compareFiles(files, pair.manifest, requireAll: false);
+          if (!dirty && (relation || safePartialCleanup)) {
+            await _writeMarker(_cleanupMarker(root), pair.manifest.identity);
+            await _deleteVerifiedLooseFiles(
+              root,
+              comic,
+              files,
+              pair.manifest,
+              token,
+              onProgress,
+            );
+            await _clearStateMarkers(root);
+            return _resultFromSnapshot(
+              await _inspectRoot(root, comic),
+              rebuiltArchive: false,
+            );
+          }
+
+          // A previous verified cleanup may have removed part of the old loose
+          // tree before another writer marked the comic dirty. A marker-free
+          // mismatch can also come from an external file copy/edit that bypassed
+          // [prepareForWrite]. In both cases restore missing archived files first
+          // (while preserving loose edits), so rebuilding cannot silently drop
+          // chapters that currently exist only in the retained ZIP.
+          if (cleanupMatches || !dirty) {
+            await _restorePair(
+              root,
+              comic,
+              pair,
+              token,
+              onProgress,
+              preserveExisting: true,
+            );
+            await _cleanupMarker(root).deleteIgnoreError();
+            files = await _scanLooseFiles(
+              root,
+              comic,
+              hashFiles: true,
+              cancellationToken: token,
+              onProgress: onProgress,
+              operation: LocalArchiveOperation.inspect,
+            );
+          }
+        }
+
+        if (files.isEmpty) {
+          throw const LocalArchiveException('Comic has no archivable files');
+        }
+
+        final manifestCreatedAt = DateTime.now().millisecondsSinceEpoch;
+        ArchiveManifest buildManifest({Map<String, String>? archiveHashes}) {
+          return ArchiveManifest(
+            version: ArchiveManifest.currentVersion,
+            comicId: comic.id,
+            sourceKey: comic.sourceKey,
+            comicType: comic.comicType.value,
+            createdAtMillis: manifestCreatedAt,
+            entries: List.unmodifiable(
+              files.map(
+                (file) => file.toManifestEntry(
+                  sha256Override: archiveHashes?[file.archivePath],
+                  allowPlaceholder: pair == null && archiveHashes == null,
+                ),
+              ),
+            ),
+          );
+        }
+
+        // For an existing archive, source hashes are already needed to decide
+        // whether its expanded tree is safe to clean. A first compression can
+        // avoid that separate full source read: hash the generated ZIP, use
+        // those hashes for the manifest, then compare the source against them
+        // again at the destructive deletion boundary.
+        var manifest = buildManifest();
+
+        final metadata = await _metadataDirectory(root).create(recursive: true);
+        final operationId = const Uuid().v4();
+        final archiveTemp = File(
+          p.join(metadata.path, '$archiveFileName.tmp-$operationId'),
+        );
+        final manifestTemp = File(
+          p.join(metadata.path, '$manifestFileName.tmp-$operationId'),
+        );
+        try {
+          token.throwIfCancelled();
+          await _writeZip(archiveTemp, files, token, onProgress);
+          if (pair == null) {
+            final archiveHashes = await _hashArchiveEntries(
+              archiveTemp,
+              manifest,
+              token,
+              onProgress,
+            );
+            manifest = buildManifest(archiveHashes: archiveHashes);
+            // The hash worker validates safe unique names while reading every
+            // entry. This metadata pass additionally proves exact name, size,
+            // and count agreement with the source inventory.
+            await _validateArchive(archiveTemp, manifest);
+          } else {
+            // Never remove expanded originals until every generated ZIP entry
+            // has been read back and matched against the source checksum.
+            await _validateArchive(
+              archiveTemp,
+              manifest,
+              verifyContent: true,
+              cancellationToken: token,
+              onProgress: onProgress,
+            );
+          }
+
+          // Detect source changes that happened while the native writer was
+          // active. The old archive and loose files remain untouched on failure.
+          final afterWrite = await _scanLooseFiles(
             root,
             comic,
-            hashFiles: true,
+            // The ZIP was checked in full above. A metadata pass detects normal
+            // concurrent edits; the deletion boundary still re-hashes every
+            // source page and catches same-size, same-mtime replacements.
+            hashFiles: false,
             cancellationToken: token,
             onProgress: onProgress,
-            operation: LocalArchiveOperation.inspect,
+            operation: LocalArchiveOperation.reconcile,
           );
-        }
-      }
+          if (!_sameFileMetadata(files, afterWrite)) {
+            throw const LocalArchiveException(
+              'Comic files changed while compression was running',
+            );
+          }
+          files = afterWrite;
 
-      if (files.isEmpty) {
-        throw const LocalArchiveException('Comic has no archivable files');
-      }
-
-      // A new compressed file still needs its first content hash pass. When a
-      // previous compressed file exists, the initial scan (or the post-restore
-      // scan above) already produced verified hashes, so do not read every
-      // page again.
-      if (pair == null) {
-        files = await _scanLooseFiles(
-          root,
-          comic,
-          hashFiles: true,
-          cancellationToken: token,
-          onProgress: onProgress,
-          operation: LocalArchiveOperation.inspect,
-        );
-      }
-      final manifest = ArchiveManifest(
-        version: ArchiveManifest.currentVersion,
-        comicId: comic.id,
-        sourceKey: comic.sourceKey,
-        comicType: comic.comicType.value,
-        createdAtMillis: DateTime.now().millisecondsSinceEpoch,
-        entries: List.unmodifiable(files.map((file) => file.toManifestEntry())),
-      );
-
-      final metadata = await _metadataDirectory(root).create(recursive: true);
-      final operationId = const Uuid().v4();
-      final archiveTemp = File(
-        p.join(metadata.path, '$archiveFileName.tmp-$operationId'),
-      );
-      final manifestTemp = File(
-        p.join(metadata.path, '$manifestFileName.tmp-$operationId'),
-      );
-      try {
-        token.throwIfCancelled();
-        await _writeZip(archiveTemp, files, token, onProgress);
-        // Never remove the loose originals until every generated ZIP entry
-        // has been read back and matched against the source checksum.
-        await _validateArchive(
-          archiveTemp,
-          manifest,
-          verifyContent: true,
-          cancellationToken: token,
-          onProgress: onProgress,
-        );
-
-        // Detect source changes that happened while the native writer was
-        // active. The old archive and loose files remain untouched on failure.
-        final afterWrite = await _scanLooseFiles(
-          root,
-          comic,
-          // The ZIP was already checked against the pre-write SHA-256
-          // manifest. A metadata pass is enough to detect normal concurrent
-          // edits before cleanup and avoids reading every page a fourth time.
-          hashFiles: false,
-          cancellationToken: token,
-          onProgress: onProgress,
-          operation: LocalArchiveOperation.reconcile,
-        );
-        if (!_sameFileMetadata(files, afterWrite)) {
-          throw const LocalArchiveException(
-            'Comic files changed while compression was running',
+          await manifestTemp.writeAsString(
+            jsonEncode(manifest.toJson()),
+            encoding: utf8,
+            flush: true,
           );
+          await _commitPair(root, comic, archiveTemp, manifestTemp, manifest);
+          // The committed manifest now includes every app-managed write that
+          // caused the previous dirty marker. Remove it before cleanup; a writer
+          // racing with cleanup will create it again and stop deletion at the
+          // next file boundary.
+          await _dirtyMarker(root).deleteIgnoreError();
+          await _writeMarker(_cleanupMarker(root), manifest.identity);
+          await _deleteVerifiedLooseFiles(
+            root,
+            comic,
+            files,
+            manifest,
+            token,
+            onProgress,
+          );
+          await _clearStateMarkers(root);
+          return _resultFromSnapshot(
+            await _inspectRoot(root, comic),
+            rebuiltArchive: true,
+          );
+        } finally {
+          await archiveTemp.deleteIgnoreError();
+          await manifestTemp.deleteIgnoreError();
         }
-        files = afterWrite;
-
-        await manifestTemp.writeAsString(
-          jsonEncode(manifest.toJson()),
-          encoding: utf8,
-          flush: true,
-        );
-        await _commitPair(root, comic, archiveTemp, manifestTemp, manifest);
-        // The committed manifest now includes every app-managed write that
-        // caused the previous dirty marker. Remove it before cleanup; a writer
-        // racing with cleanup will create it again and stop deletion at the
-        // next file boundary.
-        await _dirtyMarker(root).deleteIgnoreError();
-        await _writeMarker(_cleanupMarker(root), manifest.identity);
-        await _deleteVerifiedLooseFiles(
-          root,
-          comic,
-          files,
-          manifest,
-          token,
-          onProgress,
-        );
-        await _clearStateMarkers(root);
-        return _resultFromSnapshot(
-          await _inspectRoot(root, comic),
-          rebuiltArchive: true,
-        );
-      } finally {
-        await archiveTemp.deleteIgnoreError();
-        await manifestTemp.deleteIgnoreError();
-      }
-    });
+      });
+    }, traceOperation: 'compress');
   }
 
   Future<LocalArchiveResult> restore(
@@ -578,52 +620,60 @@ class LocalArchiveService {
     LocalArchiveCancellationToken? cancellationToken,
     LocalArchiveProgressCallback? onProgress,
   }) {
-    return _runExclusive(() async {
+    return _runExclusive(comic, () async {
       final token = cancellationToken ?? LocalArchiveCancellationToken();
-      final root = _comicRoot(comic);
-      _assertComicIdentity(root, comic);
-      if (!await root.exists()) {
-        throw const LocalArchiveException('Comic directory does not exist');
-      }
-      await _recoverInterruptedCommit(root, comic);
-      final pair = await _readValidPair(root, comic, throwOnInvalid: true);
-      if (pair == null) {
+      return _runHeavy(token, () async {
+        final root = _comicRoot(comic);
+        _assertComicIdentity(root, comic);
+        if (!await root.exists()) {
+          throw const LocalArchiveException('Comic directory does not exist');
+        }
+        await _recoverInterruptedCommit(root, comic);
+        final pair = await _readValidPair(root, comic, throwOnInvalid: true);
+        if (pair == null) {
+          return _resultFromSnapshot(
+            await _inspectRoot(root, comic),
+            rebuiltArchive: false,
+          );
+        }
+        // A dirty tree is authoritative: missing files may represent an
+        // intentional chapter deletion, so restoring the old ZIP here would
+        // resurrect content. Writers must call restore before markDirty.
+        if (await _dirtyMarker(root).exists()) {
+          return _resultFromSnapshot(
+            await _inspectRoot(root, comic),
+            rebuiltArchive: false,
+          );
+        }
+        if (await _markerMatches(
+              _expandedMarker(root),
+              pair.manifest.identity,
+            ) &&
+            !await _cleanupMarker(root).exists()) {
+          final expandedSnapshot = await _inspectRoot(root, comic);
+          if (expandedSnapshot.state == LocalStorageState.expanded) {
+            return _resultFromSnapshot(expandedSnapshot, rebuiltArchive: false);
+          }
+          // An external cleanup can leave a matching marker while removing
+          // one or more expanded pages. Opening is an authoritative deep check:
+          // preserve any existing edits and restore only missing ZIP entries.
+        }
+        await _restorePair(
+          root,
+          comic,
+          pair,
+          token,
+          onProgress,
+          preserveExisting: true,
+        );
+        await _cleanupMarker(root).deleteIgnoreError();
+        await _writeMarker(_expandedMarker(root), pair.manifest.identity);
         return _resultFromSnapshot(
           await _inspectRoot(root, comic),
           rebuiltArchive: false,
         );
-      }
-      // A dirty tree is authoritative: missing files may represent an
-      // intentional chapter deletion, so restoring the old ZIP here would
-      // resurrect content. Writers must call restore before markDirty.
-      if (await _dirtyMarker(root).exists()) {
-        return _resultFromSnapshot(
-          await _inspectRoot(root, comic),
-          rebuiltArchive: false,
-        );
-      }
-      if (await _markerMatches(_expandedMarker(root), pair.manifest.identity) &&
-          !await _cleanupMarker(root).exists()) {
-        return _resultFromSnapshot(
-          await _inspectRoot(root, comic),
-          rebuiltArchive: false,
-        );
-      }
-      await _restorePair(
-        root,
-        comic,
-        pair,
-        token,
-        onProgress,
-        preserveExisting: true,
-      );
-      await _cleanupMarker(root).deleteIgnoreError();
-      await _writeMarker(_expandedMarker(root), pair.manifest.identity);
-      return _resultFromSnapshot(
-        await _inspectRoot(root, comic),
-        rebuiltArchive: false,
-      );
-    });
+      });
+    }, traceOperation: 'restore');
   }
 
   /// Restores the archived tree, when necessary, and marks it dirty as one
@@ -635,13 +685,13 @@ class LocalArchiveService {
     LocalArchiveCancellationToken? cancellationToken,
     LocalArchiveProgressCallback? onProgress,
   }) {
-    return _runExclusive(
-      () => _prepareForWriteUnlocked(
-        comic,
-        cancellationToken ?? LocalArchiveCancellationToken(),
-        onProgress,
-      ),
-    );
+    final token = cancellationToken ?? LocalArchiveCancellationToken();
+    return _runExclusive(comic, () {
+      return _runHeavy(
+        token,
+        () => _prepareForWriteUnlocked(comic, token, onProgress),
+      );
+    }, traceOperation: 'prepare_for_write');
   }
 
   /// Expands and marks the comic dirty, then holds an in-memory lease until
@@ -653,11 +703,11 @@ class LocalArchiveService {
     LocalArchiveCancellationToken? cancellationToken,
     LocalArchiveProgressCallback? onProgress,
   }) {
-    return _runExclusive(() async {
-      await _prepareForWriteUnlocked(
-        comic,
-        cancellationToken ?? LocalArchiveCancellationToken(),
-        onProgress,
+    return _runExclusive(comic, () async {
+      final token = cancellationToken ?? LocalArchiveCancellationToken();
+      await _runHeavy(
+        token,
+        () => _prepareForWriteUnlocked(comic, token, onProgress),
       );
       final root = _comicRoot(comic);
       final key = _writerKey(root);
@@ -676,11 +726,11 @@ class LocalArchiveService {
     LocalArchiveCancellationToken? cancellationToken,
     LocalArchiveProgressCallback? onProgress,
   }) {
-    return _runExclusive(() async {
-      await _prepareForWriteUnlocked(
-        comic,
-        cancellationToken ?? LocalArchiveCancellationToken(),
-        onProgress,
+    return _runExclusive(comic, () async {
+      final token = cancellationToken ?? LocalArchiveCancellationToken();
+      await _runHeavy(
+        token,
+        () => _prepareForWriteUnlocked(comic, token, onProgress),
       );
       return mutation();
     });
@@ -688,7 +738,7 @@ class LocalArchiveService {
 
   /// Marks an expanded archive as modified before an app-managed file write.
   Future<void> markDirty(LocalComic comic) {
-    return _runExclusive(() async {
+    return _runExclusive(comic, () async {
       final root = _comicRoot(comic);
       _assertComicIdentity(root, comic);
       if (!await root.exists()) {
@@ -703,44 +753,50 @@ class LocalArchiveService {
   /// Recovers an interrupted pair commit and finishes only a previously
   /// verified loose-file cleanup. It never deletes dirty content.
   Future<LocalArchiveSnapshot> reconcile(LocalComic comic) {
-    return _runExclusive(() async {
-      final root = _comicRoot(comic);
-      _assertComicIdentity(root, comic);
-      if (!await root.exists()) {
-        return const LocalArchiveSnapshot(
-          state: LocalStorageState.missing,
-          archiveExists: false,
-          archiveBytes: 0,
-          looseBytes: 0,
-        );
-      }
-      await _recoverInterruptedCommit(root, comic);
-      await _removeStaleOperationFiles(root);
-      final pair = await _readValidPair(root, comic, throwOnInvalid: false);
-      if (pair != null &&
-          !await _dirtyMarker(root).exists() &&
-          await _markerMatches(_cleanupMarker(root), pair.manifest.identity)) {
-        final files = await _scanLooseFiles(
-          root,
-          comic,
-          hashFiles: true,
-          cancellationToken: LocalArchiveCancellationToken(),
-          operation: LocalArchiveOperation.reconcile,
-        );
-        if (_compareFiles(files, pair.manifest, requireAll: false)) {
-          await _deleteVerifiedLooseFiles(
+    return _runExclusive(comic, () async {
+      final token = LocalArchiveCancellationToken();
+      return _runHeavy(token, () async {
+        final root = _comicRoot(comic);
+        _assertComicIdentity(root, comic);
+        if (!await root.exists()) {
+          return const LocalArchiveSnapshot(
+            state: LocalStorageState.missing,
+            archiveExists: false,
+            archiveBytes: 0,
+            looseBytes: 0,
+          );
+        }
+        await _recoverInterruptedCommit(root, comic);
+        await _removeStaleOperationFiles(root);
+        final pair = await _readValidPair(root, comic, throwOnInvalid: false);
+        if (pair != null &&
+            !await _dirtyMarker(root).exists() &&
+            await _markerMatches(
+              _cleanupMarker(root),
+              pair.manifest.identity,
+            )) {
+          final files = await _scanLooseFiles(
             root,
             comic,
-            files,
-            pair.manifest,
-            LocalArchiveCancellationToken(),
-            null,
+            hashFiles: true,
+            cancellationToken: LocalArchiveCancellationToken(),
+            operation: LocalArchiveOperation.reconcile,
           );
-          await _clearStateMarkers(root);
+          if (_compareFiles(files, pair.manifest, requireAll: false)) {
+            await _deleteVerifiedLooseFiles(
+              root,
+              comic,
+              files,
+              pair.manifest,
+              LocalArchiveCancellationToken(),
+              null,
+            );
+            await _clearStateMarkers(root);
+          }
         }
-      }
-      return _inspectRoot(root, comic);
-    });
+        return _inspectRoot(root, comic);
+      });
+    }, traceOperation: 'reconcile');
   }
 
   File archiveFileFor(LocalComic comic) => _archiveFile(_comicRoot(comic));
@@ -759,16 +815,69 @@ class LocalArchiveService {
     }
   }
 
-  Future<T> _runExclusive<T>(Future<T> Function() action) {
+  Future<T> _runExclusive<T>(
+    LocalComic comic,
+    Future<T> Function() action, {
+    String? traceOperation,
+  }) {
+    final trace = traceOperation == null
+        ? null
+        : PerfTrace.start(
+            traceOperation,
+            component: 'LocalArchive',
+            attributes: <String, Object?>{
+              'comicType': comic.comicType.value,
+              'source': comic.sourceKey,
+            },
+          );
+    final key = _operationKey(comic);
+    final previous = _operationQueues[key] ?? Future<void>.value();
+    final turn = Completer<void>();
+    final tail = turn.future;
+    _operationQueues[key] = tail;
     final completer = Completer<T>();
-    _operationQueue = _operationQueue.catchError((_) {}).then((_) async {
+    previous.catchError((_) {}).then((_) async {
       try {
-        completer.complete(await action());
+        final value = await action();
+        trace?.finish();
+        completer.complete(value);
       } catch (error, stackTrace) {
+        trace?.finish(
+          outcome: error is LocalArchiveCancelledException
+              ? PerfTraceOutcome.cancelled
+              : PerfTraceOutcome.failure,
+          attributes: <String, Object?>{'errorType': error.runtimeType},
+        );
         completer.completeError(error, stackTrace);
+      } finally {
+        turn.complete();
+        if (identical(_operationQueues[key], tail)) {
+          _operationQueues.remove(key);
+        }
       }
     });
     return completer.future;
+  }
+
+  Future<T> _runHeavy<T>(
+    LocalArchiveCancellationToken token,
+    Future<T> Function() action,
+  ) async {
+    final permit = await _heavyOperations.acquire(token);
+    try {
+      token.throwIfCancelled();
+      return await action();
+    } finally {
+      permit.close();
+    }
+  }
+
+  String _operationKey(LocalComic comic) {
+    final path = comic.baseDir;
+    if (path.isNotEmpty) {
+      return _normalizedComparablePath(path);
+    }
+    return '${comic.comicType.value}\u0000${comic.sourceKey}\u0000${comic.id}';
   }
 
   Future<void> _waitForActiveWriters(
@@ -1279,6 +1388,7 @@ class LocalArchiveService {
     LocalArchiveCancellationToken cancellationToken,
   ) async {
     cancellationToken.throwIfCancelled();
+    _debugOnSourceHash?.call(file);
     final digest = await sha256.bind(file.openRead()).first;
     cancellationToken.throwIfCancelled();
     return digest.toString();
@@ -1314,6 +1424,7 @@ class LocalArchiveService {
       names,
       sourceFiles,
       sizes,
+      names.map(_shouldStoreWithoutCompression).toList(growable: false),
     ], onExit: receivePort.sendPort);
     subscription = receivePort.listen((message) {
       if (completion.isCompleted) return;
@@ -1611,12 +1722,13 @@ class LocalArchiveService {
         continue;
       }
       final stat = await file.file.stat();
-      // Content was already checked against the manifest before and after ZIP
-      // creation. Re-check metadata at the deletion boundary so a normal
-      // concurrent edit is never removed, without reading every page yet
-      // another time.
-      if (stat.size != expected.size ||
-          stat.modified.millisecondsSinceEpoch != expected.modifiedAtMillis) {
+      // Re-hash at the destructive boundary. Size and millisecond mtime alone
+      // are insufficient: an external writer can replace a page with
+      // same-length bytes and preserve (or collide on) the timestamp. The
+      // additional read is deliberately paid only when source files are about
+      // to be deleted.
+      final currentHash = await _hashFile(file.file, cancellationToken);
+      if (stat.size != expected.size || currentHash != expected.sha256) {
         throw LocalArchiveException(
           'Comic file changed before cleanup: ${file.archivePath}',
         );
@@ -2066,6 +2178,7 @@ void _writeZipWorker(List<Object?> request) async {
   final names = (request[2] as List).cast<String>();
   final sourceFiles = (request[3] as List).cast<String>();
   final sizes = (request[4] as List).cast<int>();
+  final storeWithoutCompression = (request[5] as List).cast<bool>();
   final controlPort = ReceivePort();
   final control = StreamIterator<Object?>(controlPort);
   sendPort.send([_archiveWorkerReady, controlPort.sendPort]);
@@ -2075,7 +2188,9 @@ void _writeZipWorker(List<Object?> request) async {
   Object? pendingError;
   StackTrace? pendingStackTrace;
   try {
-    if (names.length != sourceFiles.length || names.length != sizes.length) {
+    if (names.length != sourceFiles.length ||
+        names.length != sizes.length ||
+        names.length != storeWithoutCompression.length) {
       throw const LocalArchiveException('Archive input list length mismatch');
     }
     if (!await control.moveNext() || control.current != true) {
@@ -2084,7 +2199,25 @@ void _writeZipWorker(List<Object?> request) async {
     encoder.create(outputPath, level: 1);
     opened = true;
     for (var index = 0; index < names.length; index++) {
-      encoder.addFileSync(File(sourceFiles[index]), names[index], 1);
+      final source = File(sourceFiles[index]);
+      if (storeWithoutCompression[index]) {
+        // Comic pages are normally already compressed. Deflating JPEG, PNG,
+        // WebP, and similar formats spends most of the archive time and can
+        // temporarily buffer a full page for negligible size reduction.
+        final input = archive_io.InputFileStream(source.path);
+        try {
+          final stat = source.statSync();
+          final entry = archive_io.ArchiveFile.stream(names[index], input)
+            ..compression = archive_io.CompressionType.none
+            ..lastModTime = stat.modified.millisecondsSinceEpoch ~/ 1000
+            ..mode = stat.mode;
+          encoder.addArchiveFile(entry);
+        } finally {
+          input.closeSync();
+        }
+      } else {
+        encoder.addFileSync(source, names[index], 1);
+      }
       completedBytes += sizes[index];
       sendPort.send([_archiveWorkerProgress, index + 1, completedBytes]);
       if (!await control.moveNext() || control.current != true) {
@@ -2118,6 +2251,27 @@ void _writeZipWorker(List<Object?> request) async {
   }
 }
 
+bool _shouldStoreWithoutCompression(String archivePath) {
+  return switch (p.posix.extension(archivePath).toLowerCase()) {
+    '.jpg' ||
+    '.jpeg' ||
+    '.png' ||
+    '.gif' ||
+    '.webp' ||
+    '.avif' ||
+    '.heic' ||
+    '.heif' ||
+    '.jxl' ||
+    '.mp4' ||
+    '.webm' ||
+    '.zip' ||
+    '.cbz' ||
+    '.epub' ||
+    '.pdf' => true,
+    _ => false,
+  };
+}
+
 class _ArchivePair {
   const _ArchivePair(this.archive, this.manifestFile, this.manifest);
 
@@ -2131,7 +2285,60 @@ class _ActiveWriterState {
   final Completer<void> idle = Completer<void>();
 }
 
+class _AsyncSemaphore {
+  _AsyncSemaphore(this._available) : assert(_available > 0);
+
+  int _available;
+  final List<Completer<void>> _waiters = [];
+
+  Future<_SemaphorePermit> acquire(
+    LocalArchiveCancellationToken cancellationToken,
+  ) async {
+    cancellationToken.throwIfCancelled();
+    if (_available > 0) {
+      _available--;
+      return _SemaphorePermit(_release);
+    }
+
+    final waiter = Completer<void>();
+    _waiters.add(waiter);
+    await Future.any([waiter.future, cancellationToken.whenCancelled]);
+    if (!waiter.isCompleted) {
+      _waiters.remove(waiter);
+      cancellationToken.throwIfCancelled();
+    }
+    return _SemaphorePermit(_release);
+  }
+
+  void _release() {
+    while (_waiters.isNotEmpty) {
+      final waiter = _waiters.removeAt(0);
+      if (!waiter.isCompleted) {
+        waiter.complete();
+        return;
+      }
+    }
+    _available++;
+  }
+}
+
+class _SemaphorePermit {
+  _SemaphorePermit(this._release);
+
+  final void Function() _release;
+  bool _closed = false;
+
+  void close() {
+    if (_closed) return;
+    _closed = true;
+    _release();
+  }
+}
+
 class _LooseFile {
+  static const String _placeholderHash =
+      '0000000000000000000000000000000000000000000000000000000000000000';
+
   const _LooseFile({
     required this.file,
     required this.archivePath,
@@ -2146,9 +2353,20 @@ class _LooseFile {
   final int modifiedAtMillis;
   final String? sha256;
 
-  ArchiveManifestEntry toManifestEntry() {
-    final hash = sha256;
+  ArchiveManifestEntry toManifestEntry({
+    String? sha256Override,
+    bool allowPlaceholder = false,
+  }) {
+    final hash = sha256Override ?? sha256;
     if (hash == null) {
+      if (allowPlaceholder) {
+        return ArchiveManifestEntry(
+          path: archivePath,
+          size: size,
+          modifiedAtMillis: modifiedAtMillis,
+          sha256: _placeholderHash,
+        );
+      }
       throw const LocalArchiveException('Missing content hash');
     }
     return ArchiveManifestEntry(

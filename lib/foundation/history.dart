@@ -350,6 +350,11 @@ class HistoryManager with ChangeNotifier {
 
     _upgradeHistorySchemaIfNeeded();
 
+    _db.execute('''
+      CREATE INDEX IF NOT EXISTS history_time_index
+        ON history(time DESC);
+    ''');
+
     notifyListeners();
     ImageFavoriteManager().init();
     isInitialized = true;

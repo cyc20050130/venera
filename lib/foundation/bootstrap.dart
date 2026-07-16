@@ -1,14 +1,17 @@
 import 'dart:async';
+import 'dart:io';
 
 import 'package:display_mode/display_mode.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:venera/foundation/app.dart';
+import 'package:venera/core/database/backup_import_coordinator.dart';
 import 'package:venera/foundation/appdata.dart';
 import 'package:venera/foundation/cache_manager.dart';
 import 'package:venera/foundation/comic_source/comic_source.dart';
 import 'package:venera/foundation/js_engine.dart';
 import 'package:venera/foundation/log.dart';
+import 'package:venera/foundation/perf_trace.dart';
 import 'package:venera/network/app_dio.dart';
 import 'package:venera/network/cookie_jar.dart';
 import 'package:venera/pages/comic_source_page.dart';
@@ -198,6 +201,9 @@ class BootstrapController extends ChangeNotifier {
     logPerf('bootstrap start');
 
     await App.init().wait();
+    await BackupImportCoordinator(
+      Directory(App.dataPath),
+    ).recoverInterruptedImport();
     await appdata.init().wait();
 
     phaseAReady = true;
@@ -337,10 +343,11 @@ class BootstrapController extends ChangeNotifier {
   }
 
   void logPerf(String label) {
-    if (!kDebugMode) {
-      return;
-    }
-    Log.info('Bootstrap', '[perf] $label ${_stopwatch.elapsedMilliseconds}ms');
+    PerfTrace.instant(
+      label,
+      component: 'Bootstrap',
+      elapsed: _stopwatch.elapsed,
+    );
   }
 }
 

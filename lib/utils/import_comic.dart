@@ -1,6 +1,7 @@
 import 'dart:math';
 
 import 'package:flutter/foundation.dart';
+import 'package:path/path.dart' as p;
 import 'package:venera/components/components.dart';
 import 'package:venera/foundation/app.dart';
 import 'package:venera/foundation/comic_source/comic_source.dart';
@@ -95,7 +96,11 @@ class ImportComic {
     } finally {
       controller.close();
     }
-    return registerComics(imported, false);
+    return registerComics(
+      imported,
+      false,
+      cleanupManagedDirectoriesOnFailure: true,
+    );
   }
 
   Future<bool> multipleCbz() async {
@@ -126,7 +131,11 @@ class ImportComic {
       } finally {
         controller.close();
       }
-      return registerComics(imported, false);
+      return registerComics(
+        imported,
+        false,
+        cleanupManagedDirectoriesOnFailure: true,
+      );
     }
     return false;
   }
@@ -536,20 +545,36 @@ class ImportComic {
 
   Future<bool> registerComics(
     Map<String?, List<LocalComic>> importedComics,
-    bool copy,
-  ) async {
+    bool copy, {
+    bool cleanupManagedDirectoriesOnFailure = false,
+  }) async {
+    final registered = <_RegisteredImportedComic>[];
+    final managedDirectories = <String>{};
     try {
       if (copy) {
         importedComics = await _copyComicsToLocalDir(importedComics);
+        cleanupManagedDirectoriesOnFailure = true;
+      }
+      if (cleanupManagedDirectoriesOnFailure) {
+        managedDirectories.addAll(
+          importedComics.values
+              .expand((comics) => comics)
+              .map((comic) => comic.baseDir),
+        );
       }
       int importedCount = 0;
       for (var folder in importedComics.keys) {
         for (var comic in importedComics[folder]!) {
           var id = LocalManager().findValidId(ComicType.local);
-          LocalManager().add(comic, id);
-          importedCount++;
+          await LocalManager().add(comic, id);
+          final registration = _RegisteredImportedComic(
+            id: id,
+            type: comic.comicType,
+            folder: folder,
+          );
+          registered.add(registration);
           if (folder != null) {
-            LocalFavoritesManager().addComic(
+            final favoriteAdded = LocalFavoritesManager().addComic(
               folder,
               FavoriteItem(
                 id: id,
@@ -561,17 +586,103 @@ class ImportComic {
                 favoriteTime: comic.createdAt,
               ),
             );
+            if (!favoriteAdded) {
+              throw StateError(
+                'Imported comic already exists in favorite folder: $folder',
+              );
+            }
+            registration.favoriteAdded = true;
           }
+          importedCount++;
         }
       }
-      App.rootContext.showMessage(
-        message: "Imported @a comics".tlParams({'a': importedCount}),
-      );
+      if (importedCount == 0) {
+        return false;
+      }
+      _showRegistrationMessage("Imported @a comics", {'a': importedCount});
     } catch (e, s) {
-      App.rootContext.showMessage(message: "Failed to register comics".tl);
+      await _rollbackRegistrations(registered);
+      if (cleanupManagedDirectoriesOnFailure) {
+        await _deleteManagedImportDirectories(managedDirectories);
+      }
+      _showRegistrationMessage("Failed to register comics");
       Log.error("Import Comic", e.toString(), s);
       return false;
     }
     return true;
   }
+
+  void _showRegistrationMessage(
+    String message, [
+    Map<String, Object> parameters = const {},
+  ]) {
+    final context = App.rootNavigatorKey.currentContext;
+    if (context == null) {
+      return;
+    }
+    context.showMessage(
+      message: parameters.isEmpty ? message.tl : message.tlParams(parameters),
+    );
+  }
+
+  Future<void> _rollbackRegistrations(
+    List<_RegisteredImportedComic> registered,
+  ) async {
+    for (final registration in registered.reversed) {
+      if (registration.favoriteAdded && registration.folder != null) {
+        try {
+          LocalFavoritesManager().deleteComicWithId(
+            registration.folder!,
+            registration.id,
+            registration.type,
+          );
+        } catch (error, stackTrace) {
+          Log.error(
+            'Import Comic',
+            'Failed to roll back favorite ${registration.id}: $error',
+            stackTrace,
+          );
+        }
+      }
+      try {
+        LocalManager().remove(registration.id, registration.type);
+      } catch (error, stackTrace) {
+        Log.error(
+          'Import Comic',
+          'Failed to roll back local comic ${registration.id}: $error',
+          stackTrace,
+        );
+      }
+    }
+  }
+
+  Future<void> _deleteManagedImportDirectories(
+    Iterable<String> directories,
+  ) async {
+    final localRoot = p.normalize(p.absolute(LocalManager().path));
+    for (final path in directories) {
+      final candidate = p.normalize(p.absolute(path));
+      if (candidate == localRoot || !p.isWithin(localRoot, candidate)) {
+        Log.warning(
+          'Import Comic',
+          'Skip cleanup outside the managed local directory: $candidate',
+        );
+        continue;
+      }
+      await Directory(candidate).deleteIgnoreError(recursive: true);
+    }
+  }
+}
+
+class _RegisteredImportedComic {
+  _RegisteredImportedComic({
+    required this.id,
+    required this.type,
+    required this.folder,
+  });
+
+  final String id;
+  final ComicType type;
+  final String? folder;
+  bool favoriteAdded = false;
 }

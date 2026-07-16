@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'dart:isolate';
 
 import 'package:flutter/foundation.dart';
+import 'package:crypto/crypto.dart';
 import 'package:sqlite3/sqlite3.dart';
 import 'package:venera/foundation/appdata.dart';
 import 'package:venera/foundation/image_provider/local_favorite_image.dart';
@@ -304,7 +305,9 @@ class LocalFavoritesManager with ChangeNotifier {
 
   late Map<String, int> counts;
 
-  var _hashedIds = <int, int>{};
+  var _favoriteIds = <({String id, int type}), int>{};
+
+  int _favoriteIdsRefreshGeneration = 0;
 
   bool _translatedTagsBackfillNeeded = false;
 
@@ -313,7 +316,7 @@ class LocalFavoritesManager with ChangeNotifier {
   String get _dbPath => "${App.dataPath}/local_favorite.db";
 
   int get totalComics {
-    return _hashedIds.length;
+    return _favoriteIds.length;
   }
 
   int folderComics(String folder) {
@@ -351,6 +354,7 @@ class LocalFavoritesManager with ChangeNotifier {
       _db,
       folderNames,
     );
+    ensureFolderIndexes(_db, folderNames);
     await appdata.init();
     // Make sure the follow updates folder is ready
     var followUpdateFolder = appdata.settings['followUpdatesFolder'];
@@ -405,6 +409,21 @@ class LocalFavoritesManager with ChangeNotifier {
   }
 
   @visibleForTesting
+  static void ensureFolderIndexes(Database db, List<String> folders) {
+    for (final folder in folders) {
+      if (!isValidFavoriteFolderName(folder)) continue;
+      final suffix = sha1
+          .convert(utf8.encode(folder))
+          .toString()
+          .substring(0, 16);
+      db.execute('''
+        CREATE INDEX IF NOT EXISTS "favorite_display_order_$suffix"
+          ON "$folder"(display_order);
+      ''');
+    }
+  }
+
+  @visibleForTesting
   static int backfillTranslatedTags(Database db, List<String> folders) {
     var updated = 0;
     db.execute("BEGIN TRANSACTION");
@@ -454,37 +473,47 @@ class LocalFavoritesManager with ChangeNotifier {
     for (var folder in folderNames) {
       counts[folder] = count(folder);
     }
-    _initHashedIds(folderNames, _dbPath).then((value) {
-      _hashedIds = value;
-      notifyListeners();
-    });
+    refreshFavoriteIds();
   }
 
-  void refreshHashedIds() {
-    _initHashedIds(folderNames, _dbPath).then((value) {
-      _hashedIds = value;
-      notifyListeners();
-    });
+  void refreshFavoriteIds() {
+    final generation = ++_favoriteIdsRefreshGeneration;
+    _initFavoriteIds(folderNames, _dbPath).then(
+      (value) {
+        if (generation != _favoriteIdsRefreshGeneration) {
+          return;
+        }
+        _favoriteIds = value;
+        notifyListeners();
+      },
+      onError: (Object error, StackTrace stackTrace) {
+        Log.warning(
+          'Favorites',
+          'Failed to refresh favorite identities: $error\n$stackTrace',
+        );
+      },
+    );
   }
 
-  void reduceHashedId(String id, int type) {
-    var hash = id.hashCode ^ type;
-    if (_hashedIds.containsKey(hash)) {
-      if (_hashedIds[hash]! > 1) {
-        _hashedIds[hash] = _hashedIds[hash]! - 1;
+  void reduceFavoriteId(String id, int type) {
+    _favoriteIdsRefreshGeneration++;
+    final identity = (id: id, type: type);
+    if (_favoriteIds.containsKey(identity)) {
+      if (_favoriteIds[identity]! > 1) {
+        _favoriteIds[identity] = _favoriteIds[identity]! - 1;
       } else {
-        _hashedIds.remove(hash);
+        _favoriteIds.remove(identity);
       }
     }
   }
 
-  static Future<Map<int, int>> _initHashedIds(
+  static Future<Map<({String id, int type}), int>> _initFavoriteIds(
     List<String> folders,
     String dbPath,
   ) async {
     final db = sqlite3.open(dbPath);
     try {
-      var hashedIds = <int, int>{};
+      var favoriteIds = <({String id, int type}), int>{};
       var scannedRows = 0;
       for (var folder in folders) {
         var rows = db.select("""
@@ -496,15 +525,15 @@ class LocalFavoritesManager with ChangeNotifier {
           if (id is! String || type == null) {
             continue;
           }
-          var hash = id.hashCode ^ type;
-          hashedIds[hash] = (hashedIds[hash] ?? 0) + 1;
+          final identity = (id: id, type: type);
+          favoriteIds[identity] = (favoriteIds[identity] ?? 0) + 1;
           scannedRows++;
           if (scannedRows % 500 == 0) {
             await Future<void>.delayed(Duration.zero);
           }
         }
       }
-      return hashedIds;
+      return favoriteIds;
     } finally {
       db.close();
     }
@@ -571,36 +600,45 @@ class LocalFavoritesManager with ChangeNotifier {
     final folders = _getTablesWithDB();
     folders.remove('folder_sync');
     folders.remove('folder_order');
-    var folderToOrder = <String, int>{};
-    for (var folder in folders) {
-      var res = _db.select(
-        """
-        select * from folder_order
-        where folder_name == ?;
-      """,
-        [folder],
-      );
-      if (res.isNotEmpty) {
-        folderToOrder[folder] = _rowInt(res.first["order_value"]) ?? 0;
-      } else {
-        folderToOrder[folder] = 0;
+    final originalOrder = <String, int>{
+      for (var index = 0; index < folders.length; index++)
+        folders[index]: index,
+    };
+    final folderToOrder = <String, int>{};
+    for (final row in _db.select('''
+      SELECT folder_name, order_value
+      FROM folder_order;
+    ''')) {
+      final name = row['folder_name'];
+      if (name is String) {
+        folderToOrder[name] = _rowInt(row['order_value']) ?? 0;
       }
     }
     folders.sort((a, b) {
-      return folderToOrder[a]! - folderToOrder[b]!;
+      final byOrder = (folderToOrder[a] ?? 0).compareTo(folderToOrder[b] ?? 0);
+      return byOrder != 0
+          ? byOrder
+          : (originalOrder[a] ?? 0).compareTo(originalOrder[b] ?? 0);
     });
     return folders;
   }
 
   void updateOrder(List<String> folders) {
-    for (int i = 0; i < folders.length; i++) {
-      _db.execute(
-        """
-        insert or replace into folder_order (folder_name, order_value)
-        values (?, ?);
-      """,
-        [folders[i], i],
-      );
+    _db.execute('BEGIN TRANSACTION;');
+    try {
+      for (int i = 0; i < folders.length; i++) {
+        _db.execute(
+          """
+          insert or replace into folder_order (folder_name, order_value)
+          values (?, ?);
+        """,
+          [folders[i], i],
+        );
+      }
+      _db.execute('COMMIT;');
+    } catch (_) {
+      _db.execute('ROLLBACK;');
+      rethrow;
     }
     notifyListeners();
   }
@@ -772,6 +810,7 @@ class LocalFavoritesManager with ChangeNotifier {
         primary key (id, type)
       );
     """);
+    ensureFolderIndexes(_db, [name]);
     notifyListeners();
     counts[name] = 0;
     return name;
@@ -929,8 +968,9 @@ class LocalFavoritesManager with ChangeNotifier {
     } else {
       counts[folder] = counts[folder]! + 1;
     }
-    var hash = comic.id.hashCode ^ comic.type.value;
-    _hashedIds[hash] = (_hashedIds[hash] ?? 0) + 1;
+    final identity = (id: comic.id, type: comic.type.value);
+    _favoriteIdsRefreshGeneration++;
+    _favoriteIds[identity] = (_favoriteIds[identity] ?? 0) + 1;
     notifyListeners();
     return true;
   }
@@ -960,25 +1000,72 @@ class LocalFavoritesManager with ChangeNotifier {
       return;
     }
 
+    _db.execute("BEGIN TRANSACTION");
+    try {
+      _copyFavoriteRow(
+        sourceFolder,
+        targetFolder,
+        id,
+        type.value,
+        minValue(targetFolder) - 1,
+      );
+      _db.execute(
+        """
+        delete from "$sourceFolder"
+        where id == ? and type == ?;
+      """,
+        [id, type.value],
+      );
+      _db.execute("COMMIT");
+    } catch (_) {
+      _db.execute("ROLLBACK");
+      rethrow;
+    }
+
+    counts[sourceFolder] = count(sourceFolder);
+    counts[targetFolder] = count(targetFolder);
+    refreshFavoriteIds();
+    notifyListeners();
+  }
+
+  void _copyFavoriteRow(
+    String sourceFolder,
+    String targetFolder,
+    String id,
+    int type,
+    int displayOrder,
+  ) {
+    final sourceColumns = _db
+        .select('pragma table_info("$sourceFolder");')
+        .map((row) => row['name'])
+        .whereType<String>()
+        .toSet();
+    final targetColumns = _db
+        .select('pragma table_info("$targetFolder");')
+        .map((row) => row['name'])
+        .whereType<String>()
+        .toSet();
+    final commonColumns = sourceColumns
+        .where(
+          (column) =>
+              column != 'display_order' && targetColumns.contains(column),
+        )
+        .toList(growable: false);
+    if (!commonColumns.contains('id') || !commonColumns.contains('type')) {
+      throw StateError('Favorite folder schema is missing identity columns');
+    }
+    final quotedColumns = commonColumns
+        .map((column) => '"${column.replaceAll('"', '""')}"')
+        .join(', ');
     _db.execute(
-      """
-      insert into "$targetFolder" (id, name, author, type, tags, cover_path, time, display_order)
-      select id, name, author, type, tags, cover_path, time, ?
+      '''
+      insert or ignore into "$targetFolder" ($quotedColumns, display_order)
+      select $quotedColumns, ?
       from "$sourceFolder"
       where id == ? and type == ?;
-    """,
-      [minValue(targetFolder) - 1, id, type.value],
+      ''',
+      [displayOrder, id, type],
     );
-
-    _db.execute(
-      """
-    delete from "$sourceFolder"
-    where id == ? and type == ?;
-  """,
-      [id, type.value],
-    );
-
-    notifyListeners();
   }
 
   void batchMoveFavorites(
@@ -997,14 +1084,12 @@ class LocalFavoritesManager with ChangeNotifier {
     var displayOrder = maxValue(targetFolder) + 1;
     try {
       for (var item in items) {
-        _db.execute(
-          """
-          insert or ignore into "$targetFolder" (id, name, author, type, tags, cover_path, time, display_order)
-          select id, name, author, type, tags, cover_path, time, ?
-          from "$sourceFolder"
-          where id == ? and type == ?;
-        """,
-          [displayOrder, item.id, item.type.value],
+        _copyFavoriteRow(
+          sourceFolder,
+          targetFolder,
+          item.id,
+          item.type.value,
+          displayOrder,
         );
 
         _db.execute(
@@ -1027,7 +1112,7 @@ class LocalFavoritesManager with ChangeNotifier {
     // Update counts
     counts[targetFolder] = count(targetFolder);
     counts[sourceFolder] = count(sourceFolder);
-    refreshHashedIds();
+    refreshFavoriteIds();
 
     notifyListeners();
   }
@@ -1048,14 +1133,12 @@ class LocalFavoritesManager with ChangeNotifier {
     var displayOrder = maxValue(targetFolder) + 1;
     try {
       for (var item in items) {
-        _db.execute(
-          """
-          insert or ignore into "$targetFolder" (id, name, author, type, tags, cover_path, time, display_order)
-          select id, name, author, type, tags, cover_path, time, ?
-          from "$sourceFolder"
-          where id == ? and type == ?;
-        """,
-          [displayOrder, item.id, item.type.value],
+        _copyFavoriteRow(
+          sourceFolder,
+          targetFolder,
+          item.id,
+          item.type.value,
+          displayOrder,
         );
 
         displayOrder++;
@@ -1069,7 +1152,7 @@ class LocalFavoritesManager with ChangeNotifier {
 
     // Update counts
     counts[targetFolder] = count(targetFolder);
-    refreshHashedIds();
+    refreshFavoriteIds();
 
     notifyListeners();
   }
@@ -1087,7 +1170,7 @@ class LocalFavoritesManager with ChangeNotifier {
       [name],
     );
     counts.remove(name);
-    refreshHashedIds();
+    refreshFavoriteIds();
     notifyListeners();
   }
 
@@ -1105,7 +1188,7 @@ class LocalFavoritesManager with ChangeNotifier {
     } else {
       counts[folder] = count(folder);
     }
-    reduceHashedId(id, type.value);
+    reduceFavoriteId(id, type.value);
     notifyListeners();
   }
 
@@ -1134,7 +1217,7 @@ class LocalFavoritesManager with ChangeNotifier {
       counts[folder] = count(folder);
     }
     for (var comic in comics) {
-      reduceHashedId(comic.id, comic.type.value);
+      reduceFavoriteId(comic.id, comic.type.value);
     }
     notifyListeners();
   }
@@ -1163,8 +1246,8 @@ class LocalFavoritesManager with ChangeNotifier {
     }
     initCounts();
     for (var comic in comics) {
-      var hash = comic.id.hashCode ^ comic.type.value;
-      _hashedIds.remove(hash);
+      _favoriteIdsRefreshGeneration++;
+      _favoriteIds.remove((id: comic.id, type: comic.type.value));
     }
     notifyListeners();
   }
@@ -1401,8 +1484,7 @@ class LocalFavoritesManager with ChangeNotifier {
   }
 
   bool isExist(String id, ComicType type) {
-    var hash = id.hashCode ^ type.value;
-    return _hashedIds.containsKey(hash);
+    return _favoriteIds.containsKey((id: id, type: type.value));
   }
 
   void updateInfo(String folder, FavoriteItem comic, [bool notify = true]) {

@@ -6,6 +6,7 @@ import 'package:path_provider/path_provider.dart';
 import 'package:uuid/uuid.dart';
 import 'package:venera/foundation/app.dart';
 import 'package:venera/foundation/log.dart';
+import 'package:venera/utils/atomic_file.dart';
 import 'package:venera/utils/data_sync.dart';
 import 'package:venera/utils/init.dart';
 import 'package:venera/utils/io.dart';
@@ -120,7 +121,7 @@ class Appdata with Init {
       json["settings"]["disableSyncFields"] = disableSyncFields;
       var data = jsonEncode(json);
       var file = File(FilePath.join(App.dataPath, 'appdata.json'));
-      futures.add(file.writeAsString(data));
+      futures.add(AtomicFileStore(file).writeString(data));
       var syncFile = File(FilePath.join(App.dataPath, 'syncdata.json'));
 
       if (disableSyncFields.isNotEmpty) {
@@ -130,9 +131,9 @@ class Appdata with Init {
           json4sync["settings"].remove(field);
         }
         var data4sync = jsonEncode(json4sync);
-        futures.add(syncFile.writeAsString(data4sync));
+        futures.add(AtomicFileStore(syncFile).writeString(data4sync));
       } else {
-        futures.add(syncFile.deleteIgnoreError());
+        futures.add(AtomicFileStore(syncFile).delete());
       }
 
       await Future.wait(futures);
@@ -227,7 +228,7 @@ class Appdata with Init {
       _isSavingData = true;
       try {
         var file = File(FilePath.join(App.dataPath, 'implicitData.json'));
-        await file.writeAsString(jsonEncode(implicitData));
+        await AtomicFileStore(file).writeJson(implicitData);
       } finally {
         _isSavingData = false;
       }
@@ -240,28 +241,30 @@ class Appdata with Init {
   Future<void> doInit() async {
     var dataPath = (await getApplicationSupportDirectory()).path;
     var file = File(FilePath.join(dataPath, 'appdata.json'));
-    if (!await file.exists()) {
-      return;
-    }
     try {
-      var json = jsonDecode(await file.readAsString());
-      if (json is! Map) {
-        throw const FormatException('appdata root must be an object');
-      }
-      final storedSettings = json['settings'];
-      if (storedSettings is Map) {
-        for (var entry in storedSettings.entries) {
-          final key = entry.key;
-          if (key is String && entry.value != null) {
-            settings[key] = entry.value;
+      final json = await AtomicFileStore(file).readParsed((value) {
+        final decoded = jsonDecode(value);
+        if (decoded is! Map) {
+          throw const FormatException('appdata root must be an object');
+        }
+        return decoded;
+      });
+      if (json != null) {
+        final storedSettings = json['settings'];
+        if (storedSettings is Map) {
+          for (var entry in storedSettings.entries) {
+            final key = entry.key;
+            if (key is String && entry.value != null) {
+              settings[key] = entry.value;
+            }
           }
         }
+        searchHistory = normalizeSearchHistory(json['searchHistory']);
       }
-      searchHistory = normalizeSearchHistory(json['searchHistory']);
-    } catch (e) {
-      Log.error("Appdata", "Failed to load appdata", e);
+    } catch (e, s) {
+      Log.error("Appdata", "Failed to load appdata: $e", s);
       Log.info("Appdata", "Resetting appdata");
-      file.deleteIgnoreError();
+      await AtomicFileStore(file).delete();
     }
     if (normalizeDeviceId(settings["deviceId"]).isEmpty) {
       settings._data["deviceId"] = const Uuid().v4();
@@ -269,16 +272,17 @@ class Appdata with Init {
     }
     try {
       var implicitDataFile = File(FilePath.join(dataPath, 'implicitData.json'));
-      if (await implicitDataFile.exists()) {
-        implicitData = normalizeImplicitData(
-          jsonDecode(await implicitDataFile.readAsString()),
-        );
+      final decoded = await AtomicFileStore(
+        implicitDataFile,
+      ).readParsed(jsonDecode);
+      if (decoded != null) {
+        implicitData = normalizeImplicitData(decoded);
       }
-    } catch (e) {
-      Log.error("Appdata", "Failed to load implicit data", e);
+    } catch (e, s) {
+      Log.error("Appdata", "Failed to load implicit data: $e", s);
       Log.info("Appdata", "Resetting implicit data");
       var implicitDataFile = File(FilePath.join(dataPath, 'implicitData.json'));
-      implicitDataFile.deleteIgnoreError();
+      await AtomicFileStore(implicitDataFile).delete();
     }
   }
 }

@@ -209,6 +209,43 @@ int normalizeAutoPageTurningIntervalSeconds(Object? value) {
   return normalized.clamp(1, 20);
 }
 
+typedef PeriodicTimerFactory =
+    Timer Function(Duration duration, void Function(Timer timer) callback);
+
+/// Owns the auto-page timer so its active state cannot outlive the timer.
+class AutoPageTurningController {
+  Timer? _timer;
+
+  bool get isActive => _timer != null;
+
+  void start({
+    required Duration interval,
+    required bool Function() shouldStop,
+    required VoidCallback onNextPage,
+    required VoidCallback onStopped,
+    PeriodicTimerFactory timerFactory = Timer.periodic,
+  }) {
+    stop();
+    _timer = timerFactory(interval, (timer) {
+      if (!identical(_timer, timer)) {
+        return;
+      }
+      if (shouldStop()) {
+        timer.cancel();
+        _timer = null;
+        onStopped();
+        return;
+      }
+      onNextPage();
+    });
+  }
+
+  void stop() {
+    _timer?.cancel();
+    _timer = null;
+  }
+}
+
 @visibleForTesting
 int normalizeReaderPageForLoadedImages({
   required int page,
@@ -490,7 +527,7 @@ class _ReaderState extends State<Reader>
 
   @override
   bool get isPortrait =>
-      MediaQuery.of(context).orientation == Orientation.portrait;
+      MediaQuery.orientationOf(context) == Orientation.portrait;
 
   History? history;
 
@@ -618,7 +655,7 @@ class _ReaderState extends State<Reader>
     if (isFullscreen) {
       fullscreen();
     }
-    autoPageTurningTimer?.cancel();
+    _autoPageTurningController.stop();
     focusNode.dispose();
     SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
     stopVolumeEvent();
@@ -723,8 +760,9 @@ class _ReaderState extends State<Reader>
     updateHistory();
   }
 
-  /// Prevent multiple history updates in a short time.
-  /// `HistoryManager().addHistoryAsync` is a high-cost operation because it creates a new isolate.
+  /// Prevent multiple history updates in a short time. The eventual write is a
+  /// single WAL-backed upsert; keeping it on the manager's live connection
+  /// preserves ordering when the reader closes or switches chapters.
   Timer? _updateHistoryTimer;
 
   void updateHistory() {
@@ -1054,17 +1092,18 @@ class _ReaderState extends State<Reader>
       return;
     }
     _historyWriteHasRun = true;
-    unawaited(
-      HistoryManager()
-          .addHistoryAsync(_snapshotHistory(currentHistory), notify: false)
-          .catchError((Object error, StackTrace stackTrace) {
-            Log.error(
-              "Reader",
-              "Failed to persist reader history: $error",
-              stackTrace,
-            );
-          }),
-    );
+    try {
+      HistoryManager().addHistory(
+        _snapshotHistory(currentHistory),
+        notify: false,
+      );
+    } catch (error, stackTrace) {
+      Log.error(
+        "Reader",
+        "Failed to persist reader history: $error",
+        stackTrace,
+      );
+    }
   }
 
   History _snapshotHistory(History source) {
@@ -1473,12 +1512,14 @@ abstract mixin class _ReaderLocation {
     return false;
   }
 
-  Timer? autoPageTurningTimer;
+  final AutoPageTurningController _autoPageTurningController =
+      AutoPageTurningController();
+
+  bool get isAutoPageTurning => _autoPageTurningController.isActive;
 
   void autoPageTurning(String cid, ComicType type) {
-    if (autoPageTurningTimer != null) {
-      autoPageTurningTimer!.cancel();
-      autoPageTurningTimer = null;
+    if (_autoPageTurningController.isActive) {
+      _autoPageTurningController.stop();
     } else {
       final interval = normalizeAutoPageTurningIntervalSeconds(
         appdata.settings.getReaderSetting(
@@ -1487,12 +1528,12 @@ abstract mixin class _ReaderLocation {
           'autoPageTurningInterval',
         ),
       );
-      autoPageTurningTimer = Timer.periodic(Duration(seconds: interval), (_) {
-        if (page == maxPage) {
-          autoPageTurningTimer!.cancel();
-        }
-        toNextPage();
-      });
+      _autoPageTurningController.start(
+        interval: Duration(seconds: interval),
+        shouldStop: () => page >= maxPage,
+        onNextPage: toNextPage,
+        onStopped: update,
+      );
     }
   }
 }

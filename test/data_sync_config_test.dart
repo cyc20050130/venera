@@ -134,4 +134,46 @@ void main() {
 
     expect(removals, isEmpty);
   });
+
+  test(
+    'remote backup upload never removes old files before upload succeeds',
+    () async {
+      final events = <String>[];
+
+      await expectLater(
+        uploadRemoteBackupSafely(
+          upload: () async {
+            events.add('upload');
+            throw StateError('upload failed');
+          },
+          filesToRemove: const ['old.venera'],
+          remove: (name) async => events.add('remove:$name'),
+        ),
+        throwsStateError,
+      );
+
+      expect(events, ['upload']);
+    },
+  );
+
+  test(
+    'remote cleanup failures do not invalidate a successful upload',
+    () async {
+      final events = <String>[];
+      final cleanupErrors = <String>[];
+
+      await uploadRemoteBackupSafely(
+        upload: () async => events.add('upload'),
+        filesToRemove: const ['old-1.venera', 'old-2.venera'],
+        remove: (name) async {
+          events.add('remove:$name');
+          if (name == 'old-1.venera') throw StateError('remove failed');
+        },
+        onRemoveError: (name, _, _) => cleanupErrors.add(name),
+      );
+
+      expect(events, ['upload', 'remove:old-1.venera', 'remove:old-2.venera']);
+      expect(cleanupErrors, ['old-1.venera']);
+    },
+  );
 }

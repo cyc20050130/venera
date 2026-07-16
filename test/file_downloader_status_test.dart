@@ -103,6 +103,84 @@ void main() {
     );
   });
 
+  test('content range validation binds a response to the requested block', () {
+    expect(
+      isValidDownloadContentRange(
+        'bytes 512-1023/2048',
+        requestStart: 512,
+        requestEndExclusive: 1024,
+        fileSize: 2048,
+      ),
+      isTrue,
+    );
+    expect(
+      isValidDownloadContentRange(
+        'bytes 0-511/2048',
+        requestStart: 512,
+        requestEndExclusive: 1024,
+        fileSize: 2048,
+      ),
+      isFalse,
+    );
+    expect(
+      isValidDownloadContentRange(
+        'bytes 512-800/2048',
+        requestStart: 512,
+        requestEndExclusive: 1024,
+        fileSize: 2048,
+      ),
+      isFalse,
+    );
+    expect(
+      isValidDownloadContentRange(
+        'bytes 512-1535/2048',
+        requestStart: 512,
+        requestEndExclusive: 1024,
+        fileSize: 2048,
+      ),
+      isFalse,
+    );
+    expect(
+      isValidDownloadContentRange(
+        'bytes 512-1023/4096',
+        requestStart: 512,
+        requestEndExclusive: 1024,
+        fileSize: 2048,
+      ),
+      isFalse,
+    );
+    expect(
+      isValidDownloadContentRange(
+        null,
+        requestStart: 512,
+        requestEndExclusive: 1024,
+        fileSize: 2048,
+      ),
+      isFalse,
+    );
+  });
+
+  test('download validator prefers strong etag and rejects weak etag', () {
+    expect(
+      selectDownloadResourceValidator(
+        etag: '"revision-2"',
+        lastModified: 'Wed, 16 Jul 2026 08:00:00 GMT',
+      ),
+      '"revision-2"',
+    );
+    expect(
+      selectDownloadResourceValidator(
+        etag: 'W/"revision-2"',
+        lastModified: 'Wed, 16 Jul 2026 08:00:00 GMT',
+      ),
+      'Wed, 16 Jul 2026 08:00:00 GMT',
+    );
+    expect(
+      selectDownloadResourceValidator(etag: null, lastModified: null),
+      isNull,
+    );
+  });
+
   test('download chunk validation rejects writes past a block boundary', () {
     expect(acceptedDownloadChunkLength(128, remainingBlockBytes: 512), 128);
     expect(acceptedDownloadChunkLength(512, remainingBlockBytes: 512), 512);

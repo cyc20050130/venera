@@ -1,12 +1,19 @@
 import 'package:flutter_test/flutter_test.dart';
+import 'package:sqlite3/sqlite3.dart';
 import 'package:venera/foundation/app.dart';
+import 'package:venera/foundation/comic_type.dart';
+import 'package:venera/foundation/favorites.dart';
 import 'package:venera/foundation/local.dart';
 import 'package:venera/utils/import_comic.dart';
 import 'package:venera/utils/io.dart';
 
 void main() {
+  TestWidgetsFlutterBinding.ensureInitialized();
+
   late Directory tempDir;
   late LocalManager manager;
+  late LocalFavoritesManager favorites;
+  late Database favoritesDb;
 
   setUp(() async {
     tempDir = await Directory.systemTemp.createTemp('venera-import-comic-');
@@ -14,11 +21,27 @@ void main() {
     LocalManager.debugResetInstance();
     manager = LocalManager();
     await manager.init();
+    favoritesDb = sqlite3.openInMemory();
+    favoritesDb.execute('''
+      create table folder_order (
+        folder_name text primary key,
+        order_value int
+      );
+      create table folder_sync (
+        folder_name text primary key,
+        source_key text,
+        source_folder text
+      );
+    ''');
+    favorites = LocalFavoritesManager();
+    favorites.debugUseDatabaseForTest(favoritesDb, needsTagBackfill: false);
   });
 
   tearDown(() async {
+    await manager.flushCurrentDownloadingTasks();
     manager.dispose();
     LocalManager.debugResetInstance();
+    favoritesDb.close();
     if (await tempDir.exists()) {
       for (var i = 0; i < 5; i++) {
         try {
@@ -193,6 +216,91 @@ void main() {
         Directory(FilePath.join(localRoot.path, 'Comic_old')).existsSync(),
         isFalse,
       );
+    },
+  );
+
+  test(
+    'comic registration rolls back metadata, favorites, and managed files',
+    () async {
+      favorites.createFolder('Good');
+      final firstDirectory = await Directory(
+        FilePath.join(manager.path, 'first-managed'),
+      ).create();
+      final secondDirectory = await Directory(
+        FilePath.join(manager.path, 'second-managed'),
+      ).create();
+      final now = DateTime.now();
+      final first = LocalComic(
+        id: 'source-first',
+        title: 'First',
+        subtitle: '',
+        tags: const [],
+        directory: firstDirectory.name,
+        chapters: null,
+        cover: '',
+        comicType: ComicType.local,
+        downloadedChapters: const [],
+        createdAt: now,
+      );
+      final second = LocalComic(
+        id: 'source-second',
+        title: 'Second',
+        subtitle: '',
+        tags: const [],
+        directory: secondDirectory.name,
+        chapters: null,
+        cover: '',
+        comicType: ComicType.local,
+        downloadedChapters: const [],
+        createdAt: now,
+      );
+
+      final result = await const ImportComic().registerComics(
+        {
+          'Good': [first],
+          'Missing': [second],
+        },
+        false,
+        cleanupManagedDirectoriesOnFailure: true,
+      );
+
+      expect(result, isFalse);
+      expect(manager.getComics(LocalSortType.timeDesc), isEmpty);
+      expect(favorites.getFolderComics('Good'), isEmpty);
+      expect(await firstDirectory.exists(), isFalse);
+      expect(await secondDirectory.exists(), isFalse);
+    },
+  );
+
+  test(
+    'failed external directory registration never deletes user files',
+    () async {
+      final externalDirectory = await Directory(
+        FilePath.join(tempDir.path, 'external-comic'),
+      ).create();
+      final marker = await File(
+        FilePath.join(externalDirectory.path, 'page.jpg'),
+      ).writeAsBytes([1, 2, 3]);
+      final comic = LocalComic(
+        id: 'external',
+        title: 'External',
+        subtitle: '',
+        tags: const [],
+        directory: externalDirectory.path,
+        chapters: null,
+        cover: marker.name,
+        comicType: ComicType.local,
+        downloadedChapters: const [],
+        createdAt: DateTime.now(),
+      );
+
+      final result = await const ImportComic().registerComics({
+        'Missing': [comic],
+      }, false);
+
+      expect(result, isFalse);
+      expect(manager.getComics(LocalSortType.timeDesc), isEmpty);
+      expect(await marker.exists(), isTrue);
     },
   );
 }

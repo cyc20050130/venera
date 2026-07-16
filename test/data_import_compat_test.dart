@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io';
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:venera/utils/data.dart';
@@ -77,6 +78,28 @@ void main() {
     );
 
     expect(entries, isEmpty);
+  });
+
+  test('sync export falls back to appdata when no filtered copy exists', () async {
+    final directory = await Directory.systemTemp.createTemp(
+      'venera-export-appdata-',
+    );
+    try {
+      final appdata = File('${directory.path}/appdata.json')
+        ..writeAsStringSync('{}');
+
+      final entries = buildAppDataExportEntries(
+        directory.path,
+        sync: true,
+      );
+
+      expect(entries, hasLength(1));
+      expect(entries.single.archiveName, 'appdata.json');
+      expect(File(entries.single.path).readAsStringSync(), '{}');
+      expect(appdata.existsSync(), isTrue);
+    } finally {
+      await directory.delete(recursive: true);
+    }
   });
 
   test('app data temporary paths are operation scoped', () {

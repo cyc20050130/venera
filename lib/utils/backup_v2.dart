@@ -124,9 +124,10 @@ BackupV2Payload buildBackupV2Payload({
   // `syncdata.json` is the existing filtered export representation. Keep the
   // logical V2 payload aligned with the legacy export so a normal backup does
   // not accidentally re-introduce fields intentionally omitted from sync.
-  final appdataFile = File(
-    FilePath.join(dataPath, useSyncAppdata ? 'syncdata.json' : 'appdata.json'),
-  );
+  final syncAppdataFile = File(FilePath.join(dataPath, 'syncdata.json'));
+  final appdataFile = useSyncAppdata && syncAppdataFile.existsSync()
+      ? syncAppdataFile
+      : File(FilePath.join(dataPath, 'appdata.json'));
   if (appdataFile.existsSync()) {
     try {
       addJson('appdata.json', jsonDecode(appdataFile.readAsStringSync()));

@@ -39,14 +39,49 @@ void main() {
 
     expect(completed, isTrue);
   });
+
+  test('concurrent init calls share one initialization', () async {
+    final gate = Completer<void>();
+    final target = _InitProbe(gate: gate.future);
+
+    final first = target.init();
+    final second = target.init();
+    await Future<void>.delayed(Duration.zero);
+
+    expect(target.initCount, 1);
+    gate.complete();
+    await Future.wait([first, second]);
+    expect(target.initCount, 1);
+  });
+
+  test('failed initialization rejects waiters and can retry', () async {
+    final target = _InitProbe(failuresBeforeSuccess: 1);
+    final waiter = target.ensureInit();
+
+    await expectLater(target.init(), throwsStateError);
+    await expectLater(waiter, throwsStateError);
+    await target.init();
+
+    expect(target.initCount, 2);
+    await target.ensureInit();
+  });
 }
 
 class _InitProbe with Init {
+  _InitProbe({this.gate, this.failuresBeforeSuccess = 0});
+
+  final Future<void>? gate;
+  int failuresBeforeSuccess;
   int initCount = 0;
 
   @override
   Future<void> doInit() async {
     initCount++;
+    await gate;
+    if (failuresBeforeSuccess > 0) {
+      failuresBeforeSuccess--;
+      throw StateError('init failed');
+    }
   }
 
   void resetForTesting() {

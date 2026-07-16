@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:venera/pages/reader/gesture_logic.dart';
@@ -191,6 +193,36 @@ void main() {
     expect(normalizeAutoPageTurningIntervalSeconds(['5']), 5);
     expect(normalizeAutoPageTurningIntervalSeconds(null), 5);
   });
+
+  test(
+    'auto page turning clears active state when the last page is reached',
+    () {
+      final controller = AutoPageTurningController();
+      late void Function(Timer) tick;
+      final timer = _FakeTimer();
+      var pageTurns = 0;
+      var stopped = 0;
+
+      controller.start(
+        interval: const Duration(seconds: 1),
+        shouldStop: () => true,
+        onNextPage: () => pageTurns++,
+        onStopped: () => stopped++,
+        timerFactory: (_, callback) {
+          tick = callback;
+          return timer;
+        },
+      );
+      expect(controller.isActive, isTrue);
+
+      tick(timer);
+
+      expect(controller.isActive, isFalse);
+      expect(timer.isActive, isFalse);
+      expect(pageTurns, 0);
+      expect(stopped, 1);
+    },
+  );
 
   test('comic image stream events require mounted matching stream', () {
     expect(
@@ -485,4 +517,19 @@ void main() {
       expect(readerPointerCountAfterPointerEnd(-1), 0);
     },
   );
+}
+
+class _FakeTimer implements Timer {
+  bool _isActive = true;
+
+  @override
+  bool get isActive => _isActive;
+
+  @override
+  int get tick => 0;
+
+  @override
+  void cancel() {
+    _isActive = false;
+  }
 }

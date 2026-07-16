@@ -84,6 +84,27 @@ void main() {
     });
   });
 
+  test('sync export keeps appdata when no filtered snapshot is needed', () {
+    File('${tempDir.path}/appdata.json').writeAsStringSync(
+      jsonEncode({
+        'settings': {'theme': 'dark'},
+      }),
+    );
+
+    final payload = buildBackupV2Payload(
+      dataPath: tempDir.path,
+      appVersion: 'test',
+      useSyncAppdata: true,
+    );
+    final decoded = jsonDecode(
+      utf8.decode(payload.entries['$backupLogicalDirectory/appdata.json']!),
+    );
+
+    expect(decoded, {
+      'settings': {'theme': 'dark'},
+    });
+  });
+
   test('manifest rejects malformed versions and entries', () {
     expect(
       BackupManifestV2.tryParse({

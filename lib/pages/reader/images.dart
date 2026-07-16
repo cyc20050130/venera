@@ -353,6 +353,8 @@ class _GalleryModeState extends State<_GalleryMode>
 
   var photoViewControllers = <int, PhotoViewController>{};
   final Map<int, bool> _cachedPageWithDecode = {};
+  List<String>? _cachedImagesIdentity;
+  int? _lastCacheRequestPage;
 
   late _ReaderState reader;
 
@@ -399,6 +401,7 @@ class _GalleryModeState extends State<_GalleryMode>
   @override
   void initState() {
     reader = context.reader;
+    _cachedImagesIdentity = reader.images;
     controller = PageController(initialPage: reader.page);
     reader._imageViewController = this;
     Future.microtask(() {
@@ -457,7 +460,16 @@ class _GalleryModeState extends State<_GalleryMode>
   }
 
   void cache(int startPage) {
-    reader.runAfterInitialReaderWarmup('gallery-cache-$startPage', () {
+    if (!identical(_cachedImagesIdentity, reader.images)) {
+      _cachedPageWithDecode.clear();
+      _cachedImagesIdentity = reader.images;
+      _lastCacheRequestPage = null;
+    }
+    if (_lastCacheRequestPage == startPage) {
+      return;
+    }
+    _lastCacheRequestPage = startPage;
+    reader.runAfterInitialReaderWarmup('gallery-cache', () {
       if (mounted) {
         _scheduleCache(startPage);
       }
@@ -563,7 +575,7 @@ class _GalleryModeState extends State<_GalleryMode>
             photoViewControllers[index] ??= PhotoViewController();
 
             if (reader.imagesPerPage == 1 || pageImages.length == 1) {
-              final viewportSize = MediaQuery.of(context).size;
+              final viewportSize = MediaQuery.sizeOf(context);
               return PhotoViewGalleryPageOptions.customChild(
                 childSize: viewportSize,
                 controller: photoViewControllers[index],
@@ -585,7 +597,7 @@ class _GalleryModeState extends State<_GalleryMode>
               );
             }
 
-            final viewportSize = MediaQuery.of(context).size;
+            final viewportSize = MediaQuery.sizeOf(context);
             return PhotoViewGalleryPageOptions.customChild(
               childSize: viewportSize,
               controller: photoViewControllers[index],
@@ -598,7 +610,7 @@ class _GalleryModeState extends State<_GalleryMode>
         pageController: controller,
         loadingBuilder: (context, event) {
           return PhotoView.customChild(
-            childSize: MediaQuery.of(context).size,
+            childSize: MediaQuery.sizeOf(context),
             initialScale: PhotoViewComputedScale.contained,
             minScale: PhotoViewComputedScale.contained * 1.0,
             maxScale: PhotoViewComputedScale.covered * 10.0,
@@ -921,6 +933,28 @@ const Set<PointerDeviceKind> _kTouchLikeDeviceTypes = <PointerDeviceKind>{
 
 const double _kChangeChapterOffset = 160;
 
+@visibleForTesting
+int? resolveContinuousReaderLeadingPage({
+  required Iterable<ItemPosition> positions,
+  required int maxPage,
+}) {
+  if (positions.isEmpty || maxPage < 1) {
+    return null;
+  }
+
+  ItemPosition? leadingPosition;
+  for (final position in positions) {
+    if (position.itemTrailingEdge <= 0) {
+      continue;
+    }
+    if (leadingPosition == null ||
+        position.itemTrailingEdge < leadingPosition.itemTrailingEdge) {
+      leadingPosition = position;
+    }
+  }
+  return leadingPosition?.index.clamp(1, maxPage);
+}
+
 class _ContinuousMode extends StatefulWidget {
   const _ContinuousMode({super.key});
 
@@ -945,6 +979,8 @@ class _ContinuousModeState extends State<_ContinuousMode>
   bool disableScroll = false;
 
   late List<bool> cached;
+  List<String>? _cachedImagesIdentity;
+  int? _lastCacheRequestPage;
 
   int get preCacheCount =>
       appdata.settings.intValue("preloadImageCount", fallback: 4, min: 0);
@@ -967,11 +1003,8 @@ class _ContinuousModeState extends State<_ContinuousMode>
     reader._imageViewController = this;
     itemPositionsListener.itemPositions.addListener(onPositionChanged);
     cached = List.filled(reader.maxPage + 2, false);
-    reader.runAfterInitialReaderWarmup('continuous-cache', () {
-      if (mounted) {
-        cacheImages(reader.page);
-      }
-    });
+    _cachedImagesIdentity = reader.images;
+    cacheImages(reader.page);
     super.initState();
   }
 
@@ -991,18 +1024,20 @@ class _ContinuousModeState extends State<_ContinuousMode>
     if (!mounted) {
       return;
     }
-    if (itemPositionsListener.itemPositions.value.isEmpty) {
+    final page = resolveContinuousReaderLeadingPage(
+      positions: itemPositionsListener.itemPositions.value,
+      maxPage: reader.maxPage,
+    );
+    if (page == null) {
       return;
     }
-    var page = itemPositionsListener.itemPositions.value.first.index;
-    page = page.clamp(1, reader.maxPage);
     if (page != reader.page) {
       reader.setPage(page);
       context.readerScaffold._gestureDetectorState
           ?.registerNavigationInteraction();
       context.readerScaffold.update();
+      cacheImages(page);
     }
-    cacheImages(page);
   }
 
   double? _futurePosition;
@@ -1067,6 +1102,11 @@ class _ContinuousModeState extends State<_ContinuousMode>
   }
 
   void cacheImages(int current) {
+    _syncCacheState();
+    if (_lastCacheRequestPage == current) {
+      return;
+    }
+    _lastCacheRequestPage = current;
     reader.runAfterInitialReaderWarmup('continuous-cache', () {
       if (mounted) {
         _scheduleCacheImages(current);
@@ -1074,7 +1114,20 @@ class _ContinuousModeState extends State<_ContinuousMode>
     });
   }
 
+  void _syncCacheState() {
+    final images = reader.images;
+    final expectedLength = reader.maxPage + 2;
+    if (identical(_cachedImagesIdentity, images) &&
+        cached.length == expectedLength) {
+      return;
+    }
+    cached = List.filled(expectedLength, false);
+    _cachedImagesIdentity = images;
+    _lastCacheRequestPage = null;
+  }
+
   void _scheduleCacheImages(int current) {
+    _syncCacheState();
     final actions = <VoidCallback>[];
     for (int i = current + 1; i <= current + preCacheCount; i++) {
       if (i <= reader.maxPage && !cached[i]) {
@@ -1124,6 +1177,9 @@ class _ContinuousModeState extends State<_ContinuousMode>
       itemScrollController: itemScrollController,
       itemPositionsListener: itemPositionsListener,
       scrollControllerCallback: (scrollController) {
+        if (identical(_scrollController, scrollController)) {
+          return;
+        }
         if (_scrollController != null) {
           _scrollController!.removeListener(onScroll);
         }
@@ -1377,7 +1433,7 @@ class _ContinuousModeState extends State<_ContinuousMode>
     if (target == null) {
       return;
     }
-    var size = MediaQuery.of(context).size;
+    var size = MediaQuery.sizeOf(context);
     photoViewController.animateScale?.call(
       target,
       Offset(size.width / 2 - location.dx, size.height / 2 - location.dy),
@@ -1535,7 +1591,8 @@ ImageProvider _createImageProviderFromKey(
 }) {
   var reader = context.reader;
   final enableResize = reader.mode.isContinuous;
-  final mediaQuery = MediaQuery.of(context);
+  final viewportSize = MediaQuery.sizeOf(context);
+  final devicePixelRatio = MediaQuery.devicePixelRatioOf(context);
   if (!imageKey.startsWith('file://') &&
       loadPriority == ReaderImageLoadPriority.foregroundVisible) {
     ImageDownloader.markReaderImageVisible(
@@ -1554,10 +1611,7 @@ ImageProvider _createImageProviderFromKey(
     loadPriority: loadPriority,
     enableResize: enableResize,
     decodeWidth: enableResize
-        ? resolveReaderImageDecodeWidth(
-            mediaQuery.size.width,
-            mediaQuery.devicePixelRatio,
-          )
+        ? resolveReaderImageDecodeWidth(viewportSize.width, devicePixelRatio)
         : null,
   );
 }

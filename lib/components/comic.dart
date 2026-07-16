@@ -795,6 +795,7 @@ class SliverGridComics extends StatefulWidget {
     super.key,
     required this.comics,
     this.onLastItemBuild,
+    this.onItemBuild,
     this.badgeBuilder,
     this.menuBuilder,
     this.onTap,
@@ -807,6 +808,10 @@ class SliverGridComics extends StatefulWidget {
   final Map<Comic, bool>? selections;
 
   final void Function()? onLastItemBuild;
+
+  /// Called lazily when an item enters the sliver build/cache extent.
+  /// Implementations must defer mutations until after the current build.
+  final void Function(Comic comic)? onItemBuild;
 
   final String? Function(Comic)? badgeBuilder;
 
@@ -891,6 +896,7 @@ class _SliverGridComicsState extends State<SliverGridComics> {
       heroTags: heroTags,
       selection: widget.selections,
       onLastItemBuild: widget.onLastItemBuild,
+      onItemBuild: widget.onItemBuild,
       badgeBuilder: widget.badgeBuilder,
       menuBuilder: widget.menuBuilder,
       onTap: widget.onTap,
@@ -904,6 +910,7 @@ class _SliverGridComics extends StatelessWidget {
     required this.comics,
     required this.heroTags,
     this.onLastItemBuild,
+    this.onItemBuild,
     this.badgeBuilder,
     this.menuBuilder,
     this.onTap,
@@ -918,6 +925,8 @@ class _SliverGridComics extends StatelessWidget {
   final Map<Comic, bool>? selection;
 
   final void Function()? onLastItemBuild;
+
+  final void Function(Comic comic)? onItemBuild;
 
   final String? Function(Comic)? badgeBuilder;
 
@@ -934,6 +943,7 @@ class _SliverGridComics extends StatelessWidget {
         if (shouldTriggerComicListPreload(index, comics.length)) {
           onLastItemBuild?.call();
         }
+        onItemBuild?.call(comics[index]);
         var badge = badgeBuilder?.call(comics[index]);
         var isSelected = selection == null
             ? false

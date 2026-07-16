@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io' as io;
 import 'package:flutter/material.dart';
@@ -779,36 +780,145 @@ class _EditFilePage extends StatefulWidget {
 }
 
 class __EditFilePageState extends State<_EditFilePage> {
-  var current = '';
+  String? current;
+  Object? loadError;
+  bool isSaving = false;
+  bool isDirty = false;
 
   @override
   void initState() {
     super.initState();
-    current = File(widget.path).readAsStringSync();
+    _load();
   }
 
   @override
   void dispose() {
-    File(widget.path).writeAsStringSync(current);
     widget.onExit();
     super.dispose();
   }
 
+  Future<void> _load() async {
+    if (mounted) {
+      setState(() {
+        loadError = null;
+      });
+    }
+    try {
+      final value = await File(widget.path).readAsString();
+      if (!mounted) return;
+      setState(() {
+        current = value;
+        isDirty = false;
+      });
+    } catch (error) {
+      if (!mounted) return;
+      setState(() {
+        loadError = error;
+      });
+    }
+  }
+
+  Future<bool> _save() async {
+    final value = current;
+    if (value == null || !isDirty || isSaving) {
+      return value != null && !isSaving;
+    }
+    setState(() {
+      isSaving = true;
+    });
+    try {
+      await File(widget.path).writeAsString(value, flush: true);
+      if (!mounted) return true;
+      setState(() {
+        isDirty = false;
+      });
+      return true;
+    } catch (error, stackTrace) {
+      Log.error('Comic Source Editor', error, stackTrace);
+      if (mounted) {
+        context.showMessage(message: '${'Failed to save file'.tl}: $error');
+      }
+      return false;
+    } finally {
+      if (mounted) {
+        setState(() {
+          isSaving = false;
+        });
+      }
+    }
+  }
+
+  Future<void> _saveAndPop() async {
+    if (await _save() && mounted) {
+      Navigator.of(context).pop();
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: Appbar(title: Text("Edit".tl)),
-      body: Column(
-        children: [
-          Container(height: 0.6, color: context.colorScheme.outlineVariant),
-          Expanded(
-            child: CodeEditor(
-              initialValue: current,
-              onChanged: (value) => current = value,
+    return PopScope<Object?>(
+      canPop: !isDirty && !isSaving,
+      onPopInvokedWithResult: (didPop, _) {
+        if (!didPop && isDirty && !isSaving) {
+          unawaited(_saveAndPop());
+        }
+      },
+      child: Scaffold(
+        appBar: Appbar(
+          title: Text("Edit".tl),
+          actions: [
+            IconButton(
+              tooltip: 'Save'.tl,
+              onPressed: current == null || !isDirty || isSaving
+                  ? null
+                  : () => unawaited(_save()),
+              icon: isSaving
+                  ? const SizedBox.square(
+                      dimension: 20,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    )
+                  : const Icon(Icons.save_outlined),
             ),
-          ),
-        ],
+          ],
+        ),
+        body: Column(
+          children: [
+            Container(height: 0.6, color: context.colorScheme.outlineVariant),
+            Expanded(child: _buildEditorBody()),
+          ],
+        ),
       ),
+    );
+  }
+
+  Widget _buildEditorBody() {
+    final error = loadError;
+    if (error != null) {
+      return Center(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Text('${'Failed to load file'.tl}: $error'),
+            const SizedBox(height: 12),
+            FilledButton(onPressed: _load, child: Text('Retry'.tl)),
+          ],
+        ),
+      );
+    }
+    final value = current;
+    if (value == null) {
+      return const Center(child: CircularProgressIndicator());
+    }
+    return CodeEditor(
+      initialValue: value,
+      onChanged: (value) {
+        current = value;
+        if (!isDirty) {
+          setState(() {
+            isDirty = true;
+          });
+        }
+      },
     );
   }
 }

@@ -508,7 +508,7 @@ class _ReaderScaffoldState extends State<_ReaderScaffold> {
       Tooltip(
         message: "Auto Page Turning".tl,
         child: IconButton(
-          icon: context.reader.autoPageTurningTimer != null
+          icon: context.reader.isAutoPageTurning
               ? const Icon(Icons.timer)
               : const Icon(Icons.timer_sharp),
           onPressed: hasPages

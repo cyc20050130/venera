@@ -1,8 +1,10 @@
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:archive/archive_io.dart' as archive_io;
 import 'package:flutter_test/flutter_test.dart';
 import 'package:venera/foundation/app.dart';
+import 'package:venera/foundation/comic_source/comic_source.dart';
 import 'package:venera/foundation/comic_type.dart';
 import 'package:venera/foundation/local.dart';
 import 'package:venera/foundation/local_archive.dart';
@@ -132,6 +134,43 @@ void main() {
   );
 
   test(
+    'first compression hashes each source only at deletion boundary',
+    () async {
+      final hashedSources = <String>[];
+      final service = LocalArchiveService.forTesting(
+        libraryRoot: library.path,
+        onSourceHash: (file) => hashedSources.add(file.path),
+      );
+
+      await service.compress(comic);
+
+      expect(hashedSources, hasLength(2));
+      expect(hashedSources.toSet(), hasLength(2));
+      expect(hashedSources, everyElement(isNot(endsWith('cover.jpg'))));
+    },
+  );
+
+  test('already-compressed page formats are stored without deflate', () async {
+    final service = LocalArchiveService.forTesting(libraryRoot: library.path);
+
+    await service.compress(comic);
+
+    final input = archive_io.InputFileStream(
+      service.archiveFileFor(comic).path,
+    );
+    try {
+      final archive = archive_io.ZipDecoder().decodeStream(input);
+      expect(archive.files, isNotEmpty);
+      expect(
+        archive.files.map((entry) => entry.compression),
+        everyElement(archive_io.CompressionType.none),
+      );
+    } finally {
+      input.closeSync();
+    }
+  });
+
+  test(
     'restore retains ZIP and repeat compression only cleans expansion',
     () async {
       final service = LocalArchiveService.forTesting(libraryRoot: library.path);
@@ -162,6 +201,26 @@ void main() {
         await service.manifestFileFor(comic).readAsString(),
         manifestBefore,
       );
+    },
+  );
+
+  test(
+    'opening repairs missing expanded pages behind a stale marker',
+    () async {
+      final service = LocalArchiveService.forTesting(libraryRoot: library.path);
+      await service.compress(comic);
+      await service.restore(comic);
+      final missingPage = File(
+        '${comicDirectory.path}${Platform.pathSeparator}chapter-1'
+        '${Platform.pathSeparator}1.jpg',
+      );
+      await missingPage.delete();
+
+      final restored = await service.restore(comic);
+
+      expect(missingPage.existsSync(), isTrue);
+      expect(restored.state, LocalStorageState.expanded);
+      expect(service.archiveFileFor(comic).existsSync(), isTrue);
     },
   );
 
@@ -387,6 +446,50 @@ void main() {
     expect(retainedPage.existsSync(), isTrue);
   });
 
+  test(
+    'startup repair preserves a comic with an incomplete archive pair',
+    () async {
+      final dataDirectory = await Directory(
+        '${library.path}${Platform.pathSeparator}repair-data',
+      ).create();
+      App.dataPath = dataDirectory.path;
+      await File(
+        '${dataDirectory.path}${Platform.pathSeparator}local_path',
+      ).writeAsString(library.path);
+      LocalManager.debugResetInstance();
+      final manager = LocalManager();
+      await manager.init();
+      addTearDown(() async {
+        manager.dispose();
+        LocalManager.debugResetInstance();
+        await Future<void>.delayed(const Duration(milliseconds: 100));
+      });
+      final managedComic = LocalComic(
+        id: comic.id,
+        title: comic.title,
+        subtitle: comic.subtitle,
+        tags: comic.tags,
+        directory: comic.directory,
+        chapters: const ComicChapters({'chapter-1': 'Chapter 1'}),
+        cover: comic.cover,
+        comicType: comic.comicType,
+        downloadedChapters: const ['chapter-1'],
+        createdAt: comic.createdAt,
+      );
+      await manager.add(managedComic);
+      final service = LocalArchiveService();
+      await service.compress(managedComic);
+      await service.manifestFileFor(managedComic).delete();
+
+      await manager.repairAllDownloadedStateBatched();
+
+      final retained = manager.find(managedComic.id, managedComic.comicType);
+      expect(retained, isNotNull);
+      expect(retained?.downloadedChapters, const ['chapter-1']);
+      expect(service.archiveFileFor(managedComic).existsSync(), isTrue);
+    },
+  );
+
   test('compression waits for an active writer lease', () async {
     final service = LocalArchiveService.forTesting(libraryRoot: library.path);
     await service.compress(comic);
@@ -419,6 +522,52 @@ void main() {
 
     await expectLater(
       compression,
+      throwsA(isA<LocalArchiveCancelledException>()),
+    );
+    lease.close();
+  });
+
+  test('a busy comic does not block inspection of another comic', () async {
+    final service = LocalArchiveService.forTesting(libraryRoot: library.path);
+    final otherDirectory = await Directory(
+      '${library.path}${Platform.pathSeparator}comic-b',
+    ).create();
+    await File(
+      '${otherDirectory.path}${Platform.pathSeparator}cover.jpg',
+    ).writeAsBytes(const [1, 2, 3]);
+    final otherChapter = await Directory(
+      '${otherDirectory.path}${Platform.pathSeparator}chapter-1',
+    ).create();
+    await File(
+      '${otherChapter.path}${Platform.pathSeparator}1.jpg',
+    ).writeAsBytes(const [4, 5, 6]);
+    final otherComic = LocalComic(
+      id: 'comic-b',
+      title: 'Comic B',
+      subtitle: '',
+      tags: const [],
+      directory: otherDirectory.path,
+      chapters: null,
+      cover: 'cover.jpg',
+      comicType: ComicType.local,
+      downloadedChapters: const [],
+      createdAt: DateTime(2026, 7, 16),
+    );
+    final lease = await service.beginWrite(comic);
+    final token = LocalArchiveCancellationToken();
+    final blockedCompression = service.compress(
+      comic,
+      cancellationToken: token,
+    );
+
+    final otherSnapshot = await service
+        .inspect(otherComic)
+        .timeout(const Duration(seconds: 1));
+
+    expect(otherSnapshot.state, LocalStorageState.loose);
+    token.cancel();
+    await expectLater(
+      blockedCompression,
       throwsA(isA<LocalArchiveCancelledException>()),
     );
     lease.close();
@@ -521,6 +670,42 @@ void main() {
 
     expect(page.existsSync(), isTrue);
     expect(service.archiveFileFor(comic).existsSync(), isFalse);
+  });
+
+  test('same-size same-mtime concurrent edit is never deleted', () async {
+    final service = LocalArchiveService.forTesting(libraryRoot: library.path);
+    final page = File(
+      '${comicDirectory.path}${Platform.pathSeparator}chapter-1'
+      '${Platform.pathSeparator}2.jpg',
+    );
+    final originalStat = await page.stat();
+    final replacement = List<int>.filled(originalStat.size, 42);
+    var replaced = false;
+
+    final compression = service.compress(
+      comic,
+      onProgress: (progress) {
+        if (!replaced &&
+            progress.operation == LocalArchiveOperation.reconcile &&
+            progress.completedFiles == progress.totalFiles) {
+          replaced = true;
+          page.writeAsBytesSync(replacement, flush: true);
+          page.setLastModifiedSync(originalStat.modified);
+        }
+      },
+    );
+
+    await expectLater(compression, throwsA(isA<LocalArchiveException>()));
+    expect(replaced, isTrue);
+    expect(page.existsSync(), isTrue);
+    expect(await page.readAsBytes(), replacement);
+    expect(service.archiveFileFor(comic).existsSync(), isTrue);
+
+    // The retained cleanup marker restores any already-cleaned old pages and
+    // the next attempt rebuilds the ZIP around the authoritative replacement.
+    await service.compress(comic);
+    await service.restore(comic);
+    expect(await page.readAsBytes(), replacement);
   });
 
   test(

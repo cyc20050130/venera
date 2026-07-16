@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:dio/io.dart';
@@ -6,6 +7,7 @@ import 'package:flutter/foundation.dart' show visibleForTesting;
 import 'package:venera/foundation/log.dart';
 import 'package:venera/network/app_dio.dart';
 import 'package:venera/network/proxy.dart';
+import 'package:venera/utils/atomic_file.dart';
 import 'package:venera/utils/ext.dart';
 
 @visibleForTesting
@@ -59,9 +61,17 @@ class FileDownloader {
 
   late List<_DownloadBlock> _blocks;
 
+  String? _resourceValidator;
+
   Future<void> _writeStatus() async {
-    var file = File("$savePath.download");
-    await file.writeAsString(_blocks.map((e) => e.toString()).join("\n"));
+    final file = File("$savePath.download");
+    final header = jsonEncode({
+      'version': 2,
+      'fileSize': _fileSize,
+      'validator': _resourceValidator,
+    });
+    final blocks = _blocks.map((e) => e.toString()).join("\n");
+    await AtomicFileStore(file).writeString('$header\n$blocks');
   }
 
   Future<bool> _readStatus() async {
@@ -70,14 +80,44 @@ class FileDownloader {
       return false;
     }
 
-    var lines = await file.readAsLines();
-    final blocks = _parseDownloadStatusBlocks(lines, _fileSize);
+    List<String> lines;
+    try {
+      lines =
+          await AtomicFileStore(
+            file,
+          ).readParsed((value) => const LineSplitter().convert(value)) ??
+          const [];
+    } catch (_) {
+      lines = const [];
+    }
+    var blockLines = lines;
+    if (lines.isNotEmpty && lines.first.trimLeft().startsWith('{')) {
+      try {
+        final header = jsonDecode(lines.first);
+        if (header is! Map ||
+            header['version'] != 2 ||
+            header['fileSize'] != _fileSize ||
+            header['validator'] != _resourceValidator) {
+          throw const FormatException('Download resource changed');
+        }
+        blockLines = lines.skip(1).toList(growable: false);
+      } catch (_) {
+        await AtomicFileStore(file).delete();
+        return false;
+      }
+    } else if (_resourceValidator != null) {
+      // A legacy resume file cannot prove that its partial bytes belong to the
+      // currently advertised resource.
+      await AtomicFileStore(file).delete();
+      return false;
+    }
+    final blocks = _parseDownloadStatusBlocks(blockLines, _fileSize);
     if (blocks == null) {
       Log.warning(
         "Invalid download status",
         "Discarding corrupted resume state for $savePath",
       );
-      await file.delete();
+      await AtomicFileStore(file).delete();
       return false;
     }
     _blocks = blocks;
@@ -88,8 +128,8 @@ class FileDownloader {
   Future<void> _prepareFile() async {
     var file = File(savePath);
     if (await file.exists()) {
-      if (file.lengthSync() == _fileSize &&
-          File("$savePath.download").existsSync()) {
+      if (await file.length() == _fileSize &&
+          await File("$savePath.download").exists()) {
         _file = await file.open(mode: FileMode.append);
         return;
       } else {
@@ -116,6 +156,10 @@ class FileDownloader {
       throw Exception("Invalid content-length for $url: $length");
     }
     _fileSize = parsedLength;
+    _resourceValidator = selectDownloadResourceValidator(
+      etag: res.headers.value(HttpHeaders.etagHeader),
+      lastModified: res.headers.value(HttpHeaders.lastModifiedHeader),
+    );
 
     await _prepareFile();
 
@@ -279,9 +323,7 @@ class FileDownloader {
       if (_currentBytes >= _fileSize) {
         await _closeFile();
         final statusFile = File("$savePath.download");
-        if (await statusFile.exists()) {
-          await statusFile.delete();
-        }
+        await AtomicFileStore(statusFile).delete();
         resultStream.add(DownloadingStatus(_currentBytes, _fileSize, 0, true));
         await resultStream.close();
         return;
@@ -318,9 +360,7 @@ class FileDownloader {
       }
       await _closeFile();
       final statusFile = File("$savePath.download");
-      if (await statusFile.exists()) {
-        await statusFile.delete();
-      }
+      await AtomicFileStore(statusFile).delete();
 
       // check if download is finished
       if (_currentBytes < _fileSize) {
@@ -401,6 +441,7 @@ class FileDownloader {
         "Range": "bytes=$requestStart-${end - 1}",
         "Accept": "*/*",
         "Accept-Encoding": "identity",
+        if (_resourceValidator != null) "If-Range": _resourceValidator,
       },
       preserveHeaderCase: true,
     );
@@ -426,6 +467,17 @@ class FileDownloader {
         throw Exception(
           "Unexpected response status ${res.statusCode} for range "
           "$requestStart-${end - 1}",
+        );
+      }
+      if (res.statusCode == HttpStatus.partialContent &&
+          !isValidDownloadContentRange(
+            res.headers.value(HttpHeaders.contentRangeHeader),
+            requestStart: requestStart,
+            requestEndExclusive: end,
+            fileSize: _fileSize,
+          )) {
+        throw Exception(
+          'Invalid Content-Range for block $requestStart-${end - 1}',
         );
       }
 
@@ -462,6 +514,48 @@ class FileDownloader {
     _cancelNetworkRequests();
     await _closeFile();
   }
+}
+
+@visibleForTesting
+String? selectDownloadResourceValidator({
+  required String? etag,
+  required String? lastModified,
+}) {
+  final normalizedEtag = etag?.trim();
+  if (normalizedEtag != null &&
+      normalizedEtag.isNotEmpty &&
+      !normalizedEtag.startsWith('W/')) {
+    return normalizedEtag;
+  }
+  final normalizedModified = lastModified?.trim();
+  return normalizedModified == null || normalizedModified.isEmpty
+      ? null
+      : normalizedModified;
+}
+
+@visibleForTesting
+bool isValidDownloadContentRange(
+  String? value, {
+  required int requestStart,
+  required int requestEndExclusive,
+  required int fileSize,
+}) {
+  if (value == null ||
+      requestStart < 0 ||
+      requestEndExclusive <= requestStart ||
+      fileSize < requestEndExclusive) {
+    return false;
+  }
+  final match = RegExp(
+    r'^bytes\s+(\d+)-(\d+)/(\d+)$',
+  ).firstMatch(value.trim().toLowerCase());
+  if (match == null) return false;
+  final start = int.tryParse(match.group(1)!);
+  final endInclusive = int.tryParse(match.group(2)!);
+  final total = int.tryParse(match.group(3)!);
+  return start == requestStart &&
+      endInclusive == requestEndExclusive - 1 &&
+      total == fileSize;
 }
 
 @visibleForTesting
