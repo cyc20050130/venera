@@ -1,16 +1,9 @@
 import 'package:flutter_test/flutter_test.dart';
-import 'package:sqlite3/open.dart';
 import 'package:sqlite3/sqlite3.dart';
 import 'package:venera/foundation/favorites.dart';
 import 'package:venera/pages/favorites/favorites_page.dart';
 
-import 'test_native_paths.dart';
-
 void main() {
-  setUpAll(() {
-    open.overrideFor(OperatingSystem.windows, openTestSqlite);
-  });
-
   test(
     'normalizeFavoriteFolderSelection tolerates malformed implicit data',
     () {
@@ -86,7 +79,7 @@ void main() {
 
   test('FavoriteItem.fromRow tolerates scalar legacy row values', () {
     final db = sqlite3.openInMemory();
-    addTearDown(db.dispose);
+    addTearDown(db.close);
     db.execute('''
       create table favorites (
         id text,

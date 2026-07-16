@@ -16,7 +16,9 @@ import 'package:venera/pages/reader/reader.dart';
 import 'package:venera/utils/io.dart';
 
 import 'app.dart';
+import 'appdata.dart';
 import 'history.dart';
+import 'local_archive.dart';
 
 dynamic _decodeLocalComicJson(dynamic value) {
   if (value is! String) {
@@ -128,6 +130,43 @@ class LocalComic with HistoryMixin implements Comic {
       ? directory
       : FilePath.join(LocalManager().path, directory);
 
+  /// A lightweight availability check used by synchronous download-state
+  /// queries. Full manifest and ZIP validation happens in
+  /// [LocalArchiveService] before any extraction.
+  bool get hasArchiveOnDisk =>
+      File(
+        FilePath.join(
+          baseDir,
+          LocalArchiveService.metadataDirectoryName,
+          LocalArchiveService.archiveFileName,
+        ),
+      ).existsSync() &&
+      File(
+        FilePath.join(
+          baseDir,
+          LocalArchiveService.metadataDirectoryName,
+          LocalArchiveService.manifestFileName,
+        ),
+      ).existsSync();
+
+  /// Also detects an interrupted or corrupt metadata pair. Writers and the
+  /// reader must not silently bypass one half of an archive transaction.
+  bool get hasArchiveMetadataOnDisk =>
+      File(
+        FilePath.join(
+          baseDir,
+          LocalArchiveService.metadataDirectoryName,
+          LocalArchiveService.archiveFileName,
+        ),
+      ).existsSync() ||
+      File(
+        FilePath.join(
+          baseDir,
+          LocalArchiveService.metadataDirectoryName,
+          LocalArchiveService.manifestFileName,
+        ),
+      ).existsSync();
+
   @override
   String get description => "";
 
@@ -152,8 +191,26 @@ class LocalComic with HistoryMixin implements Comic {
   @override
   int? get maxPage => null;
 
-  void read() {
-    var history = HistoryManager().find(id, comicType);
+  Future<void> read() async {
+    // Capture the exact persisted progress before doing any filesystem work.
+    // Archive expansion never rewrites History, but keeping this reference
+    // also protects navigation from unrelated refreshes while awaiting I/O.
+    final history = HistoryManager().find(id, comicType);
+    if (hasArchiveMetadataOnDisk) {
+      try {
+        await LocalArchiveService().restore(this);
+      } catch (error, stackTrace) {
+        Log.error(
+          'LocalArchive',
+          'Failed to restore archived comic $sourceKey@$id: $error',
+          stackTrace,
+        );
+        App.rootContext.showMessage(
+          message: 'Failed to restore archived comic: $error',
+        );
+        return;
+      }
+    }
     int? firstDownloadedChapter;
     int? firstDownloadedChapterGroup;
     if (downloadedChapters.isNotEmpty && chapters != null) {
@@ -243,6 +300,34 @@ class LocalManager with ChangeNotifier {
   Future<void> Function()? debugBeforeDownloadingTasksSnapshotWrite;
 
   Directory get directory => Directory(path);
+
+  /// Restores an app-managed archive and atomically marks it dirty before a
+  /// downloader or deletion path mutates its loose files.
+  Future<void> prepareComicForWrite(LocalComic comic) async {
+    if (!comic.hasArchiveMetadataOnDisk) {
+      return;
+    }
+    await LocalArchiveService().prepareForWrite(comic);
+    notifyListeners();
+  }
+
+  Future<void> prepareComicForWriteById(String id, ComicType type) async {
+    final comic = find(id, type);
+    if (comic != null) {
+      await prepareComicForWrite(comic);
+    }
+  }
+
+  Future<LocalArchiveWriteLease?> beginComicWriteById(
+    String id,
+    ComicType type,
+  ) async {
+    final comic = find(id, type);
+    if (comic == null) return null;
+    final lease = await LocalArchiveService().beginWrite(comic);
+    notifyListeners();
+    return lease;
+  }
 
   void _checkNoMedia() {
     if (App.isAndroid) {
@@ -474,7 +559,7 @@ class LocalManager with ChangeNotifier {
     _saveDownloadingTasksTimer?.cancel();
     saveCurrentDownloadingTasksInBackground(reason: 'dispose');
     super.dispose();
-    _db.dispose();
+    _db.close();
   }
 
   List<LocalComic> getRecent() {
@@ -524,6 +609,12 @@ class LocalManager with ChangeNotifier {
       throw "Invalid ep";
     }
     var comic = find(id, type) ?? (throw "Comic Not Found");
+    if (comic.hasArchiveMetadataOnDisk) {
+      // Reading and exports share this path, so both transparently expand an
+      // archived comic while retaining the ZIP and its reading identity.
+      await LocalArchiveService().restore(comic);
+      comic = find(id, type) ?? comic;
+    }
     var directory = Directory(comic.baseDir);
     if (comic.hasChapters) {
       var cid = ep is int
@@ -667,7 +758,12 @@ class LocalManager with ChangeNotifier {
   ) async {
     var comic = find(id, type);
     if (comic != null) {
-      return Directory(FilePath.join(path, comic.directory));
+      if (!LocalArchiveService().canManage(comic)) {
+        throw const LocalArchiveException(
+          'Refusing to write into a comic outside the managed local library',
+        );
+      }
+      return Directory(comic.baseDir);
     }
     const comicDirectoryMaxLength = 80;
     if (name.length > comicDirectoryMaxLength) {
@@ -678,11 +774,41 @@ class LocalManager with ChangeNotifier {
   }
 
   void completeTask(DownloadTask task) {
-    add(task.toLocalComic());
+    final completedComic = task.toLocalComic();
+    add(completedComic);
     downloadingTasks.remove(task);
     notifyListeners();
     saveCurrentDownloadingTasksInBackground(reason: 'complete task');
     downloadingTasks.firstOrNull?.resume();
+    if (appdata.settings.boolValue('autoCompressDownloads', fallback: true)) {
+      // Compression uses the archive service's serialized queue. Deliberately
+      // do not await it here: the next download can start immediately, and an
+      // archive failure must never turn a successful download into a failure.
+      unawaited(_autoCompressCompletedComic(completedComic));
+    }
+  }
+
+  Future<void> _autoCompressCompletedComic(LocalComic completedComic) async {
+    try {
+      final comic = find(completedComic.id, completedComic.comicType);
+      if (comic == null || !LocalArchiveService().canManage(comic)) {
+        return;
+      }
+      final result = await LocalArchiveService().compress(comic);
+      Log.info(
+        'LocalArchive',
+        'Auto-compressed ${comic.sourceKey}@${comic.id}: '
+            '${result.archiveBytes} bytes, saved ${result.savedBytes} bytes',
+      );
+      notifyListeners();
+    } catch (error, stackTrace) {
+      Log.error(
+        'LocalArchive',
+        'Auto-compression failed for '
+            '${completedComic.sourceKey}@${completedComic.id}: $error',
+        stackTrace,
+      );
+    }
   }
 
   void removeTask(DownloadTask task) {
@@ -1035,8 +1161,8 @@ class LocalManager with ChangeNotifier {
   }
 
   void deleteComic(LocalComic c, [bool removeFileOnDisk = true]) {
-    if (removeFileOnDisk) {
-      var dir = Directory(FilePath.join(path, c.directory));
+    if (removeFileOnDisk && LocalArchiveService().canManage(c)) {
+      var dir = Directory(c.baseDir);
       dir.deleteIgnoreError(recursive: true);
     }
     // Deleting a local comic means that it's no longer available, thus both favorite and history should be deleted.
@@ -1053,13 +1179,46 @@ class LocalManager with ChangeNotifier {
     notifyListeners();
   }
 
-  void deleteComicChapters(LocalComic c, List<String> chapters) {
+  Future<void> deleteComicChapters(LocalComic c, List<String> chapters) async {
     if (chapters.isEmpty) {
       return;
     }
     var newDownloadedChapters = c.downloadedChapters
         .where((e) => !chapters.contains(e))
         .toList();
+    // Record every requested target before preparing the archive, but do not
+    // filter by existence yet: an archived comic intentionally has no loose
+    // chapter directories until runPreparedMutation restores them.
+    final shouldRemovedDirs = chapters
+        .map(
+          (chapter) => Directory(
+            FilePath.join(c.baseDir, getChapterDirectoryName(chapter)),
+          ),
+        )
+        .toList(growable: false);
+    Future<void> deleteChapterDirectories() async {
+      for (final directory in shouldRemovedDirs) {
+        if (await directory.exists()) {
+          await directory.delete(recursive: true);
+        }
+      }
+    }
+
+    // Expanding first prevents a partial chapter deletion from being undone
+    // by a later restore of the retained ZIP. Keep the short deletion inside
+    // the archive queue so compression cannot clear the dirty marker between
+    // preparation and the actual filesystem mutation.
+    if (c.hasArchiveMetadataOnDisk) {
+      await LocalArchiveService().runPreparedMutation(
+        c,
+        deleteChapterDirectories,
+      );
+    } else {
+      await deleteChapterDirectories();
+    }
+    // Commit downloaded-state changes only after the filesystem deletion has
+    // succeeded, otherwise repair could erase progress based on a half-failed
+    // operation.
     if (newDownloadedChapters.isNotEmpty) {
       _db.execute(
         'UPDATE comics SET downloadedChapters = ? WHERE id = ? AND comic_type = ?;',
@@ -1070,18 +1229,6 @@ class LocalManager with ChangeNotifier {
         c.id,
         c.comicType.value,
       ]);
-    }
-    var shouldRemovedDirs = <Directory>[];
-    for (var chapter in chapters) {
-      var dir = Directory(
-        FilePath.join(c.baseDir, getChapterDirectoryName(chapter)),
-      );
-      if (dir.existsSync()) {
-        shouldRemovedDirs.add(dir);
-      }
-    }
-    if (shouldRemovedDirs.isNotEmpty) {
-      _deleteDirectories(shouldRemovedDirs);
     }
     notifyListeners();
   }
@@ -1099,8 +1246,8 @@ class LocalManager with ChangeNotifier {
     _db.execute('BEGIN TRANSACTION;');
     try {
       for (var c in comics) {
-        if (removeFileOnDisk) {
-          var dir = Directory(FilePath.join(path, c.directory));
+        if (removeFileOnDisk && LocalArchiveService().canManage(c)) {
+          var dir = Directory(c.baseDir);
           if (dir.existsSync()) {
             shouldRemovedDirs.add(dir);
           }
@@ -1173,6 +1320,12 @@ class LocalManager with ChangeNotifier {
   }
 
   static bool _chapterDirectoryHasImages(LocalComic comic, String chapterId) {
+    // Archived chapters are still downloaded. Treating the intentionally
+    // absent loose directory as corruption would otherwise delete the comic
+    // row and its reading progress during startup repair.
+    if (comic.hasArchiveOnDisk) {
+      return true;
+    }
     var dir = Directory(
       FilePath.join(comic.baseDir, getChapterDirectoryName(chapterId)),
     );

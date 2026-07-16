@@ -3,13 +3,10 @@ import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:flutter_test/flutter_test.dart';
-import 'package:sqlite3/open.dart';
 import 'package:venera/foundation/app.dart';
 import 'package:venera/foundation/cache_manager.dart';
 import 'package:venera/foundation/comic_source/comic_source.dart';
 import 'package:venera/network/images.dart';
-
-import 'test_native_paths.dart';
 
 void main() {
   late Directory tempDir;
@@ -18,10 +15,6 @@ void main() {
   late Uri imageUri;
   late Uri slowImageUri;
   int requestCount = 0;
-
-  setUpAll(() {
-    open.overrideFor(OperatingSystem.windows, openTestSqlite);
-  });
 
   setUp(() async {
     ImageDownloader.debugResetReaderImageScheduling();

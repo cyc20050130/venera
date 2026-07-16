@@ -1,20 +1,13 @@
 import 'dart:io';
 
 import 'package:flutter_test/flutter_test.dart';
-import 'package:sqlite3/open.dart';
 import 'package:sqlite3/sqlite3.dart';
 import 'package:venera/foundation/app.dart';
 import 'package:venera/foundation/cache_manager.dart';
 
-import 'test_native_paths.dart';
-
 void main() {
   late Directory tempDir;
   late Directory tempCacheDir;
-
-  setUpAll(() {
-    open.overrideFor(OperatingSystem.windows, openTestSqlite);
-  });
 
   setUp(() async {
     tempDir = await Directory.systemTemp.createTemp('venera-cache-test-');
@@ -45,7 +38,7 @@ void main() {
     final rows = verifyDb.select(
       "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'cache';",
     );
-    verifyDb.dispose();
+    verifyDb.close();
 
     expect(rows, isNotEmpty);
     expect(manager.currentSize, greaterThanOrEqualTo(0));
@@ -88,7 +81,7 @@ void main() {
 
     final db = sqlite3.open('${tempDir.path}/cache.db');
     final rows = db.select('SELECT COUNT(*) AS count FROM cache;');
-    db.dispose();
+    db.close();
 
     expect(rows.first['count'], 0);
   });
@@ -121,7 +114,7 @@ void main() {
         null,
       ],
     );
-    db.dispose();
+    db.close();
 
     final manager = CacheManager();
     final cached = await manager.findCache('cover-key');
@@ -152,7 +145,7 @@ void main() {
       'INSERT INTO cache (key, dir, name, expires, type) VALUES (?, ?, ?, ?, ?)',
       ['broken-key', '0', 'cached-file', 'not-an-int', null],
     );
-    db.dispose();
+    db.close();
 
     final manager = CacheManager();
     final cached = await manager.findCache('broken-key');
@@ -163,7 +156,7 @@ void main() {
     final rows = verifyDb.select('SELECT key FROM cache WHERE key = ?;', [
       'broken-key',
     ]);
-    verifyDb.dispose();
+    verifyDb.close();
 
     expect(rows, isEmpty);
   });
@@ -194,7 +187,7 @@ void main() {
         null,
       ],
     );
-    db.dispose();
+    db.close();
 
     final manager = CacheManager();
     await manager.checkCache();
@@ -206,7 +199,7 @@ void main() {
     final rows = verifyDb.select('SELECT key FROM cache WHERE key = ?;', [
       'escape-key',
     ]);
-    verifyDb.dispose();
+    verifyDb.close();
 
     expect(rows, isEmpty);
   });
@@ -279,7 +272,7 @@ void main() {
       'SELECT COUNT(*) AS count FROM cache WHERE key = ?;',
       ['same-key'],
     );
-    db.dispose();
+    db.close();
 
     expect(rows.first['count'], 1);
     expect(manager.currentSize, 100 * 1024);
@@ -304,7 +297,7 @@ void main() {
     await Future<void>.delayed(const Duration(milliseconds: 10));
     final secondHit = await manager.findCache('touch-key');
     final thirdExpires = expires();
-    db.dispose();
+    db.close();
 
     expect(firstHit, isNotNull);
     expect(secondHit, isNotNull);

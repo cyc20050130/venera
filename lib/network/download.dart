@@ -509,37 +509,55 @@ class ImagesDownloadTask extends DownloadTask with _TransferSpeedMixin {
         await LocalManager().saveCurrentDownloadingTasksNow();
       }
 
-      while (_chapter < _images!.length) {
-        var images = _images![_images!.keys.elementAt(_chapter)]!;
-        tasks.clear();
-        var chapterFailed = false;
-        while (_index < images.length) {
-          _scheduleTasks();
-          var task = tasks[_index]!;
-          await task.wait();
-          if (isPaused) {
-            return;
-          }
-          if (task.error != null) {
-            Log.error("Download", task.error.toString());
-            if (comic?.chapters == null) {
-              _setError("Error: ${task.error}");
+      final writeLease = _chapter < _images!.length
+          ? await LocalManager().beginComicWriteById(id, comicType)
+          : null;
+      if (_chapter < _images!.length) {
+        // Restore only when page writes are actually about to begin. This
+        // avoids doubling storage while a resumed task is still fetching
+        // metadata or waiting on the network. The lease also keeps a manual
+        // compression from snapshotting only part of the active download.
+        if (!_isRunning) {
+          writeLease?.close();
+          return;
+        }
+      }
+
+      try {
+        while (_chapter < _images!.length) {
+          var images = _images![_images!.keys.elementAt(_chapter)]!;
+          tasks.clear();
+          var chapterFailed = false;
+          while (_index < images.length) {
+            _scheduleTasks();
+            var task = tasks[_index]!;
+            await task.wait();
+            if (isPaused) {
               return;
             }
-            await _markCurrentChapterFailed();
-            chapterFailed = true;
-            break;
+            if (task.error != null) {
+              Log.error("Download", task.error.toString());
+              if (comic?.chapters == null) {
+                _setError("Error: ${task.error}");
+                return;
+              }
+              await _markCurrentChapterFailed();
+              chapterFailed = true;
+              break;
+            }
+            _index++;
+            _downloadedCount++;
+            _message = "$_downloadedCount/$_totalCount";
+            await LocalManager().scheduleSaveCurrentDownloadingTasks();
           }
-          _index++;
-          _downloadedCount++;
-          _message = "$_downloadedCount/$_totalCount";
-          await LocalManager().scheduleSaveCurrentDownloadingTasks();
+          _index = 0;
+          if (!chapterFailed) {
+            _markCurrentChapterDownloaded();
+          }
+          _chapter++;
         }
-        _index = 0;
-        if (!chapterFailed) {
-          _markCurrentChapterDownloaded();
-        }
-        _chapter++;
+      } finally {
+        writeLease?.close();
       }
 
       if (_failedChapters.isNotEmpty) {
@@ -910,6 +928,7 @@ class ArchiveDownloadTask extends DownloadTask {
   }
 
   FileDownloader? _downloader;
+  Future<void>? _activeExtraction;
 
   String _message = "Fetching comic info...";
 
@@ -932,7 +951,16 @@ class ArchiveDownloadTask extends DownloadTask {
   void cancel() async {
     _isRunning = false;
     await _downloader?.stop();
-    if (path != null) {
+    final extraction = _activeExtraction;
+    if (extraction != null) {
+      try {
+        await extraction;
+      } catch (_) {
+        // The resume path owns extraction error reporting.
+      }
+    }
+    final existing = LocalManager().find(id, comicType);
+    if (path != null && existing == null) {
       Directory(path!).deleteIgnoreError(recursive: true);
     }
     path = null;
@@ -1042,16 +1070,37 @@ class ArchiveDownloadTask extends DownloadTask {
         }
 
         try {
-          await _extractArchive(
-            archiveFile.path,
-            path!,
-            operationId: operationId,
+          // Preserve the old archive and mark its expanded tree dirty only
+          // after the replacement archive is fully downloaded and immediately
+          // before files are extracted into the comic directory.
+          final writeLease = await LocalManager().beginComicWriteById(
+            id,
+            comicType,
           );
+          if (!_isRunning) {
+            writeLease?.close();
+            return;
+          }
+          try {
+            final extraction = _extractArchive(
+              archiveFile.path,
+              path!,
+              operationId: operationId,
+            );
+            _activeExtraction = extraction;
+            await extraction;
+          } finally {
+            _activeExtraction = null;
+            writeLease?.close();
+          }
         } catch (e) {
           _setError("Failed to extract archive: $e");
           return;
         }
 
+        if (!_isRunning) {
+          return;
+        }
         LocalManager().completeTask(this);
       } finally {
         await archiveFile.deleteIgnoreError();

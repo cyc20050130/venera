@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:collection';
+import 'dart:typed_data';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter_qjs/flutter_qjs.dart';
@@ -120,7 +121,6 @@ abstract class ImageDownloader {
   static int _activeForegroundThumbnailLoadingCount = 0;
   static int _consecutiveForegroundThumbnailSlots = 0;
 
-  static const _kReaderPrefetchPollInterval = Duration(milliseconds: 16);
   static const _kMaxConcurrentReaderPrefetches = 1;
   static const _kReaderLifecycleResumeQuietWindow = Duration(milliseconds: 900);
 
@@ -133,6 +133,7 @@ abstract class ImageDownloader {
   static int _activeReaderForegroundLoads = 0;
   static int _activeReaderSameChapterPrefetchLoads = 0;
   static int _activeReaderNextChapterPrefetchLoads = 0;
+  static Completer<void>? _readerSchedulerSignal;
 
   @visibleForTesting
   static Stream<ImageDownloadProgress> Function(
@@ -386,10 +387,10 @@ abstract class ImageDownloader {
       final expectedBytes = normalizeImageResponseContentLength(
         body.contentLength,
       );
-      var buffer = <int>[];
+      final buffer = BytesBuilder(copy: false);
       await for (var data in stream) {
         checkStop();
-        buffer.addAll(data);
+        buffer.add(data);
         if (expectedBytes != null) {
           yield ImageDownloadProgress(
             currentBytes: buffer.length,
@@ -398,16 +399,17 @@ abstract class ImageDownloader {
         }
       }
 
+      List<int> imageBytes = buffer.takeBytes();
+
       if (configs['onResponse'] is JSInvokable) {
-        final uint8List = Uint8List.fromList(buffer);
         final onResponse = configs['onResponse'] as JSInvokable;
         final processedBytes = await runImageOnResponseCallback(
-          () => onResponse([uint8List]),
+          () => onResponse([_asUint8List(imageBytes)]),
           release: onResponse.free,
           label: 'thumbnail',
         );
         if (processedBytes != null) {
-          buffer = processedBytes;
+          imageBytes = processedBytes;
         } else {
           Log.warning(
             "Network",
@@ -416,15 +418,16 @@ abstract class ImageDownloader {
         }
       }
 
-      if (buffer.isEmpty) {
+      if (imageBytes.isEmpty) {
         throw "Error: Empty response body.";
       }
+      final resultBytes = _asUint8List(imageBytes);
       _logThumbnailPerf('cover network complete', cacheKey);
-      await _writeThumbnailCache(cacheKey, buffer);
+      await _writeThumbnailCache(cacheKey, resultBytes);
       yield ImageDownloadProgress(
-        currentBytes: buffer.length,
-        totalBytes: buffer.length,
-        imageBytes: Uint8List.fromList(buffer),
+        currentBytes: resultBytes.length,
+        totalBytes: resultBytes.length,
+        imageBytes: resultBytes,
       );
     } finally {
       stopPoller?.cancel();
@@ -663,11 +666,12 @@ abstract class ImageDownloader {
     if (requestedPriority == ReaderImageLoadPriority.foregroundVisible ||
         !_readerImagePriorities.containsKey(cacheKey)) {
       _readerImagePriorities[cacheKey] = requestedPriority;
+      _notifyReaderScheduler();
     }
     final existing = _loadingImages[cacheKey];
     if (existing != null) {
       if (existing.isClosed) {
-        _removeReaderImageLoadState(cacheKey);
+        _finishReaderImageLoad(cacheKey);
       } else {
         if (requestedPriority == ReaderImageLoadPriority.foregroundVisible) {
           _promoteReaderImageLoad(
@@ -684,7 +688,8 @@ abstract class ImageDownloader {
       }
     }
     final cancelToken = CancelToken();
-    final stream = _StreamWrapper<ImageDownloadProgress>(
+    late final _StreamWrapper<ImageDownloadProgress> stream;
+    stream = _StreamWrapper<ImageDownloadProgress>(
       _createReaderImageLoad(
         imageKey,
         sourceKey,
@@ -693,7 +698,11 @@ abstract class ImageDownloader {
         cancelToken: cancelToken,
         cacheStrategy: cacheStrategy,
       ),
-      (wrapper) => _removeReaderImageLoadState(cacheKey),
+      (wrapper) {
+        if (_loadingImages[cacheKey] == wrapper) {
+          _removeReaderImageLoadState(cacheKey);
+        }
+      },
       beforeListen: () async {
         if (requestedPriority == ReaderImageLoadPriority.foregroundVisible) {
           _cancelReaderLoadsWhere(
@@ -701,10 +710,16 @@ abstract class ImageDownloader {
             excludeCacheKey: cacheKey,
           );
         }
-        await _waitForReaderImageTurn(cacheKey);
+        await _acquireReaderImageTurn(
+          cacheKey,
+          isCurrent: () => _loadingImages[cacheKey] == stream,
+        );
       },
-      onListenStart: () => _markReaderImageStarted(cacheKey),
-      onListenFinish: () => _markReaderImageFinished(cacheKey),
+      onListenFinish: (wrapper) {
+        if (_loadingImages[cacheKey] == wrapper) {
+          _markReaderImageFinished(cacheKey);
+        }
+      },
       onCancel: () => cancelToken.cancel('reader image request cancelled'),
       keepAliveWithoutListeners:
           requestedPriority != ReaderImageLoadPriority.foregroundVisible,
@@ -736,13 +751,14 @@ abstract class ImageDownloader {
     final existing = _loadingImages[cacheKey];
     if (existing != null) {
       if (existing.isClosed) {
-        _removeReaderImageLoadState(cacheKey);
+        _finishReaderImageLoad(cacheKey);
       } else {
         return;
       }
     }
     final cancelToken = CancelToken();
-    final stream = _StreamWrapper<ImageDownloadProgress>(
+    late final _StreamWrapper<ImageDownloadProgress> stream;
+    stream = _StreamWrapper<ImageDownloadProgress>(
       _createReaderImageLoad(
         imageKey,
         sourceKey,
@@ -751,10 +767,20 @@ abstract class ImageDownloader {
         cancelToken: cancelToken,
         cacheStrategy: ComicImageCacheStrategy.cacheHitIsTerminal,
       ),
-      (wrapper) => _removeReaderImageLoadState(cacheKey),
-      beforeListen: () => _waitForReaderImageTurn(cacheKey),
-      onListenStart: () => _markReaderImageStarted(cacheKey),
-      onListenFinish: () => _markReaderImageFinished(cacheKey),
+      (wrapper) {
+        if (_loadingImages[cacheKey] == wrapper) {
+          _removeReaderImageLoadState(cacheKey);
+        }
+      },
+      beforeListen: () => _acquireReaderImageTurn(
+        cacheKey,
+        isCurrent: () => _loadingImages[cacheKey] == stream,
+      ),
+      onListenFinish: (wrapper) {
+        if (_loadingImages[cacheKey] == wrapper) {
+          _markReaderImageFinished(cacheKey);
+        }
+      },
       onCancel: () => cancelToken.cancel('reader image request cancelled'),
       keepAliveWithoutListeners: true,
     );
@@ -814,6 +840,7 @@ abstract class ImageDownloader {
   @visibleForTesting
   static void debugSetReaderLifecycleQuietUntil(DateTime? quietUntil) {
     _readerLifecycleQuietUntil = quietUntil;
+    _notifyReaderScheduler();
   }
 
   @visibleForTesting
@@ -847,6 +874,7 @@ abstract class ImageDownloader {
       cacheKey,
       ReaderImageLoadPriority.foregroundVisible,
     );
+    _notifyReaderScheduler();
   }
 
   static void markReaderImagePrefetch(
@@ -866,6 +894,7 @@ abstract class ImageDownloader {
     if (activePriority == null || priority.index < activePriority.index) {
       _readerImagePriorities[cacheKey] = priority;
     }
+    _notifyReaderScheduler();
   }
 
   static Stream<ImageDownloadProgress> _createReaderImageLoad(
@@ -891,17 +920,22 @@ abstract class ImageDownloader {
     );
   }
 
-  static Future<void> _waitForReaderImageTurn(String cacheKey) async {
+  static Future<void> _acquireReaderImageTurn(
+    String cacheKey, {
+    required bool Function() isCurrent,
+  }) async {
     while (true) {
-      final priority = _readerImagePriorities[cacheKey];
-      if (priority == null ||
-          priority == ReaderImageLoadPriority.foregroundVisible) {
+      if (!isCurrent()) {
         return;
       }
-      if (shouldDeferReaderImageLoadForLifecycle(priority)) {
-        await Future.delayed(_kReaderPrefetchPollInterval);
-        continue;
+      final priority = _readerImagePriorities[cacheKey];
+      if (priority == null) {
+        return;
       }
+      final quietRemaining =
+          priority == ReaderImageLoadPriority.foregroundVisible
+          ? Duration.zero
+          : readerLifecycleQuietRemaining;
       final totalPrefetchLoads =
           _activeReaderSameChapterPrefetchLoads +
           _activeReaderNextChapterPrefetchLoads;
@@ -911,12 +945,30 @@ abstract class ImageDownloader {
             ReaderImageLoadPriority.sameChapterPrefetch,
             excludeCacheKey: cacheKey,
           );
-      if (_activeReaderForegroundLoads == 0 &&
-          totalPrefetchLoads < _kMaxConcurrentReaderPrefetches &&
-          !hasCompetingSameChapterWork) {
+      final canStart =
+          priority == ReaderImageLoadPriority.foregroundVisible ||
+          (quietRemaining == Duration.zero &&
+              _activeReaderForegroundLoads == 0 &&
+              totalPrefetchLoads < _kMaxConcurrentReaderPrefetches &&
+              !hasCompetingSameChapterWork);
+      if (canStart) {
+        _markReaderImageStarted(cacheKey);
         return;
       }
-      await Future.delayed(_kReaderPrefetchPollInterval);
+      final signal = _readerSchedulerSignal ??= Completer<void>();
+      if (quietRemaining > Duration.zero) {
+        await Future.any([signal.future, Future<void>.delayed(quietRemaining)]);
+      } else {
+        await signal.future;
+      }
+    }
+  }
+
+  static void _notifyReaderScheduler() {
+    final signal = _readerSchedulerSignal;
+    _readerSchedulerSignal = null;
+    if (signal != null && !signal.isCompleted) {
+      signal.complete();
     }
   }
 
@@ -938,6 +990,7 @@ abstract class ImageDownloader {
   static void _markReaderImageFinished(String cacheKey) {
     final priority = _activeReaderImageKinds.remove(cacheKey);
     _decrementActiveReaderLoadCount(priority);
+    _notifyReaderScheduler();
   }
 
   static void _resetReaderImageSchedulingState({
@@ -950,6 +1003,7 @@ abstract class ImageDownloader {
     _activeReaderSameChapterPrefetchLoads = 0;
     _activeReaderNextChapterPrefetchLoads = 0;
     _readerLifecycleQuietUntil = null;
+    _notifyReaderScheduler();
     if (resetDebugLoader) {
       debugReaderImageLoader = null;
     }
@@ -1034,36 +1088,32 @@ abstract class ImageDownloader {
         final expectedBytes = normalizeImageResponseContentLength(
           body.contentLength,
         );
-        var buffer = <int>[];
+        final buffer = BytesBuilder(copy: false);
         await for (var data in stream) {
-          buffer.addAll(data);
+          buffer.add(data);
           yield ImageDownloadProgress(
             currentBytes: buffer.length,
             totalBytes: expectedBytes,
           );
         }
 
+        List<int> responseBytes = buffer.takeBytes();
+
         final rawOnResponse = configs['onResponse'];
         if (rawOnResponse is JSInvokable) {
           final processedBytes = await runImageOnResponseCallback(
-            () => rawOnResponse([Uint8List.fromList(buffer)]),
+            () => rawOnResponse([_asUint8List(responseBytes)]),
             release: rawOnResponse.free,
             label: 'reader',
           );
           if (processedBytes != null) {
-            buffer = processedBytes;
+            responseBytes = processedBytes;
           } else {
             Log.warning("Network", "Ignoring invalid reader onResponse result");
           }
         }
 
-        Uint8List data;
-        if (buffer is Uint8List) {
-          data = buffer;
-        } else {
-          data = Uint8List.fromList(buffer);
-          buffer.clear();
-        }
+        var data = _asUint8List(responseBytes);
 
         if (configs['modifyImage'] != null) {
           var newData = await modifyImageWithScript(
@@ -1144,15 +1194,21 @@ abstract class ImageDownloader {
     String cacheKey,
     ReaderImageLoadPriority targetPriority,
   ) {
+    var changed = false;
     final storedPriority = _readerImagePriorities[cacheKey];
     if (storedPriority == null || targetPriority.index < storedPriority.index) {
       _readerImagePriorities[cacheKey] = targetPriority;
+      changed = true;
     }
     final activePriority = _activeReaderImageKinds[cacheKey];
     if (activePriority != null && targetPriority.index < activePriority.index) {
       _decrementActiveReaderLoadCount(activePriority);
       _activeReaderImageKinds[cacheKey] = targetPriority;
       _incrementActiveReaderLoadCount(targetPriority);
+      changed = true;
+    }
+    if (changed) {
+      _notifyReaderScheduler();
     }
   }
 
@@ -1221,6 +1277,7 @@ abstract class ImageDownloader {
     _readerImagePriorities.remove(cacheKey);
     _activeReaderImageKinds.remove(cacheKey);
     _pendingReaderPrefetchRequests.remove(cacheKey);
+    _notifyReaderScheduler();
   }
 
   static void _finishReaderImageLoad(String cacheKey) {
@@ -1244,6 +1301,10 @@ abstract class ImageDownloader {
   }
 }
 
+Uint8List _asUint8List(List<int> bytes) {
+  return bytes is Uint8List ? bytes : Uint8List.fromList(bytes);
+}
+
 /// A wrapper class for a stream that
 /// allows multiple listeners to listen to the same stream.
 class _StreamWrapper<T> {
@@ -1253,8 +1314,7 @@ class _StreamWrapper<T> {
 
   final void Function(_StreamWrapper<T> wrapper) onClosed;
   final Future<void> Function()? beforeListen;
-  final void Function()? onListenStart;
-  final void Function()? onListenFinish;
+  final void Function(_StreamWrapper<T> wrapper)? onListenFinish;
   final void Function()? onCancel;
   final void Function()? onNoListeners;
   final bool keepAliveWithoutListeners;
@@ -1271,7 +1331,6 @@ class _StreamWrapper<T> {
     this._stream,
     this.onClosed, {
     this.beforeListen,
-    this.onListenStart,
     this.onListenFinish,
     this.onCancel,
     this.onNoListeners,
@@ -1285,7 +1344,6 @@ class _StreamWrapper<T> {
       if (isClosed) {
         return;
       }
-      onListenStart?.call();
       _iterator = StreamIterator(_stream);
       while (!isClosed && await _iterator!.moveNext()) {
         final data = _iterator!.current;
@@ -1319,7 +1377,7 @@ class _StreamWrapper<T> {
         );
       }
       _iterator = null;
-      onListenFinish?.call();
+      onListenFinish?.call(this);
       for (var controller in controllers) {
         if (!controller.isClosed) {
           controller.close();

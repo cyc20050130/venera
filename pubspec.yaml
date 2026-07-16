@@ -2,7 +2,7 @@ name: venera
 description: "A comic app."
 publish_to: 'none'
 
-version: 1.6.29+189
+version: 1.6.30+190
 
 environment:
   sdk: '>=3.8.0 <4.0.0'
@@ -14,8 +14,10 @@ dependencies:
   path_provider: any
   intl: any
   window_manager: ^0.5.1
-  sqlite3: ^2.7.4
-  sqlite3_flutter_libs: ^0.5.30
+  sqlite3: ^3.2.0
+  sqlite_async: ^0.14.3
+  flutter_riverpod: ^3.3.2
+  go_router: ^17.3.0
   flutter_qjs:
     git:
       url: https://github.com/cyc20050130/flutter_qjs

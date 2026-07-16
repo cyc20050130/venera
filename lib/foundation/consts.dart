@@ -4,7 +4,8 @@ const changePoint = 600;
 /// If window width is less than this value, it is considered as tablet.
 ///
 /// If it is more than this value, it is considered as desktop.
-const changePoint2 = 1300;
+/// Expanded layout: persistent labelled navigation and optional two-pane views.
+const changePoint2 = 1024;
 
 /// Default user agent for http requests.
 const webUA =

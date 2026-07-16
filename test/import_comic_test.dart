@@ -1,19 +1,12 @@
 import 'package:flutter_test/flutter_test.dart';
-import 'package:sqlite3/open.dart';
 import 'package:venera/foundation/app.dart';
 import 'package:venera/foundation/local.dart';
 import 'package:venera/utils/import_comic.dart';
 import 'package:venera/utils/io.dart';
 
-import 'test_native_paths.dart';
-
 void main() {
   late Directory tempDir;
   late LocalManager manager;
-
-  setUpAll(() {
-    open.overrideFor(OperatingSystem.windows, openTestSqlite);
-  });
 
   setUp(() async {
     tempDir = await Directory.systemTemp.createTemp('venera-import-comic-');

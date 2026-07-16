@@ -73,7 +73,7 @@ class CacheManager {
       Log.error("CacheManager", "Failed to initialize cache DB: $e", s);
       try {
         try {
-          _db.dispose();
+          _db.close();
         } catch (_) {
           // ignore dispose failure for partially initialized databases
         }
@@ -630,7 +630,7 @@ class CacheManager {
     _initialMaintenanceTimer = null;
     _maintenanceTimer?.cancel();
     _maintenanceTimer = null;
-    _db.dispose();
+    _db.close();
     _currentSize = null;
     _maintenanceScheduled = false;
     _initialMaintenanceScheduled = false;

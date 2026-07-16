@@ -3,12 +3,9 @@ import 'dart:io';
 
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
-import 'package:sqlite3/open.dart';
 import 'package:sqlite3/sqlite3.dart';
 import 'package:venera/foundation/app.dart';
 import 'package:venera/foundation/favorites.dart';
-
-import 'test_native_paths.dart';
 
 const _pathProviderChannel = MethodChannel('plugins.flutter.io/path_provider');
 
@@ -17,7 +14,6 @@ void main() {
 
   setUpAll(() {
     TestWidgetsFlutterBinding.ensureInitialized();
-    open.overrideFor(OperatingSystem.windows, openTestSqlite);
   });
 
   setUp(() async {
@@ -114,7 +110,7 @@ void main() {
         ''',
           ['comic-bad', 'Bad', 'Author', 'bad', '[]', 'cover', '', 1, ''],
         )
-        ..dispose();
+        ..close();
 
       final manager = LocalFavoritesManager();
       await manager.init();
@@ -155,7 +151,7 @@ void main() {
           primary key (id, type)
         );
       ''')
-      ..dispose();
+      ..close();
 
     final manager = LocalFavoritesManager();
     await manager.init();

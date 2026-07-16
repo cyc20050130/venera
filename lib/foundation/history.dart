@@ -6,6 +6,7 @@ import 'dart:math';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:sqlite3/sqlite3.dart';
+import 'package:venera/core/domain/comic_key.dart';
 import 'package:venera/foundation/comic_source/comic_source.dart';
 import 'package:venera/foundation/comic_details_repository.dart';
 import 'package:venera/foundation/comic_type.dart';
@@ -153,6 +154,8 @@ abstract mixin class HistoryMixin {
   HistoryType get historyType;
 
   String get sourceKey;
+
+  ComicKey get comicKey => ComicKey(sourceKey: sourceKey, comicId: id);
 }
 
 class History implements Comic {
@@ -303,7 +306,8 @@ class HistoryManager with ChangeNotifier {
 
   String get _dbPath => "${App.dataPath}/history.db";
 
-  String _cacheKey(String id, String sourceKey) => "$id@$sourceKey";
+  String _cacheKey(String id, String sourceKey) =>
+      ComicKey(sourceKey: sourceKey, comicId: id).storageKey;
 
   String _cacheKeyForHistory(History history) =>
       _cacheKey(history.id, history.sourceKey);
@@ -451,7 +455,7 @@ class HistoryManager with ChangeNotifier {
           newItem.group,
         ]);
       } finally {
-        db.dispose();
+        db.close();
       }
     });
   }
@@ -698,7 +702,7 @@ class HistoryManager with ChangeNotifier {
 
   void close() {
     if (isInitialized) {
-      _db.dispose();
+      _db.close();
     }
     isInitialized = false;
     _cachedHistoryIds = null;

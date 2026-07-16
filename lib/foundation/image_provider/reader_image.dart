@@ -51,6 +51,19 @@ bool shouldEnableCustomImageProcessing(Object? value) {
   return normalizeBoolSetting(value, false);
 }
 
+int? resolveReaderImageDecodeWidth(
+  double logicalWidth,
+  double devicePixelRatio,
+) {
+  if (!logicalWidth.isFinite ||
+      !devicePixelRatio.isFinite ||
+      logicalWidth <= 0 ||
+      devicePixelRatio <= 0) {
+    return null;
+  }
+  return (logicalWidth * devicePixelRatio).round().clamp(1, 1 << 20);
+}
+
 class ReaderImageProvider
     extends BaseImageProvider<image_provider.ReaderImageProvider> {
   /// Image provider for normal image.
@@ -61,6 +74,7 @@ class ReaderImageProvider
     this.eid,
     this.page, {
     this.enableResize = false,
+    this.decodeWidth,
     this.loadPriority = ReaderImageLoadPriority.foregroundVisible,
   });
 
@@ -76,6 +90,11 @@ class ReaderImageProvider
 
   @override
   final bool enableResize;
+
+  final int? decodeWidth;
+
+  @override
+  int? get preferredDecodeWidth => decodeWidth;
 
   final ReaderImageLoadPriority loadPriority;
 
@@ -175,5 +194,6 @@ class ReaderImageProvider
   }
 
   @override
-  String get key => "$imageKey@$sourceKey@$cid@$eid@$enableResize";
+  String get key =>
+      "$imageKey@$sourceKey@$cid@$eid@$enableResize@${decodeWidth ?? ''}";
 }

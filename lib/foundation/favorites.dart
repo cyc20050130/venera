@@ -506,7 +506,7 @@ class LocalFavoritesManager with ChangeNotifier {
       }
       return hashedIds;
     } finally {
-      db.dispose();
+      db.close();
     }
   }
 
@@ -651,7 +651,7 @@ class LocalFavoritesManager with ChangeNotifier {
         """);
         return rows.map((element) => FavoriteItem.fromRow(element)).toList();
       } finally {
-        db.dispose();
+        db.close();
       }
     });
   }
@@ -688,7 +688,7 @@ class LocalFavoritesManager with ChangeNotifier {
         }
         return res.toList();
       } finally {
-        db.dispose();
+        db.close();
       }
     });
   }
@@ -1187,7 +1187,7 @@ class LocalFavoritesManager with ChangeNotifier {
   }
 
   Future<void> clearAll() async {
-    _db.dispose();
+    _db.close();
     File("${App.dataPath}/local_favorite.db").deleteSync();
     await init();
   }
@@ -1609,7 +1609,7 @@ class LocalFavoritesManager with ChangeNotifier {
     if (!_dbOpened) {
       return;
     }
-    _db.dispose();
+    _db.close();
     _dbOpened = false;
   }
 

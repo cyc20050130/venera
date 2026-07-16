@@ -232,7 +232,7 @@ class ImportComic {
     } finally {
       // Keep the local SQLite handle scoped to the import operation. Import can
       // be cancelled or fail on malformed external data.
-      db?.dispose();
+      db?.close();
       controller.close();
     }
     if (cancelled) return false;

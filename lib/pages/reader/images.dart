@@ -1534,6 +1534,8 @@ ImageProvider _createImageProviderFromKey(
       ReaderImageLoadPriority.foregroundVisible,
 }) {
   var reader = context.reader;
+  final enableResize = reader.mode.isContinuous;
+  final mediaQuery = MediaQuery.of(context);
   if (!imageKey.startsWith('file://') &&
       loadPriority == ReaderImageLoadPriority.foregroundVisible) {
     ImageDownloader.markReaderImageVisible(
@@ -1550,9 +1552,13 @@ ImageProvider _createImageProviderFromKey(
     reader.eid,
     page,
     loadPriority: loadPriority,
-    enableResize: reader
-        .mode
-        .isContinuous, // For continuous mode, we need to resize the image to improve performance
+    enableResize: enableResize,
+    decodeWidth: enableResize
+        ? resolveReaderImageDecodeWidth(
+            mediaQuery.size.width,
+            mediaQuery.devicePixelRatio,
+          )
+        : null,
   );
 }
 

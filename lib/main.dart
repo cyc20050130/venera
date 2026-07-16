@@ -1,12 +1,14 @@
 import 'dart:async';
 import 'package:desktop_webview_window/desktop_webview_window.dart';
 import 'package:dynamic_color/dynamic_color.dart';
-import 'package:flex_seed_scheme/flex_seed_scheme.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_localizations/flutter_localizations.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:go_router/go_router.dart';
 import 'package:venera/foundation/bootstrap.dart';
+import 'package:venera/design_system/app_design_system.dart';
 import 'package:venera/foundation/log.dart';
 import 'package:venera/network/images.dart';
 import 'package:venera/pages/auth_page.dart';
@@ -22,6 +24,27 @@ import 'headless.dart';
 
 const Duration _lifecycleDownloadFlushThrottle = Duration(milliseconds: 700);
 const Duration _lifecycleAuthPromptThrottle = Duration(seconds: 2);
+
+abstract final class AppRoutePath {
+  static const bootstrap = '/bootstrap';
+  static const unlock = '/unlock';
+  static const home = '/app';
+}
+
+@visibleForTesting
+String? resolveRootRouteRedirect({
+  required bool phaseAReady,
+  required bool authorizationRequired,
+  required bool startupAuthorized,
+  required String currentLocation,
+}) {
+  final target = !phaseAReady
+      ? AppRoutePath.bootstrap
+      : authorizationRequired && !startupAuthorized
+      ? AppRoutePath.unlock
+      : AppRoutePath.home;
+  return currentLocation == target ? null : target;
+}
 
 @visibleForTesting
 bool shouldRequireAuthorization(Object? value) {
@@ -106,7 +129,7 @@ void main(List<String> args) {
     runZonedGuarded(
       () async {
         WidgetsFlutterBinding.ensureInitialized();
-        runApp(const MyApp());
+        runApp(const ProviderScope(child: MyApp()));
         bootstrapController.start();
         if (App.isDesktop) {
           await windowManager.ensureInitialized();
@@ -148,9 +171,47 @@ class MyApp extends StatefulWidget {
 
 class _MyAppState extends State<MyApp> with WidgetsBindingObserver {
   late final VoidCallback _forceRebuildCallback;
+  late final GoRouter _router;
+  bool _startupAuthorized = false;
 
   @override
   void initState() {
+    super.initState();
+    _router = GoRouter(
+      navigatorKey: App.rootNavigatorKey,
+      initialLocation: AppRoutePath.bootstrap,
+      refreshListenable: Listenable.merge([
+        bootstrapController,
+        appdata.settings,
+      ]),
+      redirect: (context, state) => resolveRootRouteRedirect(
+        phaseAReady: bootstrapController.phaseAReady,
+        authorizationRequired: shouldRequireAuthorization(
+          appdata.settings['authorizationRequired'],
+        ),
+        startupAuthorized: _startupAuthorized,
+        currentLocation: state.uri.path,
+      ),
+      routes: [
+        GoRoute(
+          path: AppRoutePath.bootstrap,
+          builder: (context, state) => const _BootstrapPage(),
+        ),
+        GoRoute(
+          path: AppRoutePath.unlock,
+          builder: (context, state) => AuthPage(
+            onSuccessfulAuth: () {
+              _startupAuthorized = true;
+              _router.go(AppRoutePath.home);
+            },
+          ),
+        ),
+        GoRoute(
+          path: AppRoutePath.home,
+          builder: (context, state) => const MainPage(),
+        ),
+      ],
+    );
     _forceRebuildCallback = forceRebuild;
     App.registerForceRebuild(_forceRebuildCallback);
     SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
@@ -162,7 +223,6 @@ class _MyAppState extends State<MyApp> with WidgetsBindingObserver {
       logBootstrapEvent('first Flutter frame');
       bootstrapController.schedulePostFrameWork();
     });
-    super.initState();
   }
 
   bool isAuthPageActive = false;
@@ -180,6 +240,7 @@ class _MyAppState extends State<MyApp> with WidgetsBindingObserver {
     if (overlay != null) {
       removeAndDisposeOverlayEntry(overlay);
     }
+    _router.dispose();
     super.dispose();
   }
 
@@ -284,7 +345,7 @@ class _MyAppState extends State<MyApp> with WidgetsBindingObserver {
   void _closeAuthPage() {
     final rootContext = App.rootNavigatorKey.currentContext;
     if (rootContext != null && rootContext.mounted) {
-      rootContext.pop();
+      Navigator.of(rootContext).maybePop();
     }
     isAuthPageActive = false;
   }
@@ -337,14 +398,11 @@ class _MyAppState extends State<MyApp> with WidgetsBindingObserver {
         'sans-serif',
       ];
     }
-    return ThemeData(
-      colorScheme: SeedColorScheme.fromSeeds(
-        primaryKey: primary,
-        secondaryKey: secondary,
-        tertiaryKey: tertiary,
-        brightness: brightness,
-        tones: FlexTones.vividBackground(brightness),
-      ),
+    return AppTheme.build(
+      primary: primary,
+      secondary: secondary,
+      tertiary: tertiary,
+      brightness: brightness,
       fontFamily: font,
       fontFamilyFallback: fallback,
     );
@@ -372,12 +430,11 @@ class _MyAppState extends State<MyApp> with WidgetsBindingObserver {
               tertiary = light.tertiary;
             }
             if (!bootstrapController.phaseAReady) {
-              return MaterialApp(
+              return MaterialApp.router(
                 title: "venera",
-                home: const _BootstrapPage(),
+                routerConfig: _router,
                 debugShowCheckedModeBanner: false,
                 theme: getTheme(primary, secondary, tertiary, Brightness.light),
-                navigatorKey: App.rootNavigatorKey,
                 darkTheme: getTheme(
                   primary,
                   secondary,
@@ -463,22 +520,11 @@ class _MyAppState extends State<MyApp> with WidgetsBindingObserver {
                 },
               );
             }
-            final home =
-                shouldRequireAuthorization(
-                  appdata.settings['authorizationRequired'],
-                )
-                ? AuthPage(
-                    onSuccessfulAuth: () {
-                      App.rootContext.toReplacement(() => const MainPage());
-                    },
-                  )
-                : const MainPage();
-            return MaterialApp(
+            return MaterialApp.router(
               title: "venera",
-              home: home,
+              routerConfig: _router,
               debugShowCheckedModeBanner: false,
               theme: getTheme(primary, secondary, tertiary, Brightness.light),
-              navigatorKey: App.rootNavigatorKey,
               darkTheme: getTheme(
                 primary,
                 secondary,

@@ -1,24 +1,17 @@
 import 'dart:io';
 
 import 'package:flutter_test/flutter_test.dart';
-import 'package:sqlite3/open.dart';
 import 'package:sqlite3/sqlite3.dart';
 import 'package:venera/foundation/appdata.dart';
 import 'package:venera/foundation/app.dart';
 import 'package:venera/foundation/favorites.dart';
 import 'package:venera/utils/tags_translation.dart';
 
-import 'test_native_paths.dart';
-
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
 
   late Directory tempDir;
   late Database db;
-
-  setUpAll(() {
-    open.overrideFor(OperatingSystem.windows, openTestSqlite);
-  });
 
   setUp(() async {
     tempDir = await Directory.systemTemp.createTemp('venera-favorites-test-');
@@ -28,7 +21,7 @@ void main() {
   });
 
   tearDown(() async {
-    db.dispose();
+    db.close();
     if (await tempDir.exists()) {
       await tempDir.delete(recursive: true);
     }

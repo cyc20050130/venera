@@ -677,4 +677,144 @@ void main() {
       await second.cancel();
     },
   );
+
+  test('reader prefetch scheduler reserves only one active slot', () async {
+    final starts = <String>[];
+    final controllers = <String, StreamController<ImageDownloadProgress>>{};
+
+    ImageDownloader.debugReaderImageLoader =
+        (
+          String imageKey,
+          String? sourceKey,
+          String cid,
+          String eid, {
+          bool useCache = true,
+        }) {
+          final controller = StreamController<ImageDownloadProgress>();
+          controllers[imageKey] = controller;
+          return (() async* {
+            starts.add(imageKey);
+            yield* controller.stream;
+          })();
+        };
+
+    ImageDownloader.prefetchReaderImage('first', 'source', 'cid', 'eid');
+    ImageDownloader.prefetchReaderImage('second', 'source', 'cid', 'eid');
+    await Future<void>.delayed(const Duration(milliseconds: 60));
+
+    expect(starts, ['first']);
+
+    await controllers['first']!.close();
+    await Future<void>.delayed(const Duration(milliseconds: 60));
+
+    expect(starts, ['first', 'second']);
+    ImageDownloader.cancelReaderPrefetches();
+  });
+
+  test('lifecycle quiet window wakes deferred prefetch once', () async {
+    final starts = <String>[];
+    ImageDownloader.debugReaderImageLoader =
+        (
+          String imageKey,
+          String? sourceKey,
+          String cid,
+          String eid, {
+          bool useCache = true,
+        }) {
+          return (() async* {
+            starts.add(imageKey);
+            yield ImageDownloadProgress(
+              currentBytes: 1,
+              totalBytes: 1,
+              imageBytes: Uint8List.fromList([1]),
+            );
+          })();
+        };
+    ImageDownloader.debugSetReaderLifecycleQuietUntil(
+      DateTime.now().add(const Duration(milliseconds: 80)),
+    );
+
+    ImageDownloader.prefetchReaderImage('deferred', 'source', 'cid', 'eid');
+    await Future<void>.delayed(const Duration(milliseconds: 30));
+    expect(starts, isEmpty);
+
+    await Future<void>.delayed(const Duration(milliseconds: 100));
+    expect(starts, ['deferred']);
+  });
+
+  test(
+    'a cancelled old stream cannot remove its same-key replacement',
+    () async {
+      var starts = 0;
+      final oldCancelFinished = Completer<void>();
+      final replacementController = StreamController<ImageDownloadProgress>();
+
+      ImageDownloader.debugReaderImageLoader =
+          (
+            String imageKey,
+            String? sourceKey,
+            String cid,
+            String eid, {
+            bool useCache = true,
+          }) {
+            starts++;
+            if (starts == 1) {
+              return StreamController<ImageDownloadProgress>(
+                onCancel: () async {
+                  await Future<void>.delayed(const Duration(milliseconds: 80));
+                  if (!oldCancelFinished.isCompleted) {
+                    oldCancelFinished.complete();
+                  }
+                },
+              ).stream;
+            }
+            if (starts == 2) {
+              return replacementController.stream;
+            }
+            return Stream<ImageDownloadProgress>.value(
+              ImageDownloadProgress(
+                currentBytes: 1,
+                totalBytes: 1,
+                imageBytes: Uint8List.fromList([1]),
+              ),
+            );
+          };
+
+      final first = ImageDownloader.loadComicImage(
+        'same-key',
+        'source',
+        'cid',
+        'eid',
+      ).listen((_) {});
+      await Future<void>.delayed(const Duration(milliseconds: 20));
+      await first.cancel();
+
+      final replacement = ImageDownloader.loadComicImage(
+        'same-key',
+        'source',
+        'cid',
+        'eid',
+      ).listen((_) {});
+      await Future<void>.delayed(const Duration(milliseconds: 20));
+      expect(starts, 2);
+
+      await oldCancelFinished.future.timeout(const Duration(seconds: 1));
+      await Future<void>.delayed(const Duration(milliseconds: 20));
+      final sharedReplacement = ImageDownloader.loadComicImage(
+        'same-key',
+        'source',
+        'cid',
+        'eid',
+      ).listen((_) {});
+      await Future<void>.delayed(const Duration(milliseconds: 20));
+
+      expect(starts, 2);
+      await Future.wait([replacement.cancel(), sharedReplacement.cancel()]);
+      await replacementController.close();
+
+      ImageDownloader.prefetchReaderImage('after-race', 'source', 'cid', 'eid');
+      await Future<void>.delayed(const Duration(milliseconds: 60));
+      expect(starts, 3);
+    },
+  );
 }

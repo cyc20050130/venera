@@ -56,6 +56,11 @@ class _AppSettingsState extends State<AppSettings> {
             }
           },
         ).toSliver(),
+        _SwitchSetting(
+          title: "Auto compress downloads".tl,
+          subtitle: "Keep covers and losslessly archive completed comics".tl,
+          settingKey: "autoCompressDownloads",
+        ).toSliver(),
         ListTile(
           title: Text("Cache Size".tl),
           subtitle: Text(bytesToReadableString(CacheManager().currentSize)),

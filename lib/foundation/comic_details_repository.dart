@@ -358,7 +358,7 @@ class ComicDetailsRepository {
 
   @visibleForTesting
   void debugReset() {
-    _db?.dispose();
+    _db?.close();
     _db = null;
     _initFuture = null;
     _backgroundRefreshTasks.clear();

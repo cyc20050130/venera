@@ -15,6 +15,45 @@ void main() {
     expect(app.shouldRequireAuthorization(null), isFalse);
   });
 
+  test('root router preserves bootstrap and authorization gates', () {
+    expect(
+      app.resolveRootRouteRedirect(
+        phaseAReady: false,
+        authorizationRequired: false,
+        startupAuthorized: false,
+        currentLocation: app.AppRoutePath.home,
+      ),
+      app.AppRoutePath.bootstrap,
+    );
+    expect(
+      app.resolveRootRouteRedirect(
+        phaseAReady: true,
+        authorizationRequired: true,
+        startupAuthorized: false,
+        currentLocation: app.AppRoutePath.bootstrap,
+      ),
+      app.AppRoutePath.unlock,
+    );
+    expect(
+      app.resolveRootRouteRedirect(
+        phaseAReady: true,
+        authorizationRequired: true,
+        startupAuthorized: true,
+        currentLocation: app.AppRoutePath.unlock,
+      ),
+      app.AppRoutePath.home,
+    );
+    expect(
+      app.resolveRootRouteRedirect(
+        phaseAReady: true,
+        authorizationRequired: false,
+        startupAuthorized: false,
+        currentLocation: app.AppRoutePath.home,
+      ),
+      isNull,
+    );
+  });
+
   test('download flush is throttled across background lifecycle sequence', () {
     final now = DateTime(2026, 6, 3, 20);
 

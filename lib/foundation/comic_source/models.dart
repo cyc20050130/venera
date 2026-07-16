@@ -291,6 +291,13 @@ class Comic {
   toString() => "$sourceKey@$id";
 }
 
+/// Stable identity without adding a new required member to the legacy
+/// [Comic] interface. Several persisted models use `implements Comic`; an
+/// extension keeps those models source-compatible during the migration.
+extension ComicKeyExtension on Comic {
+  ComicKey get comicKey => ComicKey(sourceKey: sourceKey, comicId: id);
+}
+
 class ComicID {
   final ComicType type;
 

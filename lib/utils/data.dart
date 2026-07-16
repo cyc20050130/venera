@@ -4,6 +4,8 @@ import 'dart:isolate';
 
 import 'package:flutter/foundation.dart' show visibleForTesting;
 import 'package:sqlite3/sqlite3.dart';
+import 'package:venera/core/database/app_database.dart';
+import 'package:venera/core/database/backup_v2_importer.dart';
 import 'package:venera/foundation/app.dart';
 import 'package:venera/foundation/appdata.dart';
 import 'package:venera/foundation/comic_source/comic_source.dart';
@@ -15,6 +17,7 @@ import 'package:venera/network/cookie_jar.dart';
 import 'package:venera/utils/ext.dart';
 import 'package:zip_flutter/zip_flutter.dart' deferred as zip_flutter;
 
+import 'backup_v2.dart';
 import 'io.dart';
 
 Future<void> _dataImportQueue = Future<void>.value();
@@ -185,6 +188,69 @@ File createAppDataImportCacheFile() {
 }
 
 @visibleForTesting
+String? normalizeDataArchiveEntryName(Object? rawName) {
+  if (rawName is! String || rawName.isEmpty || rawName.contains('\u0000')) {
+    return null;
+  }
+  final normalized = rawName.replaceAll('\\', '/');
+  if (normalized.startsWith('/') ||
+      RegExp(r'^[A-Za-z]:').hasMatch(normalized)) {
+    return null;
+  }
+  final segments = normalized.split('/');
+  if (segments.any((segment) => segment == '..' || segment == '.')) {
+    return null;
+  }
+  final cleanSegments = segments
+      .where((segment) => segment.isNotEmpty)
+      .toList();
+  if (cleanSegments.isEmpty) return null;
+  return cleanSegments.join('/');
+}
+
+Future<void> _extractDataArchiveSafely(
+  String archivePath,
+  String destinationPath,
+) async {
+  await Isolate.run(() async {
+    await zip_flutter.loadLibrary();
+    final archive = zip_flutter.ZipFile.openRead(archivePath);
+    final seen = <String>{};
+    try {
+      final entries = archive.getAllEntries();
+      if (entries.length > 100000) {
+        throw const FormatException('Archive contains too many entries');
+      }
+      for (final entry in entries) {
+        final relative = normalizeDataArchiveEntryName(entry.name);
+        if (relative == null) {
+          throw FormatException('Unsafe archive entry: ${entry.name}');
+        }
+        final duplicateKey = Platform.isWindows
+            ? relative.toLowerCase()
+            : relative;
+        if (!seen.add(duplicateKey)) {
+          throw FormatException('Duplicate archive entry: ${entry.name}');
+        }
+        final outputPath = FilePath.join(destinationPath, relative);
+        if (!isPathInsideDirectory(outputPath, destinationPath)) {
+          throw FormatException(
+            'Archive entry escapes destination: ${entry.name}',
+          );
+        }
+        if (entry.isDir) {
+          Directory(outputPath).createSync(recursive: true);
+        } else {
+          entry.writeToFile(outputPath);
+        }
+      }
+    } finally {
+      archive.close();
+    }
+  });
+}
+
+@visibleForTesting
 Directory buildAppDataImportDirectory(
   String cachePath,
   String prefix, {
@@ -219,6 +285,18 @@ Future<File> exportAppData([bool sync = true]) async {
           }
         }
       }
+      final logical = buildBackupV2Payload(
+        dataPath: dataPath,
+        appVersion: App.version,
+        useSyncAppdata: sync,
+      );
+      for (final entry in logical.entries.entries) {
+        zipFile.addFileFromBytes(entry.key, entry.value);
+      }
+      zipFile.addFileFromBytes(
+        backupManifestEntryName,
+        Uint8List.fromList(utf8.encode(jsonEncode(logical.manifest.toJson()))),
+      );
       zipFile.close();
     });
     await tempFile.rename(cacheFile.path);
@@ -243,10 +321,8 @@ Future<void> _importAppDataLocked(File file, bool checkVersion) async {
   var cacheDirPath = cacheDir.path;
   cacheDir.createSync();
   try {
-    await Isolate.run(() async {
-      await zip_flutter.loadLibrary();
-      zip_flutter.ZipFile.openAndExtract(file.path, cacheDirPath);
-    });
+    await _extractDataArchiveSafely(file.path, cacheDirPath);
+    final backupV2Manifest = validateExtractedBackupV2(cacheDir);
     var historyFile = cacheDir.joinFile("history.db");
     var localFavoriteFile = cacheDir.joinFile("local_favorite.db");
     var appdataFile = cacheDir.joinFile("appdata.json");
@@ -323,6 +399,17 @@ Future<void> _importAppDataLocked(File file, bool checkVersion) async {
         await _sanitizeImportedSourceSettings();
       }
     }
+    if (backupV2Manifest != null) {
+      final rewriteDatabase = AppDatabase(
+        path: FilePath.join(App.dataPath, AppDatabase.fileName),
+      );
+      try {
+        await rewriteDatabase.initialize();
+        await BackupV2Importer(rewriteDatabase).importDirectory(cacheDir);
+      } finally {
+        await rewriteDatabase.close();
+      }
+    }
   } finally {
     await cacheDir.deleteIgnoreError(recursive: true);
   }
@@ -384,10 +471,7 @@ Future<void> _importPicaDataLocked(File file) async {
   var cacheDirPath = cacheDir.path;
   cacheDir.createSync();
   try {
-    await Isolate.run(() async {
-      await zip_flutter.loadLibrary();
-      zip_flutter.ZipFile.openAndExtract(file.path, cacheDirPath);
-    });
+    await _extractDataArchiveSafely(file.path, cacheDirPath);
     var localFavoriteFile = cacheDir.joinFile("local_favorite.db");
     if (localFavoriteFile.existsSync()) {
       var db = sqlite3.open(localFavoriteFile.path);
@@ -447,7 +531,7 @@ Future<void> _importPicaDataLocked(File file) async {
       } catch (e) {
         Log.error("Import Data", "Failed to import local favorite: $e");
       } finally {
-        db.dispose();
+        db.close();
       }
     }
     var historyFile = cacheDir.joinFile("history.db");
@@ -566,7 +650,7 @@ Future<void> _importPicaDataLocked(File file) async {
       } catch (e, stack) {
         Log.error("Import Data", "Failed to import history: $e", stack);
       } finally {
-        db.dispose();
+        db.close();
       }
     }
   } finally {

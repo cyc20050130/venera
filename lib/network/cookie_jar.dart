@@ -32,7 +32,7 @@ class CookieJarSql {
   }
 
   void close() {
-    _db.dispose();
+    _db.close();
   }
 
   void saveFromResponse(Uri uri, List<Cookie> cookies) {
@@ -231,7 +231,7 @@ class CookieJarSql {
   }
 
   void dispose() {
-    _db.dispose();
+    _db.close();
   }
 }
 

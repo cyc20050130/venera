@@ -498,9 +498,12 @@ class _ReaderState extends State<Reader>
   bool isLoading = false;
 
   var focusNode = FocusNode();
+  late final int _previousImageCacheMaximumSizeBytes;
 
   @override
   void initState() {
+    _previousImageCacheMaximumSizeBytes =
+        PaintingBinding.instance.imageCache.maximumSizeBytes;
     _readerMountedAt = DateTime.now();
     _initialReaderWorkScheduler = ReaderDeferredWorkScheduler(
       remainingDelay: () => _initialReaderBackgroundWorkRemaining,
@@ -585,7 +588,7 @@ class _ReaderState extends State<Reader>
   Future<void> setImageCacheSize() async {
     try {
       var availableRAM = await MemoryInfo.getFreePhysicalMemorySize();
-      if (availableRAM == null) return;
+      if (availableRAM == null || !mounted) return;
       int maxImageCacheSize;
       if (availableRAM < 1 << 30) {
         maxImageCacheSize = 100 << 20;
@@ -622,7 +625,8 @@ class _ReaderState extends State<Reader>
     Future.microtask(() {
       DataSync().onDataChanged();
     });
-    PaintingBinding.instance.imageCache.maximumSizeBytes = 100 << 20;
+    PaintingBinding.instance.imageCache.maximumSizeBytes =
+        _previousImageCacheMaximumSizeBytes;
     disposeReaderWindow();
     super.dispose();
   }
@@ -698,8 +702,16 @@ class _ReaderState extends State<Reader>
       return;
     }
     _completedDownloadedChapters.remove(chapterNumber);
-    Future.microtask(() {
-      LocalManager().deleteComicChapters(localComic, [chapterId]);
+    Future.microtask(() async {
+      try {
+        await LocalManager().deleteComicChapters(localComic, [chapterId]);
+      } catch (error, stackTrace) {
+        Log.error(
+          'LocalArchive',
+          'Failed to auto-delete downloaded chapter $chapterId: $error',
+          stackTrace,
+        );
+      }
     });
   }
 

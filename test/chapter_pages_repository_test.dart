@@ -2,24 +2,17 @@ import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:flutter_test/flutter_test.dart';
-import 'package:sqlite3/open.dart';
 import 'package:sqlite3/sqlite3.dart';
 import 'package:venera/foundation/app.dart';
 import 'package:venera/foundation/chapter_pages_repository.dart';
 import 'package:venera/foundation/comic_source/comic_source.dart';
 import 'package:venera/foundation/res.dart';
 
-import 'test_native_paths.dart';
-
 void main() {
   late Directory tempDir;
   late ComicSource source;
   late Res<List<String>> currentPages;
   var loadCount = 0;
-
-  setUpAll(() {
-    open.overrideFor(OperatingSystem.windows, openTestSqlite);
-  });
 
   setUp(() async {
     tempDir = await Directory.systemTemp.createTemp(
@@ -137,7 +130,7 @@ void main() {
     await repo.init();
 
     final db = sqlite3.open('${tempDir.path}/comic_details.db');
-    addTearDown(db.dispose);
+    addTearDown(db.close);
     final now = DateTime.now().millisecondsSinceEpoch;
     db.execute(
       '''

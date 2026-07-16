@@ -4,7 +4,6 @@ import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:flutter_test/flutter_test.dart';
-import 'package:sqlite3/open.dart';
 import 'package:sqlite3/sqlite3.dart';
 import 'package:venera/foundation/app.dart';
 import 'package:venera/foundation/comic_source/comic_source.dart';
@@ -17,18 +16,12 @@ import 'package:venera/foundation/local.dart';
 import 'package:venera/network/download.dart';
 import 'package:venera/network/images.dart';
 
-import 'test_native_paths.dart';
-
 void main() {
   late Directory tempDir;
   late LocalManager manager;
   late bool managerInitialized;
 
   File snapshotFile() => File('${tempDir.path}/downloading_tasks.json');
-
-  setUpAll(() {
-    open.overrideFor(OperatingSystem.windows, openTestSqlite);
-  });
 
   setUp(() async {
     tempDir = await Directory.systemTemp.createTemp('venera-local-test-');
@@ -90,6 +83,39 @@ void main() {
     expect(firstArchive, endsWith('archive_downloading-op-a.zip'));
     expect(firstExtract, endsWith('archive_downloading-op-a'));
   });
+
+  test(
+    'deleting an external local entry never deletes external files',
+    () async {
+      await manager.init();
+      managerInitialized = true;
+      final external = await Directory.systemTemp.createTemp(
+        'venera-external-comic-',
+      );
+      addTearDown(() => external.delete(recursive: true));
+      final marker = File('${external.path}/keep.txt')
+        ..writeAsStringSync('keep');
+      final comic = LocalComic(
+        id: 'external-comic',
+        title: 'External comic',
+        subtitle: '',
+        tags: const [],
+        directory: external.path,
+        chapters: null,
+        cover: 'cover.jpg',
+        comicType: ComicType.local,
+        downloadedChapters: const [],
+        createdAt: DateTime(2026, 7, 16),
+      );
+      await manager.add(comic);
+
+      manager.batchDeleteComicsKeepFavoritesAndHistory([comic]);
+      await Future<void>.delayed(const Duration(milliseconds: 100));
+
+      expect(manager.find(comic.id, comic.comicType), isNull);
+      expect(marker.existsSync(), isTrue);
+    },
+  );
 
   test('scheduled task snapshots keep only the latest queued state', () async {
     manager.downloadingTasks.add(_FakeDownloadTask('first'));
@@ -281,7 +307,7 @@ void main() {
     managerInitialized = true;
 
     final db = sqlite3.open('${tempDir.path}/local.db');
-    addTearDown(db.dispose);
+    addTearDown(db.close);
     db.execute(
       'INSERT OR REPLACE INTO comics VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);',
       [
@@ -433,8 +459,8 @@ void main() {
       1,
     );
 
-    favoritesDb.dispose();
-    historyDb.dispose();
+    favoritesDb.close();
+    historyDb.close();
   });
 
   test('batched downloaded state repair notifies once after changes', () async {

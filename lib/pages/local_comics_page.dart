@@ -1,10 +1,14 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
+import 'package:path/path.dart' as p;
 import 'package:uuid/uuid.dart';
 import 'package:venera/components/components.dart';
 import 'package:venera/foundation/app.dart';
 import 'package:venera/foundation/appdata.dart';
 import 'package:venera/foundation/comic_type.dart';
 import 'package:venera/foundation/local.dart';
+import 'package:venera/foundation/local_archive.dart';
 import 'package:venera/foundation/log.dart';
 import 'package:venera/pages/comic_details_page/comic_page.dart';
 import 'package:venera/pages/downloading_page.dart';
@@ -32,6 +36,73 @@ LocalSortType normalizeLocalComicsSortType(Object? value) {
   return LocalSortType.name;
 }
 
+@visibleForTesting
+enum LocalArchiveUiAction {
+  compress,
+  releaseExtracted,
+  recompress,
+  restore,
+  none,
+}
+
+@visibleForTesting
+LocalArchiveUiAction localArchiveUiActionForState(LocalStorageState? state) {
+  return switch (state) {
+    null || LocalStorageState.loose => LocalArchiveUiAction.compress,
+    LocalStorageState.archived => LocalArchiveUiAction.restore,
+    LocalStorageState.expanded => LocalArchiveUiAction.releaseExtracted,
+    LocalStorageState.dirty => LocalArchiveUiAction.recompress,
+    LocalStorageState.missing ||
+    LocalStorageState.error => LocalArchiveUiAction.none,
+  };
+}
+
+@visibleForTesting
+String? localArchiveBadgeKey(
+  LocalStorageState? state, {
+  bool operationRunning = false,
+}) {
+  if (operationRunning) return 'Archiving';
+  return switch (state) {
+    null => null,
+    LocalStorageState.loose => 'Not archived',
+    LocalStorageState.archived => 'Archived',
+    LocalStorageState.expanded => 'Expanded',
+    LocalStorageState.dirty => 'Archive modified',
+    LocalStorageState.missing => 'Files missing',
+    LocalStorageState.error => 'Archive error',
+  };
+}
+
+@visibleForTesting
+double localArchiveOperationProgress(LocalArchiveProgress progress) {
+  final fraction = progress.fraction.clamp(0.0, 1.0);
+  return switch (progress.operation) {
+    LocalArchiveOperation.inspect => fraction * 0.2,
+    LocalArchiveOperation.compress => 0.2 + fraction * 0.6,
+    LocalArchiveOperation.restore => 0.1 + fraction * 0.8,
+    LocalArchiveOperation.cleanup => 0.8 + fraction * 0.2,
+    LocalArchiveOperation.reconcile => fraction,
+  };
+}
+
+@visibleForTesting
+bool isLocalArchivePathManaged({
+  required String libraryPath,
+  required String comicPath,
+}) {
+  if (libraryPath.isEmpty || comicPath.isEmpty) return false;
+  try {
+    final library = p.canonicalize(p.absolute(libraryPath));
+    final comic = p.canonicalize(p.absolute(comicPath));
+    return p.isWithin(library, comic);
+  } catch (_) {
+    return false;
+  }
+}
+
+enum _LocalArchiveUiOperation { compress, restore }
+
 class _LocalComicsPageState extends State<LocalComicsPage> {
   late List<LocalComic> comics;
 
@@ -45,31 +116,100 @@ class _LocalComicsPageState extends State<LocalComicsPage> {
 
   Map<LocalComic, bool> selectedComics = {};
 
+  final Map<String, LocalArchiveSnapshot> _archiveSnapshots = {};
+
+  final Set<String> _activeArchiveKeys = {};
+
+  int _archiveRefreshGeneration = 0;
+
+  Timer? _archiveRefreshDebounce;
+
+  bool _archiveOperationRunning = false;
+
+  String _archiveKey(LocalComic comic) =>
+      '${comic.comicType.value}\u0000${comic.sourceKey}\u0000${comic.id}\u0000${comic.directory}';
+
+  bool _canArchive(LocalComic comic) =>
+      !LocalManager().isDownloading(comic.id, comic.comicType) &&
+      isLocalArchivePathManaged(
+        libraryPath: LocalManager().path,
+        comicPath: comic.baseDir,
+      ) &&
+      LocalArchiveService().canManage(comic);
+
+  List<LocalComic> _queryComics() {
+    if (keyword.isEmpty) {
+      return LocalManager().getComics(sortType);
+    }
+    return LocalManager().search(keyword);
+  }
+
   void update() {
     if (!mounted) return;
-    if (keyword.isEmpty) {
-      setState(() {
-        comics = LocalManager().getComics(sortType);
-      });
-    } else {
-      setState(() {
-        comics = LocalManager().search(keyword);
-      });
+    setState(() {
+      comics = _queryComics();
+    });
+    if (!_archiveOperationRunning) {
+      _scheduleArchiveRefresh();
     }
+  }
+
+  void _scheduleArchiveRefresh() {
+    _archiveRefreshDebounce?.cancel();
+    _archiveRefreshDebounce = Timer(const Duration(milliseconds: 150), () {
+      unawaited(_refreshArchiveStates());
+    });
   }
 
   @override
   void initState() {
+    super.initState();
     sortType = normalizeLocalComicsSortType(appdata.implicitData["local_sort"]);
     comics = LocalManager().getComics(sortType);
     LocalManager().addListener(update);
-    super.initState();
+    unawaited(_refreshArchiveStates());
   }
 
   @override
   void dispose() {
+    _archiveRefreshGeneration++;
+    _archiveRefreshDebounce?.cancel();
     LocalManager().removeListener(update);
     super.dispose();
+  }
+
+  Future<void> _refreshArchiveStates({
+    Iterable<LocalComic>? targetComics,
+  }) async {
+    final generation = ++_archiveRefreshGeneration;
+    final targets = (targetComics ?? comics).where(_canArchive).toList();
+    final refreshed = <String, LocalArchiveSnapshot>{};
+    for (final comic in targets) {
+      // Avoid recursively listing every page of every unarchived comic just
+      // to render a badge. Full scanning still happens when compression is
+      // requested; archived entries need inspection to distinguish expanded
+      // and dirty states.
+      if (!comic.hasArchiveMetadataOnDisk) {
+        refreshed[_archiveKey(comic)] = LocalArchiveSnapshot(
+          state: await Directory(comic.baseDir).exists()
+              ? LocalStorageState.loose
+              : LocalStorageState.missing,
+          archiveExists: false,
+          archiveBytes: 0,
+          looseBytes: 0,
+        );
+        continue;
+      }
+      final snapshot = await LocalArchiveService().inspect(comic);
+      if (!mounted || generation != _archiveRefreshGeneration) return;
+      refreshed[_archiveKey(comic)] = snapshot;
+    }
+    if (!mounted || generation != _archiveRefreshGeneration) return;
+    final visibleKeys = comics.map(_archiveKey).toSet();
+    setState(() {
+      _archiveSnapshots.removeWhere((key, _) => !visibleKeys.contains(key));
+      _archiveSnapshots.addAll(refreshed);
+    });
   }
 
   void sort() {
@@ -122,9 +262,211 @@ class _LocalComicsPageState extends State<LocalComicsPage> {
     );
   }
 
+  String? _archiveBadgeFor(LocalComic comic) {
+    if (!_canArchive(comic)) return null;
+    final key = _archiveKey(comic);
+    return localArchiveBadgeKey(
+      _archiveSnapshots[key]?.state,
+      operationRunning: _activeArchiveKeys.contains(key),
+    )?.tl;
+  }
+
+  List<MenuEntry> _archiveMenuEntries(LocalComic comic) {
+    if (!_canArchive(comic) || _archiveOperationRunning) return const [];
+    final action = localArchiveUiActionForState(
+      _archiveSnapshots[_archiveKey(comic)]?.state,
+    );
+    return switch (action) {
+      LocalArchiveUiAction.compress => [
+        MenuEntry(
+          icon: Icons.archive_outlined,
+          text: 'Compress local files'.tl,
+          onClick: () => unawaited(
+            _runArchiveOperation([comic], _LocalArchiveUiOperation.compress),
+          ),
+        ),
+      ],
+      LocalArchiveUiAction.releaseExtracted => [
+        MenuEntry(
+          icon: Icons.inventory_2_outlined,
+          text: 'Release extracted files'.tl,
+          onClick: () => unawaited(
+            _runArchiveOperation([comic], _LocalArchiveUiOperation.compress),
+          ),
+        ),
+      ],
+      LocalArchiveUiAction.recompress => [
+        MenuEntry(
+          icon: Icons.sync,
+          text: 'Recompress local files'.tl,
+          onClick: () => unawaited(
+            _runArchiveOperation([comic], _LocalArchiveUiOperation.compress),
+          ),
+        ),
+      ],
+      LocalArchiveUiAction.restore => [
+        MenuEntry(
+          icon: Icons.unarchive_outlined,
+          text: 'Restore archived files'.tl,
+          onClick: () => unawaited(
+            _runArchiveOperation([comic], _LocalArchiveUiOperation.restore),
+          ),
+        ),
+      ],
+      LocalArchiveUiAction.none => const [],
+    };
+  }
+
+  Future<void> _runArchiveOperation(
+    List<LocalComic> requestedComics,
+    _LocalArchiveUiOperation operation,
+  ) async {
+    if (_archiveOperationRunning || !mounted) return;
+    final seen = <String>{};
+    final targets = requestedComics
+        .where(_canArchive)
+        .where((comic) => seen.add(_archiveKey(comic)))
+        .toList(growable: false);
+    final skipped = requestedComics.length - targets.length;
+    if (targets.isEmpty) {
+      context.showMessage(
+        message: 'Only Venera-managed comics can be archived.'.tl,
+      );
+      return;
+    }
+
+    final token = LocalArchiveCancellationToken();
+    final operationText = switch (operation) {
+      _LocalArchiveUiOperation.compress => 'Compressing'.tl,
+      _LocalArchiveUiOperation.restore => 'Restoring'.tl,
+    };
+    setState(() {
+      _archiveOperationRunning = true;
+      _activeArchiveKeys.addAll(targets.map(_archiveKey));
+    });
+
+    final loadingController = showLoadingDialog(
+      context,
+      barrierDismissible: false,
+      allowCancel: true,
+      withProgress: true,
+      message: '@action @current/@total'.tlParams({
+        'action': operationText,
+        'current': 1,
+        'total': targets.length,
+      }),
+      onCancel: token.cancel,
+    );
+    final refreshed = <String, LocalArchiveSnapshot>{};
+    final failures = <Object>[];
+    var completed = 0;
+    var cancelled = false;
+    var lastDisplayedProgress = -1.0;
+    try {
+      for (var index = 0; index < targets.length; index++) {
+        final comic = targets[index];
+        token.throwIfCancelled();
+        loadingController.setMessage(
+          '@action @current/@total'.tlParams({
+            'action': operationText,
+            'current': index + 1,
+            'total': targets.length,
+          }),
+        );
+        loadingController.setProgress(index / targets.length);
+        lastDisplayedProgress = index / targets.length;
+
+        void reportProgress(LocalArchiveProgress progress) {
+          final comicProgress = localArchiveOperationProgress(progress);
+          final overall = ((index + comicProgress) / targets.length).clamp(
+            0.0,
+            1.0,
+          );
+          if (overall - lastDisplayedProgress >= 0.01 || overall == 1.0) {
+            lastDisplayedProgress = overall;
+            loadingController.setProgress(overall);
+          }
+        }
+
+        try {
+          final result = switch (operation) {
+            _LocalArchiveUiOperation.compress =>
+              await LocalArchiveService().compress(
+                comic,
+                cancellationToken: token,
+                onProgress: reportProgress,
+              ),
+            _LocalArchiveUiOperation.restore =>
+              await LocalArchiveService().restore(
+                comic,
+                cancellationToken: token,
+                onProgress: reportProgress,
+              ),
+          };
+          refreshed[_archiveKey(comic)] = result;
+          completed++;
+          loadingController.setProgress((index + 1) / targets.length);
+        } on LocalArchiveCancelledException {
+          cancelled = true;
+          break;
+        } catch (error, stackTrace) {
+          failures.add(error);
+          Log.error('Local Archive', error, stackTrace);
+        }
+      }
+    } on LocalArchiveCancelledException {
+      cancelled = true;
+    } finally {
+      loadingController.close();
+      if (mounted) {
+        setState(() {
+          _archiveSnapshots.addAll(refreshed);
+          _activeArchiveKeys.clear();
+          _archiveOperationRunning = false;
+        });
+      }
+    }
+
+    if (!mounted) return;
+    unawaited(_refreshArchiveStates(targetComics: targets));
+    if (cancelled || token.isCancelled) {
+      context.showMessage(message: 'Archive operation canceled'.tl);
+      return;
+    }
+    if (failures.isNotEmpty) {
+      final detail = failures.length == 1 ? ': ${failures.first}' : '';
+      context.showMessage(
+        message:
+            '${'Archive failed for @count comics'.tlParams({'count': failures.length})}$detail',
+      );
+      return;
+    }
+    final resultMessage = switch (operation) {
+      _LocalArchiveUiOperation.compress => 'Archived @count comics'.tlParams({
+        'count': completed,
+      }),
+      _LocalArchiveUiOperation.restore => 'Restored @count comics'.tlParams({
+        'count': completed,
+      }),
+    };
+    final skippedMessage = skipped == 0
+        ? ''
+        : ' · ${'Skipped @count external comics'.tlParams({'count': skipped})}';
+    context.showMessage(message: '$resultMessage$skippedMessage');
+  }
+
   Widget buildMultiSelectMenu() {
+    final selected = selectedComics.keys.toList(growable: false);
     return MenuButton(
       entries: [
+        if (selected.any(_canArchive))
+          MenuEntry(
+            icon: Icons.archive_outlined,
+            text: 'Compress local files'.tl,
+            onClick: () => unawaited(
+              _runArchiveOperation(selected, _LocalArchiveUiOperation.compress),
+            ),
+          ),
         MenuEntry(
           icon: Icons.delete_outline,
           text: "Delete".tl,
@@ -313,6 +655,7 @@ class _LocalComicsPageState extends State<LocalComicsPage> {
           SliverGridComics(
             comics: comics,
             selections: selectedComics,
+            badgeBuilder: (comic) => _archiveBadgeFor(comic as LocalComic),
             onLongPressed: (c, heroTag) {
               setState(() {
                 multiSelectMode = true;
@@ -338,22 +681,24 @@ class _LocalComicsPageState extends State<LocalComicsPage> {
                   ComicType.fromKey(c.sourceKey),
                 )!;
                 comic.read();
+                unawaited(_refreshArchiveStates(targetComics: [comic]));
               }
             },
             menuBuilder: (c) {
               return [
+                ..._archiveMenuEntries(c as LocalComic),
                 MenuEntry(
                   icon: Icons.folder_open,
                   text: "Open Folder".tl,
                   onClick: () {
-                    openComicFolder(c as LocalComic);
+                    openComicFolder(c);
                   },
                 ),
                 MenuEntry(
                   icon: Icons.delete,
                   text: "Delete".tl,
                   onClick: () {
-                    deleteComics([c as LocalComic]).then((value) {
+                    deleteComics([c]).then((value) {
                       if (!mounted) return;
                       if (value && multiSelectMode) {
                         setState(() {
@@ -364,7 +709,7 @@ class _LocalComicsPageState extends State<LocalComicsPage> {
                     });
                   },
                 ),
-                ...exportActions([c as LocalComic]),
+                ...exportActions([c]),
               ];
             },
           ),
@@ -480,6 +825,14 @@ class _LocalComicsPageState extends State<LocalComicsPage> {
       var fileName = "";
       // For each comic, export it to a file
       for (var comic in comics) {
+        if (canceled) return;
+        if (comic.hasArchiveMetadataOnDisk) {
+          // PDF export reads the loose tree directly, while CBZ/EPUB use
+          // LocalManager.getImages. Restore here so every export format has
+          // identical archived-comic behavior and the retained ZIP stays
+          // available for later cleanup.
+          await LocalArchiveService().restore(comic);
+        }
         fileName = FilePath.join(
           cacheDir,
           sanitizeFileName(comic.title, maxLength: 100) + ext,
@@ -529,6 +882,9 @@ class _LocalComicsPageState extends State<LocalComicsPage> {
       await Directory(cacheDir).deleteIgnoreError(recursive: true);
       if (!archiveReadyForSave) {
         await File(outFile).deleteIgnoreError();
+      }
+      if (mounted) {
+        unawaited(_refreshArchiveStates(targetComics: comics));
       }
     }
     try {
@@ -649,9 +1005,26 @@ void showDeleteChaptersPopWindow(BuildContext context, LocalComic comic) {
                   children: [
                     FilledButton(
                       onPressed: () {
-                        Future.delayed(const Duration(milliseconds: 200), () {
-                          LocalManager().deleteComicChapters(comic, chapters);
-                        });
+                        Future.delayed(
+                          const Duration(milliseconds: 200),
+                          () async {
+                            try {
+                              await LocalManager().deleteComicChapters(
+                                comic,
+                                chapters,
+                              );
+                            } catch (error, stackTrace) {
+                              Log.error(
+                                'LocalArchive',
+                                'Failed to delete comic chapters: $error',
+                                stackTrace,
+                              );
+                              App.rootContext.showMessage(
+                                message: error.toString(),
+                              );
+                            }
+                          },
+                        );
                         App.rootContext.pop();
                       },
                       child: Text("Submit".tl),

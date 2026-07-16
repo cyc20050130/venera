@@ -1,17 +1,10 @@
 import 'dart:io';
 
 import 'package:flutter_test/flutter_test.dart';
-import 'package:sqlite3/open.dart';
 import 'package:sqlite3/sqlite3.dart';
 import 'package:venera/network/cookie_jar.dart';
 
-import 'test_native_paths.dart';
-
 void main() {
-  setUpAll(() {
-    open.overrideFor(OperatingSystem.windows, openTestSqlite);
-  });
-
   test('host cookie wins over parent domain cookie with same name', () async {
     final tempDir = await Directory.systemTemp.createTemp('venera_cookie_jar_');
     final jar = CookieJarSql('${tempDir.path}/cookie.db');
@@ -42,7 +35,7 @@ void main() {
     jar.saveFromResponse(uri, [Cookie('sid', 'valid')]);
 
     final db = sqlite3.open(dbPath);
-    addTearDown(db.dispose);
+    addTearDown(db.close);
     db.execute(
       '''
       INSERT OR REPLACE INTO cookies (

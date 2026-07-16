@@ -8,32 +8,49 @@ import 'package:flutter/material.dart';
 import 'package:venera/foundation/cache_manager.dart';
 import 'package:venera/foundation/log.dart';
 
+const int _maxDecodedImagePixels = 2560 * 1440;
+
+@visibleForTesting
+TargetImageSize resolveImageDecodeTargetSize(
+  int width,
+  int height, {
+  int? preferredWidth,
+  int maxPixels = _maxDecodedImagePixels,
+}) {
+  if (width <= 0 || height <= 0 || maxPixels <= 0) {
+    return TargetImageSize(width: width, height: height);
+  }
+
+  var scale = 1.0;
+  if (preferredWidth != null && preferredWidth > 0 && width > preferredWidth) {
+    scale = preferredWidth / width;
+  }
+
+  final imageRatio = width / height;
+  // A hard total-pixel cap makes long-strip comics narrower than the physical
+  // viewport and visibly blurs text. Keep the viewport-width reduction for
+  // those images, but only apply the memory cap to conventional page ratios.
+  if (imageRatio >= 0.5 && imageRatio <= 2) {
+    final pixels = width.toDouble() * height;
+    if (pixels > maxPixels) {
+      scale = min(scale, sqrt(maxPixels / pixels));
+    }
+  }
+
+  if (!scale.isFinite || scale >= 1) {
+    return TargetImageSize(width: width, height: height);
+  }
+  return TargetImageSize(
+    width: max(1, (width * scale).floor()),
+    height: max(1, (height * scale).floor()),
+  );
+}
+
 abstract class BaseImageProvider<T extends BaseImageProvider<T>>
     extends ImageProvider<T> {
   const BaseImageProvider();
 
-  static const int maxImagePixel = 2560 * 1440;
-
-  static TargetImageSize _getTargetSize(int width, int height) {
-    // ignore invalid size
-    if (width <= 0 || height <= 0) {
-      return TargetImageSize(width: width, height: height);
-    }
-    // ignore too wide or too tall image
-    final imageRatio = width / height;
-    if (imageRatio > 2 || imageRatio < 0.5) {
-      return TargetImageSize(width: width, height: height);
-    }
-    // resize if too large
-    if (width * height > maxImagePixel) {
-      final ratio = sqrt(maxImagePixel / (width * height));
-      return TargetImageSize(
-        width: (width * ratio).round(),
-        height: (height * ratio).round(),
-      );
-    }
-    return TargetImageSize(width: width, height: height);
-  }
+  static const int maxImagePixel = _maxDecodedImagePixels;
 
   @override
   ImageStreamCompleter loadImage(T key, ImageDecoderCallback decode) {
@@ -109,7 +126,13 @@ abstract class BaseImageProvider<T extends BaseImageProvider<T>>
         final buffer = await ImmutableBuffer.fromUint8List(data);
         return await decode(
           buffer,
-          getTargetSize: enableResize ? _getTargetSize : null,
+          getTargetSize: enableResize
+              ? (width, height) => resolveImageDecodeTargetSize(
+                  width,
+                  height,
+                  preferredWidth: preferredDecodeWidth,
+                )
+              : null,
         );
       } catch (e) {
         await CacheManager().delete(this.key);
@@ -163,6 +186,8 @@ abstract class BaseImageProvider<T extends BaseImageProvider<T>>
   }
 
   bool get enableResize => false;
+
+  int? get preferredDecodeWidth => null;
 }
 
 typedef FileDecoderCallback = Future<ui.Codec> Function(Uint8List);

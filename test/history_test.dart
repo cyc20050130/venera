@@ -3,7 +3,6 @@ import 'dart:io';
 import 'dart:isolate';
 
 import 'package:flutter_test/flutter_test.dart';
-import 'package:sqlite3/open.dart';
 import 'package:sqlite3/sqlite3.dart';
 import 'package:venera/foundation/comic_type.dart';
 import 'package:venera/foundation/app.dart';
@@ -20,7 +19,6 @@ void main() {
   String? originalCurrentDir;
 
   setUpAll(() async {
-    open.overrideFor(OperatingSystem.windows, openTestSqlite);
     final source = File(zipDllSourcePath);
     if (!source.existsSync()) {
       throw StateError(
@@ -28,8 +26,9 @@ void main() {
       );
     }
     originalCurrentDir = Directory.current.path;
-    zipDllDir = await Directory.systemTemp.createTemp('venera-history-zip-');
-    source.copySync('${zipDllDir.path}/zip_flutter.dll');
+    // A loaded DLL stays locked until the test process exits on Windows.
+    // Use the stable build output directly instead of leaking a temp folder.
+    zipDllDir = source.parent;
     Directory.current = zipDllDir.path;
   });
 
@@ -290,7 +289,7 @@ void main() {
 
   test('History.fromRow tolerates JSON readEpisode and scalar DB values', () {
     final db = sqlite3.open('${tempDir.path}/history.db');
-    addTearDown(db.dispose);
+    addTearDown(db.close);
     db.execute(
       '''
       insert or replace into history
@@ -331,7 +330,7 @@ void main() {
 
   test('ImageFavoriteManager skips corrupt rows without hiding valid rows', () {
     final db = sqlite3.open('${tempDir.path}/history.db');
-    addTearDown(db.dispose);
+    addTearDown(db.close);
     db.execute(
       '''
       insert or replace into image_favorites
@@ -486,7 +485,7 @@ void main() {
         null,
       ],
     );
-    db.dispose();
+    db.close();
 
     await history.init();
     expect(history.find('comic-2', ComicType('picacg'.hashCode)), isNotNull);
@@ -551,7 +550,7 @@ void main() {
           2,
         ],
       );
-      db.dispose();
+      db.close();
 
       await history.init();
 
@@ -563,7 +562,7 @@ void main() {
         'select id, ep, page, chapter_group from history where id = ?;',
         ['comic-legacy'],
       );
-      recoveredDb.dispose();
+      recoveredDb.close();
 
       expect(legacyTables, isEmpty);
       expect(rows, isNotEmpty);
@@ -614,7 +613,7 @@ void main() {
       'select id, source_key, ep, page, chapter_group from history where id = ? and source_key = ?;',
       ['comic-export', 'source-export'],
     );
-    db.dispose();
+    db.close();
 
     expect(rows, isNotEmpty);
     expect(rows.first['ep'], 7);
@@ -669,7 +668,7 @@ void main() {
           3,
         ],
       );
-      db.dispose();
+      db.close();
 
       await File(appdataPath).writeAsString(
         jsonEncode({
