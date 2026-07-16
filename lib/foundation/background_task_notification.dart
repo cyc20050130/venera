@@ -101,9 +101,7 @@ final class BackgroundTaskNotificationService {
   BackgroundTaskNotificationPermission get permission => _permission;
 
   bool get notificationNeedsAttention =>
-      App.isAndroid &&
-      (_permission == BackgroundTaskNotificationPermission.disabled ||
-          _permission == BackgroundTaskNotificationPermission.error);
+      backgroundTaskNotificationNeedsAttention(App.isAndroid, _permission);
 
   Future<void> initialize() async {
     if (!App.isAndroid || _initialized) return;
@@ -152,6 +150,10 @@ final class BackgroundTaskNotificationService {
           enabled = await plugin.areNotificationsEnabled() == true;
         }
       }
+      if (enabled && await _isChannelDisabled(plugin)) {
+        _setPermission(BackgroundTaskNotificationPermission.channelDisabled);
+        return false;
+      }
       _setPermission(
         enabled
             ? BackgroundTaskNotificationPermission.enabled
@@ -172,7 +174,9 @@ final class BackgroundTaskNotificationService {
   Future<void> openNotificationSettings() async {
     if (!App.isAndroid) return;
     try {
-      await _methodChannel.invokeMethod<void>('openNotificationSettings');
+      await _methodChannel.invokeMethod<void>('openNotificationSettings', {
+        'channelId': _channelId,
+      });
     } catch (error, stackTrace) {
       Log.error(
         'BackgroundTask',
@@ -182,6 +186,16 @@ final class BackgroundTaskNotificationService {
     } finally {
       await refreshPermissionStatus();
     }
+  }
+
+  Future<bool> _isChannelDisabled(
+    AndroidFlutterLocalNotificationsPlugin plugin,
+  ) async {
+    final channels = await plugin.getNotificationChannels();
+    final channel = channels
+        ?.where((item) => item.id == _channelId)
+        .firstOrNull;
+    return channel?.importance == Importance.none;
   }
 
   void _setPermission(BackgroundTaskNotificationPermission value) {
@@ -284,7 +298,19 @@ final class BackgroundTaskNotificationService {
           AndroidServiceForegroundType.foregroundServiceTypeDataSync,
         },
       );
+      await _notifications.show(
+        id: _notificationId,
+        title: buildBackgroundTaskNotificationTitle(data),
+        body: buildBackgroundTaskNotificationBody(data),
+        notificationDetails: NotificationDetails(android: details),
+        payload: '/downloads',
+      );
       _serviceRunning = true;
+      if (await _isChannelDisabled(plugin)) {
+        _setPermission(BackgroundTaskNotificationPermission.channelDisabled);
+      } else {
+        _setPermission(BackgroundTaskNotificationPermission.enabled);
+      }
     } catch (_) {
       _setPermission(BackgroundTaskNotificationPermission.error);
       rethrow;
@@ -295,8 +321,25 @@ final class BackgroundTaskNotificationService {
     _pendingData = null;
     final plugin = await _androidPlugin();
     await plugin?.stopForegroundService();
+    await _notifications.cancel(id: _notificationId);
     _serviceRunning = false;
   }
 }
 
-enum BackgroundTaskNotificationPermission { unknown, enabled, disabled, error }
+@visibleForTesting
+bool backgroundTaskNotificationNeedsAttention(
+  bool isAndroid,
+  BackgroundTaskNotificationPermission permission,
+) {
+  return isAndroid &&
+      permission != BackgroundTaskNotificationPermission.unknown &&
+      permission != BackgroundTaskNotificationPermission.enabled;
+}
+
+enum BackgroundTaskNotificationPermission {
+  unknown,
+  enabled,
+  disabled,
+  channelDisabled,
+  error,
+}

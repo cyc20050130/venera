@@ -37,4 +37,28 @@ void main() {
     expect(buildBackgroundTaskNotificationTitle(data), 'Downloading');
     expect(buildBackgroundTaskNotificationBody(data), 'Fetching comic info...');
   });
+
+  test('notification warning follows Android permission and channel state', () {
+    expect(
+      backgroundTaskNotificationNeedsAttention(
+        true,
+        BackgroundTaskNotificationPermission.enabled,
+      ),
+      isFalse,
+    );
+    expect(
+      backgroundTaskNotificationNeedsAttention(
+        true,
+        BackgroundTaskNotificationPermission.channelDisabled,
+      ),
+      isTrue,
+    );
+    expect(
+      backgroundTaskNotificationNeedsAttention(
+        false,
+        BackgroundTaskNotificationPermission.disabled,
+      ),
+      isFalse,
+    );
+  });
 }

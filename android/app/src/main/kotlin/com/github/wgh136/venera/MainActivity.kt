@@ -137,8 +137,17 @@ class MainActivity : FlutterFragmentActivity() {
                 }
 
                 "openNotificationSettings" -> {
-                    val intent = Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS).apply {
+                    val channelId = call.argument<String>("channelId")
+                    val intent = Intent(
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && channelId != null)
+                            Settings.ACTION_CHANNEL_NOTIFICATION_SETTINGS
+                        else
+                            Settings.ACTION_APP_NOTIFICATION_SETTINGS
+                    ).apply {
                         putExtra(Settings.EXTRA_APP_PACKAGE, packageName)
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && channelId != null) {
+                            putExtra(Settings.EXTRA_CHANNEL_ID, channelId)
+                        }
                     }
                     try {
                         startContractForResult(

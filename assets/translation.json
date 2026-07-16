@@ -475,6 +475,7 @@
     "Mouse scroll speed": "鼠标滚动速度",
     "Notification permission is disabled. Background task notifications are hidden by Android.": "通知权限未开启，Android 已隐藏后台任务通知。",
     "Android could not start background task notifications. Check system notification settings.": "Android 无法启动后台任务通知，请检查系统通知设置。",
+    "The downloads and compression notification channel is disabled.": "下载和压缩通知渠道未开启。",
     "Enable notifications": "开启通知"
   },
   "zh_TW": {
@@ -953,6 +954,7 @@
     "Mouse scroll speed": "滑鼠滾動速度",
     "Notification permission is disabled. Background task notifications are hidden by Android.": "通知權限未開啟，Android 已隱藏背景工作通知。",
     "Android could not start background task notifications. Check system notification settings.": "Android 無法啟動背景工作通知，請檢查系統通知設定。",
+    "The downloads and compression notification channel is disabled.": "下載和壓縮通知頻道未開啟。",
     "Enable notifications": "開啟通知"
   }
 }

@@ -22,7 +22,8 @@ class DownloadingPage extends StatefulWidget {
   State<DownloadingPage> createState() => _DownloadingPageState();
 }
 
-class _DownloadingPageState extends State<DownloadingPage> {
+class _DownloadingPageState extends State<DownloadingPage>
+    with WidgetsBindingObserver {
   DownloadTask? firstTask;
   final notificationService = BackgroundTaskNotificationService.instance;
 
@@ -34,6 +35,7 @@ class _DownloadingPageState extends State<DownloadingPage> {
 
   @override
   void initState() {
+    WidgetsBinding.instance.addObserver(this);
     LocalManager().addListener(update);
     notificationService.permissionChanges.addListener(update);
     unawaited(notificationService.refreshPermissionStatus());
@@ -42,10 +44,18 @@ class _DownloadingPageState extends State<DownloadingPage> {
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     LocalManager().removeListener(update);
     notificationService.permissionChanges.removeListener(update);
     firstTask?.removeListener(update);
     super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      unawaited(notificationService.refreshPermissionStatus());
+    }
   }
 
   void update() {
@@ -98,6 +108,9 @@ class _DownloadingPageState extends State<DownloadingPage> {
     final serviceError =
         notificationService.permission ==
         BackgroundTaskNotificationPermission.error;
+    final channelDisabled =
+        notificationService.permission ==
+        BackgroundTaskNotificationPermission.channelDisabled;
     return Material(
       color: context.colorScheme.errorContainer,
       child: Row(
@@ -111,6 +124,8 @@ class _DownloadingPageState extends State<DownloadingPage> {
             child: Text(
               (serviceError
                       ? 'Android could not start background task notifications. Check system notification settings.'
+                      : channelDisabled
+                      ? 'The downloads and compression notification channel is disabled.'
                       : 'Notification permission is disabled. Background task notifications are hidden by Android.')
                   .tl,
               style: TextStyle(color: context.colorScheme.onErrorContainer),
