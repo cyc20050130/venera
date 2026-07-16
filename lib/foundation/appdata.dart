@@ -41,7 +41,6 @@ List<String> normalizeSearchHistory(Object? value) {
   return value.whereType<String>().where((e) => e.isNotEmpty).take(50).toList();
 }
 
-@visibleForTesting
 Map<String, dynamic> normalizeImplicitData(Object? value) {
   if (value is! Map) {
     return <String, dynamic>{};
@@ -216,6 +215,24 @@ class Appdata with Init {
     }
     searchHistory = normalizeSearchHistory(data['searchHistory']);
     saveDataInBackground();
+  }
+
+  /// Restores a user-selected full backup, including device-only settings.
+  ///
+  /// This path is deliberately separate from [syncData]: remote sync payloads
+  /// must never overwrite credentials, proxy configuration or the device ID.
+  Future<void> restoreFullData(Map<String, dynamic> data) async {
+    final restoredSettings = data['settings'];
+    if (restoredSettings is Map) {
+      for (final entry in restoredSettings.entries) {
+        final key = entry.key;
+        if (key is String && entry.value != null) {
+          settings[key] = entry.value;
+        }
+      }
+    }
+    searchHistory = normalizeSearchHistory(data['searchHistory']);
+    await saveData(false);
   }
 
   var implicitData = <String, dynamic>{};

@@ -169,6 +169,10 @@ class LocalComic with HistoryMixin implements Comic {
         ),
       ).existsSync();
 
+  bool get hasDirtyArchiveMarkerOnDisk => File(
+    FilePath.join(baseDir, LocalArchiveService.metadataDirectoryName, 'dirty'),
+  ).existsSync();
+
   @override
   String get description => "";
 
@@ -198,7 +202,7 @@ class LocalComic with HistoryMixin implements Comic {
     // Archive expansion never rewrites History, but keeping this reference
     // also protects navigation from unrelated refreshes while awaiting I/O.
     final history = HistoryManager().find(id, comicType);
-    if (hasArchiveMetadataOnDisk) {
+    if (hasArchiveMetadataOnDisk && !hasDirtyArchiveMarkerOnDisk) {
       final token = LocalArchiveCancellationToken();
       final stopwatch = Stopwatch()..start();
       var lastProgress = -1.0;
@@ -353,6 +357,9 @@ class LocalManager with ChangeNotifier {
   }
 
   late Database _db;
+  bool _isInitialized = false;
+
+  bool get isInitialized => _isInitialized;
 
   /// path to the directory where all the comics are stored
   late String path;
@@ -513,6 +520,7 @@ class LocalManager with ChangeNotifier {
     if (await _restoreDownloadingTasksOnInit()) {
       notifyListeners();
     }
+    _isInitialized = true;
   }
 
   Future<bool> _restoreDownloadingTasksOnInit() async {
@@ -635,8 +643,10 @@ class LocalManager with ChangeNotifier {
   void dispose() {
     _saveDownloadingTasksTimer?.cancel();
     saveCurrentDownloadingTasksInBackground(reason: 'dispose');
+    final closeDatabase = _isInitialized;
+    _isInitialized = false;
     super.dispose();
-    _db.close();
+    if (closeDatabase) _db.close();
   }
 
   List<LocalComic> getRecent() {
@@ -686,7 +696,7 @@ class LocalManager with ChangeNotifier {
       throw "Invalid ep";
     }
     var comic = find(id, type) ?? (throw "Comic Not Found");
-    if (comic.hasArchiveMetadataOnDisk) {
+    if (comic.hasArchiveMetadataOnDisk && !comic.hasDirtyArchiveMarkerOnDisk) {
       // Reading and exports share this path, so both transparently expand an
       // archived comic while retaining the ZIP and its reading identity.
       await LocalArchiveService().restore(comic);
@@ -990,6 +1000,52 @@ class LocalManager with ChangeNotifier {
     _trackDownloadingTasksFlush(future, snapshot);
     _resolveScheduledDownloadingTasksSave(future);
     return future;
+  }
+
+  /// Quiesces active tasks before an imported snapshot replaces their file.
+  /// Returns whether the first task should be resumed if the import rolls back.
+  Future<bool> prepareDownloadingTasksImport() async {
+    if (!_isInitialized) return false;
+    final shouldResume = downloadingTasks.firstOrNull?.isPaused == false;
+    for (final task in downloadingTasks) {
+      task.pause();
+    }
+    await flushCurrentDownloadingTasks();
+    return shouldResume;
+  }
+
+  /// Closes the legacy local index before an atomic full-backup replacement.
+  /// The manager object stays alive and is reopened by [reloadAfterFullDataImport].
+  Future<bool> prepareFullDataImport() async {
+    if (!_isInitialized) return false;
+    final shouldResume = await prepareDownloadingTasksImport();
+    _saveDownloadingTasksTimer?.cancel();
+    _saveDownloadingTasksTimer = null;
+    _db.close();
+    _isInitialized = false;
+    return shouldResume;
+  }
+
+  /// Reopens the local index after either a committed import or a rollback.
+  Future<void> reloadAfterFullDataImport({bool resumeFirst = false}) async {
+    downloadingTasks.clear();
+    _lastWrittenDownloadingTasksSnapshot = null;
+    await init();
+    if (resumeFirst) downloadingTasks.firstOrNull?.resume();
+    notifyListeners();
+  }
+
+  /// Reloads a committed backup snapshot without automatically starting work.
+  Future<void> reloadDownloadingTasksFromDisk() async {
+    if (!_isInitialized) return;
+    downloadingTasks.clear();
+    _lastWrittenDownloadingTasksSnapshot = null;
+    await _restoreDownloadingTasksOnInit();
+    notifyListeners();
+  }
+
+  void resumeFirstDownloadingTask() {
+    if (_isInitialized) downloadingTasks.firstOrNull?.resume();
   }
 
   void _trackDownloadingTasksFlush(Future<void> future, String snapshot) {
@@ -1412,7 +1468,7 @@ class LocalManager with ChangeNotifier {
     // Archived chapters are still downloaded. Treating the intentionally
     // absent loose directory as corruption would otherwise delete the comic
     // row and its reading progress during startup repair.
-    if (comic.hasArchiveMetadataOnDisk) {
+    if (comic.hasArchiveMetadataOnDisk && !comic.hasDirtyArchiveMarkerOnDisk) {
       return true;
     }
     var dir = Directory(

@@ -256,6 +256,7 @@ void main() {
       containsAll([
         LocalArchiveOperation.restore,
         LocalArchiveOperation.finalize,
+        LocalArchiveOperation.confirm,
       ]),
     );
     expect(openingProgress.last.fraction, 1);

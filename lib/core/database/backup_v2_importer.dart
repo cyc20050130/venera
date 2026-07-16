@@ -56,7 +56,11 @@ final class ImportedArchiveLink {
 final class BackupV2ImportResult {
   const BackupV2ImportResult({
     required this.historyCount,
+    required this.imageFavoriteCount,
+    required this.imageFavoriteAssetCount,
     required this.favoriteCollectionCount,
+    required this.cookieCount,
+    required this.downloadTaskCount,
     required this.localComicCount,
     required this.sourceCount,
     required this.availableArchiveCount,
@@ -64,7 +68,11 @@ final class BackupV2ImportResult {
   });
 
   final int historyCount;
+  final int imageFavoriteCount;
+  final int imageFavoriteAssetCount;
   final int favoriteCollectionCount;
+  final int cookieCount;
+  final int downloadTaskCount;
   final int localComicCount;
   final int sourceCount;
   final int availableArchiveCount;
@@ -103,15 +111,28 @@ final class BackupV2Importer {
         throw FormatException('Duplicate backup manifest path: ${entry.path}');
       }
       entriesByPath[entry.path] = entry;
-      payloads[entry.path] = File(
-        p.joinAll([directory.path, ...entry.path.split('/')]),
-      ).readAsBytesSync();
+      // Compatibility databases and image-favorite assets have already been
+      // checksum-validated as files. Keeping them out of this map prevents a
+      // full backup from being duplicated in memory and then in venera.db.
+      if (entry.path.startsWith('$backupLogicalDirectory/') &&
+          entry.kind != 'image_favorite_asset') {
+        payloads[entry.path] = File(
+          p.joinAll([directory.path, ...entry.path.split('/')]),
+        ).readAsBytesSync();
+      }
     }
 
     final projection = _BackupProjection.parse(
       payloads: payloads,
       entriesByPath: entriesByPath,
     );
+    bool hasLogicalPayload(String name) =>
+        payloads.containsKey('$backupLogicalDirectory/$name');
+    final importsAppState = hasLogicalPayload('appdata.json');
+    final importsImplicitData = hasLogicalPayload('implicit_data.json');
+    final importsImageFavorites = hasLogicalPayload('image_favorites.json');
+    final importsCookies = hasLogicalPayload('cookies.json');
+    final importsDownloadTasks = hasLogicalPayload('download_tasks.json');
     final previousLinks = await archiveLinks();
     final previousRelinks = <String, String>{
       for (final link in previousLinks)
@@ -122,6 +143,7 @@ final class BackupV2Importer {
     final importedAt = _clock().toUtc().millisecondsSinceEpoch;
     final archiveLinksToWrite = <_ArchiveLinkProjection>[];
     for (final comic in projection.localComics) {
+      if (!comic.expectsArchive) continue;
       archiveLinksToWrite.add(
         _buildArchiveLink(
           comic,
@@ -135,35 +157,34 @@ final class BackupV2Importer {
     await database.raw.writeTransaction((tx) async {
       await tx.execute('DELETE FROM backup_import');
       await tx.execute('DELETE FROM backup_payloads');
-      await tx.execute('DELETE FROM app_state');
+      if (importsAppState) {
+        if (importsImplicitData) {
+          await tx.execute('DELETE FROM app_state');
+        } else {
+          await tx.execute(
+            "DELETE FROM app_state WHERE section_key <> 'implicitData'",
+          );
+        }
+      } else if (importsImplicitData) {
+        await tx.execute(
+          "DELETE FROM app_state WHERE section_key = 'implicitData'",
+        );
+      }
       await tx.execute('DELETE FROM reading_history');
+      if (importsImageFavorites) {
+        await tx.execute('DELETE FROM image_favorites');
+      }
       await tx.execute('DELETE FROM favorite_collections');
+      if (importsCookies) await tx.execute('DELETE FROM cookies');
+      if (importsDownloadTasks) await tx.execute('DELETE FROM download_tasks');
       await tx.execute('DELETE FROM local_comics');
       await tx.execute('DELETE FROM local_archive_links');
       await tx.execute('DELETE FROM source_documents');
 
-      if (manifest.entries.isNotEmpty) {
-        await tx.executeBatch(
-          '''
-          INSERT INTO backup_payloads(path, kind, content, sha256, length)
-          VALUES (?, ?, ?, ?, ?)
-          ''',
-          manifest.entries
-              .map(
-                (entry) => <Object?>[
-                  entry.path,
-                  entry.kind,
-                  payloads[entry.path],
-                  entry.sha256,
-                  entry.length,
-                ],
-              )
-              .toList(growable: false),
-        );
-      }
       if (projection.appState.isNotEmpty) {
         await tx.executeBatch(
-          'INSERT INTO app_state(section_key, payload_json) VALUES (?, ?)',
+          'INSERT OR REPLACE INTO app_state(section_key, payload_json) '
+          'VALUES (?, ?)',
           projection.appState.entries
               .map((entry) => <Object?>[entry.key, jsonEncode(entry.value)])
               .toList(growable: false),
@@ -188,6 +209,25 @@ final class BackupV2Importer {
               .toList(growable: false),
         );
       }
+      if (projection.imageFavorites.isNotEmpty) {
+        await tx.executeBatch(
+          '''
+          INSERT INTO image_favorites(
+            identity_key, source_key, comic_id, payload_json
+          ) VALUES (?, ?, ?, ?)
+          ''',
+          projection.imageFavorites
+              .map(
+                (entry) => <Object?>[
+                  entry.identityKey,
+                  entry.sourceKey,
+                  entry.comicId,
+                  entry.payloadJson,
+                ],
+              )
+              .toList(growable: false),
+        );
+      }
       if (projection.favorites.isNotEmpty) {
         await tx.executeBatch(
           '''
@@ -196,6 +236,43 @@ final class BackupV2Importer {
           ''',
           projection.favorites.entries
               .map((entry) => <Object?>[entry.key, jsonEncode(entry.value)])
+              .toList(growable: false),
+        );
+      }
+      if (projection.cookies.isNotEmpty) {
+        await tx.executeBatch(
+          '''
+          INSERT INTO cookies(
+            name, value, domain, path, expires, secure, http_only
+          ) VALUES (?, ?, ?, ?, ?, ?, ?)
+          ''',
+          projection.cookies
+              .map((entry) => entry.parameters)
+              .toList(growable: false),
+        );
+      }
+      if (projection.downloadTasks.isNotEmpty) {
+        await tx.executeBatch(
+          '''
+          INSERT INTO download_tasks(
+            task_id, source_key, comic_id, chapter_id, state,
+            completed_units, total_units, payload_json, created_at, updated_at
+          ) VALUES (?, ?, ?, ?, 'paused', ?, ?, ?, ?, ?)
+          ''',
+          projection.downloadTasks
+              .map(
+                (entry) => <Object?>[
+                  entry.taskId,
+                  entry.sourceKey,
+                  entry.comicId,
+                  entry.chapterId,
+                  entry.completedUnits,
+                  entry.totalUnits,
+                  entry.payloadJson,
+                  importedAt,
+                  importedAt,
+                ],
+              )
               .toList(growable: false),
         );
       }
@@ -288,7 +365,11 @@ final class BackupV2Importer {
         .length;
     return BackupV2ImportResult(
       historyCount: projection.history.length,
+      imageFavoriteCount: projection.imageFavorites.length,
+      imageFavoriteAssetCount: projection.imageFavoriteAssets.length,
       favoriteCollectionCount: projection.favorites.length,
+      cookieCount: projection.cookies.length,
+      downloadTaskCount: projection.downloadTasks.length,
       localComicCount: projection.localComics.length,
       sourceCount: projection.sources.length,
       availableArchiveCount: availableCount,
@@ -482,14 +563,22 @@ final class _BackupProjection {
   const _BackupProjection({
     required this.appState,
     required this.history,
+    required this.imageFavorites,
+    required this.imageFavoriteAssets,
     required this.favorites,
+    required this.cookies,
+    required this.downloadTasks,
     required this.localComics,
     required this.sources,
   });
 
   final Map<String, Object?> appState;
   final List<_HistoryProjection> history;
+  final List<_ImageFavoriteProjection> imageFavorites;
+  final List<_ImageFavoriteAssetProjection> imageFavoriteAssets;
   final Map<String, Object?> favorites;
+  final List<_CookieProjection> cookies;
+  final List<_DownloadTaskProjection> downloadTasks;
   final List<_LocalComicProjection> localComics;
   final List<_SourceProjection> sources;
 
@@ -504,6 +593,13 @@ final class _BackupProjection {
     final appState = appdata == null
         ? <String, Object?>{}
         : _stringKeyedMap(appdata, path: 'logical/appdata.json');
+    final implicitData = _optionalJson(payloads, 'implicit_data.json');
+    if (implicitData != null) {
+      appState['implicitData'] = _stringKeyedMap(
+        implicitData,
+        path: 'logical/implicit_data.json',
+      );
+    }
 
     final historyValue = _optionalJson(payloads, 'history.json') ?? const [];
     if (historyValue is! List) {
@@ -517,10 +613,12 @@ final class _BackupProjection {
         path: 'logical/history.json[$index]',
       );
       final comicId = _requiredString(row['id'], 'history[$index].id');
-      final sourceKey = _requiredString(
+      final explicitSource = _optionalString(
         row['source_key'] ?? row['sourceKey'],
-        'history[$index].source_key',
       );
+      final type = _optionalNonNegativeInt(row['type']) ?? 0;
+      final sourceKey =
+          explicitSource ?? (type == 0 ? 'local' : 'Unknown:$type');
       final identity = ComicKey(
         sourceKey: sourceKey,
         comicId: comicId,
@@ -538,6 +636,42 @@ final class _BackupProjection {
       );
     }
 
+    final imageFavoritesValue =
+        _optionalJson(payloads, 'image_favorites.json') ?? const [];
+    if (imageFavoritesValue is! List) {
+      throw const FormatException(
+        'logical/image_favorites.json must be an array',
+      );
+    }
+    final imageFavorites = <_ImageFavoriteProjection>[];
+    final imageFavoriteKeys = <String>{};
+    for (var index = 0; index < imageFavoritesValue.length; index++) {
+      final row = _stringKeyedMap(
+        imageFavoritesValue[index],
+        path: 'logical/image_favorites.json[$index]',
+      );
+      final comicId = _requiredString(row['id'], 'image favorite[$index].id');
+      final sourceKey = _requiredString(
+        row['source_key'] ?? row['sourceKey'],
+        'image favorite[$index].source_key',
+      );
+      final identity = ComicKey(
+        sourceKey: sourceKey,
+        comicId: comicId,
+      ).storageKey;
+      if (!imageFavoriteKeys.add(identity)) {
+        throw FormatException('Duplicate image favorite identity: $identity');
+      }
+      imageFavorites.add(
+        _ImageFavoriteProjection(
+          identityKey: identity,
+          sourceKey: sourceKey,
+          comicId: comicId,
+          payloadJson: jsonEncode(row),
+        ),
+      );
+    }
+
     final favoritesValue =
         _optionalJson(payloads, 'favorites.json') ?? const {};
     if (favoritesValue is! Map) {
@@ -547,6 +681,191 @@ final class _BackupProjection {
       favoritesValue,
       path: 'logical/favorites.json',
     );
+
+    final imageFavoriteAssetsValue =
+        _optionalJson(payloads, 'image_favorite_assets.json') ?? const [];
+    if (imageFavoriteAssetsValue is! List) {
+      throw const FormatException(
+        'logical/image_favorite_assets.json must be an array',
+      );
+    }
+    final imageFavoriteAssets = <_ImageFavoriteAssetProjection>[];
+    final imageFavoriteAssetNames = <String>{};
+    final imageFavoriteAssetPaths = <String>{};
+    for (var index = 0; index < imageFavoriteAssetsValue.length; index++) {
+      final row = _stringKeyedMap(
+        imageFavoriteAssetsValue[index],
+        path: 'logical/image_favorite_assets.json[$index]',
+      );
+      final name = _requiredString(
+        row['name'],
+        'image favorite asset[$index].name',
+      );
+      if (!_isSafeAssetName(name) ||
+          !imageFavoriteAssetNames.add(name.toLowerCase())) {
+        throw FormatException(
+          'Invalid or duplicate image favorite asset name: $name',
+        );
+      }
+      final assetPath = _requiredString(
+        row['path'],
+        'image favorite asset[$index].path',
+      );
+      if (!assetPath.startsWith(
+            '$backupLogicalDirectory/image_favorite_assets/',
+          ) ||
+          !imageFavoriteAssetPaths.add(assetPath)) {
+        throw FormatException(
+          'Invalid or duplicate image favorite asset path: $assetPath',
+        );
+      }
+      final length = _requiredNonNegativeInt(
+        row['length'],
+        'image favorite asset[$index].length',
+      );
+      final digest = _requiredString(
+        row['sha256'],
+        'image favorite asset[$index].sha256',
+      );
+      if (!RegExp(r'^[0-9a-f]{64}$').hasMatch(digest)) {
+        throw FormatException('Invalid image favorite asset sha256: $name');
+      }
+      final manifestEntry = entriesByPath[assetPath];
+      if (manifestEntry == null ||
+          manifestEntry.kind != 'image_favorite_asset' ||
+          manifestEntry.length != length ||
+          manifestEntry.sha256 != digest) {
+        throw FormatException('Image favorite asset metadata mismatch: $name');
+      }
+      imageFavoriteAssets.add(
+        _ImageFavoriteAssetProjection(
+          name: name,
+          path: assetPath,
+          length: length,
+          sha256: digest,
+        ),
+      );
+    }
+    final unindexedImageAssets = entriesByPath.values
+        .where((entry) => entry.kind == 'image_favorite_asset')
+        .map((entry) => entry.path)
+        .toSet()
+        .difference(imageFavoriteAssetPaths);
+    if (unindexedImageAssets.isNotEmpty) {
+      throw const FormatException('Backup contains unindexed image assets');
+    }
+
+    final cookiesValue = _optionalJson(payloads, 'cookies.json') ?? const [];
+    if (cookiesValue is! List) {
+      throw const FormatException('logical/cookies.json must be an array');
+    }
+    final cookies = <_CookieProjection>[];
+    final cookieKeys = <String>{};
+    for (var index = 0; index < cookiesValue.length; index++) {
+      final row = _stringKeyedMap(
+        cookiesValue[index],
+        path: 'logical/cookies.json[$index]',
+      );
+      final name = _requiredString(row['name'], 'cookie[$index].name');
+      final value = _requiredString(
+        row['value'],
+        'cookie[$index].value',
+        allowEmpty: true,
+      );
+      final domain = _requiredString(row['domain'], 'cookie[$index].domain');
+      final path = _requiredString(row['path'] ?? '/', 'cookie[$index].path');
+      final expires = row['expires'] == null
+          ? null
+          : _requiredNonNegativeInt(row['expires'], 'cookie[$index].expires');
+      final secure = _requiredFlag(row['secure'], 'cookie[$index].secure');
+      final httpOnly = _requiredFlag(
+        row['httpOnly'] ?? row['http_only'],
+        'cookie[$index].httpOnly',
+      );
+      final key = jsonEncode([name, domain, path]);
+      if (!cookieKeys.add(key)) {
+        throw FormatException('Duplicate cookie identity: $key');
+      }
+      cookies.add(
+        _CookieProjection(
+          name: name,
+          value: value,
+          domain: domain,
+          path: path,
+          expires: expires,
+          secure: secure,
+          httpOnly: httpOnly,
+        ),
+      );
+    }
+
+    final downloadTasksValue =
+        _optionalJson(payloads, 'download_tasks.json') ?? const [];
+    if (downloadTasksValue is! List) {
+      throw const FormatException(
+        'logical/download_tasks.json must be an array',
+      );
+    }
+    final downloadTasks = <_DownloadTaskProjection>[];
+    final downloadTaskKeys = <String>{};
+    for (var index = 0; index < downloadTasksValue.length; index++) {
+      final row = _stringKeyedMap(
+        downloadTasksValue[index],
+        path: 'logical/download_tasks.json[$index]',
+      );
+      final type = _requiredString(row['type'], 'download task[$index].type');
+      final String sourceKey;
+      final String comicId;
+      switch (type) {
+        case 'ImagesDownloadTask':
+          sourceKey = _requiredString(
+            row['source'],
+            'download task[$index].source',
+          );
+          comicId = _requiredString(
+            row['comicId'],
+            'download task[$index].comicId',
+          );
+        case 'ArchiveDownloadTask':
+          final comic = _stringKeyedMap(
+            row['comic'],
+            path: 'download task[$index].comic',
+          );
+          sourceKey = _requiredString(
+            comic['sourceKey'] ?? comic['source_key'],
+            'download task[$index].comic.sourceKey',
+          );
+          comicId = _requiredString(
+            comic['id'],
+            'download task[$index].comic.id',
+          );
+        default:
+          throw FormatException('Unsupported download task type: $type');
+      }
+      final taskId = ComicKey(
+        sourceKey: sourceKey,
+        comicId: comicId,
+      ).storageKey;
+      if (!downloadTaskKeys.add(taskId)) {
+        throw FormatException('Duplicate download task identity: $taskId');
+      }
+      var completedUnits = _optionalNonNegativeInt(row['downloadedCount']) ?? 0;
+      var totalUnits = _optionalNonNegativeInt(row['totalCount']);
+      if (totalUnits != null && completedUnits > totalUnits) {
+        completedUnits = totalUnits;
+      }
+      downloadTasks.add(
+        _DownloadTaskProjection(
+          taskId: taskId,
+          sourceKey: sourceKey,
+          comicId: comicId,
+          chapterId: null,
+          completedUnits: completedUnits,
+          totalUnits: totalUnits,
+          payloadJson: jsonEncode(row),
+        ),
+      );
+    }
 
     final localValue = _optionalJson(payloads, 'local_index.json') ?? const {};
     if (localValue is! Map) {
@@ -589,19 +908,28 @@ final class _BackupProjection {
       final archive = archiveValue == null
           ? const <String, Object?>{}
           : _stringKeyedMap(archiveValue, path: 'local comic archive metadata');
-      var relativePath = _optionalString(archive['relativePath']);
-      var originalPath = _optionalString(archive['originalPath']);
-      if (relativePath == null &&
-          directory.isNotEmpty &&
-          !p.isAbsolute(directory) &&
-          !directory.startsWith('..')) {
-        relativePath = p.posix.join(
-          directory.replaceAll('\\', '/'),
-          '.venera',
-          'archive.zip',
-        );
-      } else if (originalPath == null && p.isAbsolute(directory)) {
-        originalPath = p.join(directory, '.venera', 'archive.zip');
+      final expectsArchive =
+          archive['exists'] == true ||
+          (!archive.containsKey('exists') && archive['length'] != null);
+      var relativePath = expectsArchive
+          ? _optionalString(archive['relativePath'])
+          : null;
+      var originalPath = expectsArchive
+          ? _optionalString(archive['originalPath'])
+          : null;
+      if (expectsArchive) {
+        if (relativePath == null &&
+            directory.isNotEmpty &&
+            !p.isAbsolute(directory) &&
+            !directory.startsWith('..')) {
+          relativePath = p.posix.join(
+            directory.replaceAll('\\', '/'),
+            '.venera',
+            'archive.zip',
+          );
+        } else if (originalPath == null && p.isAbsolute(directory)) {
+          originalPath = p.join(directory, '.venera', 'archive.zip');
+        }
       }
       localComics.add(
         _LocalComicProjection(
@@ -610,6 +938,7 @@ final class _BackupProjection {
           comicType: comicType,
           directory: directory,
           payloadJson: jsonEncode(row),
+          expectsArchive: expectsArchive,
           originalRoot: originalRoot,
           relativeArchivePath: relativePath,
           originalArchivePath: originalPath,
@@ -663,7 +992,11 @@ final class _BackupProjection {
     return _BackupProjection(
       appState: appState,
       history: history,
+      imageFavorites: imageFavorites,
+      imageFavoriteAssets: imageFavoriteAssets,
       favorites: favorites,
+      cookies: cookies,
+      downloadTasks: downloadTasks,
       localComics: localComics,
       sources: sources,
     );
@@ -684,6 +1017,84 @@ final class _HistoryProjection {
   final String payloadJson;
 }
 
+final class _ImageFavoriteProjection {
+  const _ImageFavoriteProjection({
+    required this.identityKey,
+    required this.sourceKey,
+    required this.comicId,
+    required this.payloadJson,
+  });
+
+  final String identityKey;
+  final String sourceKey;
+  final String comicId;
+  final String payloadJson;
+}
+
+final class _ImageFavoriteAssetProjection {
+  const _ImageFavoriteAssetProjection({
+    required this.name,
+    required this.path,
+    required this.length,
+    required this.sha256,
+  });
+
+  final String name;
+  final String path;
+  final int length;
+  final String sha256;
+}
+
+final class _CookieProjection {
+  const _CookieProjection({
+    required this.name,
+    required this.value,
+    required this.domain,
+    required this.path,
+    required this.expires,
+    required this.secure,
+    required this.httpOnly,
+  });
+
+  final String name;
+  final String value;
+  final String domain;
+  final String path;
+  final int? expires;
+  final int secure;
+  final int httpOnly;
+
+  List<Object?> get parameters => [
+    name,
+    value,
+    domain,
+    path,
+    expires,
+    secure,
+    httpOnly,
+  ];
+}
+
+final class _DownloadTaskProjection {
+  const _DownloadTaskProjection({
+    required this.taskId,
+    required this.sourceKey,
+    required this.comicId,
+    required this.chapterId,
+    required this.completedUnits,
+    required this.totalUnits,
+    required this.payloadJson,
+  });
+
+  final String taskId;
+  final String sourceKey;
+  final String comicId;
+  final String? chapterId;
+  final int completedUnits;
+  final int? totalUnits;
+  final String payloadJson;
+}
+
 final class _LocalComicProjection {
   const _LocalComicProjection({
     required this.identityKey,
@@ -691,6 +1102,7 @@ final class _LocalComicProjection {
     required this.comicType,
     required this.directory,
     required this.payloadJson,
+    required this.expectsArchive,
     required this.originalRoot,
     required this.relativeArchivePath,
     required this.originalArchivePath,
@@ -702,6 +1114,7 @@ final class _LocalComicProjection {
   final String comicType;
   final String directory;
   final String payloadJson;
+  final bool expectsArchive;
   final String? originalRoot;
   final String? relativeArchivePath;
   final String? originalArchivePath;
@@ -799,6 +1212,21 @@ int? _optionalNonNegativeInt(Object? value) {
   return result != null && result >= 0 ? result : null;
 }
 
+int _requiredFlag(Object? value, String field) {
+  return switch (value) {
+    true || 1 || '1' => 1,
+    null || false || 0 || '0' => 0,
+    _ => throw FormatException('Invalid $field'),
+  };
+}
+
+bool _isSafeAssetName(String value) {
+  return normalizeBackupEntryPath(value) == value &&
+      !value.contains('/') &&
+      !value.contains('\\') &&
+      p.basename(value) == value;
+}
+
 String _localIdentity(String comicId, String comicType) {
   return jsonEncode([comicType, comicId]);
 }
@@ -861,10 +1289,12 @@ bool _archivePairMatches(
   try {
     final archive = File(archivePath);
     if (!archive.existsSync() ||
-        archive.statSync().type != FileSystemEntityType.file ||
-        (expectedLength != null && archive.lengthSync() != expectedLength)) {
+        archive.statSync().type != FileSystemEntityType.file) {
       return false;
     }
+    // Recompression legitimately changes the ZIP length. The companion
+    // manifest identity is authoritative; [expectedLength] remains useful as
+    // display/provenance metadata but must not prevent automatic relinking.
     final manifest = File(p.join(archive.parent.path, 'manifest.json'));
     if (!manifest.existsSync()) return false;
     final decoded = jsonDecode(manifest.readAsStringSync());

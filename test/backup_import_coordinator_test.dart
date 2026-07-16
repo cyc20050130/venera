@@ -138,6 +138,94 @@ void main() {
     _expectNoTransactionArtifacts(root);
   });
 
+  test('failure after durable commit never rolls imported data back', () async {
+    final target = File(p.join(root.path, 'history.db'))
+      ..writeAsStringSync('old-history');
+    final imported = File(p.join(source.path, 'history.db'))
+      ..writeAsStringSync('new-history');
+    final coordinator = BackupImportCoordinator(
+      root,
+      operationId: 'post-commit-failure',
+      afterStep: (step) async {
+        if (step == 'committed') {
+          throw StateError('simulated stop after durable commit');
+        }
+      },
+    );
+    final prepared = await coordinator.prepare([
+      BackupImportSource(relativePath: 'history.db', source: imported),
+    ]);
+
+    await expectLater(coordinator.commit(prepared), throwsA(isA<StateError>()));
+    expect(target.readAsStringSync(), 'new-history');
+
+    await BackupImportCoordinator(root).recoverInterruptedImport();
+    expect(target.readAsStringSync(), 'new-history');
+    _expectNoTransactionArtifacts(root);
+  });
+
+  test('explicit rollback cannot revert a durably committed import', () async {
+    final target = File(p.join(root.path, 'history.db'))
+      ..writeAsStringSync('old-history');
+    final imported = File(p.join(source.path, 'history.db'))
+      ..writeAsStringSync('new-history');
+    final coordinator = BackupImportCoordinator(
+      root,
+      operationId: 'committed-rollback',
+      afterStep: (step) async {
+        if (step == 'committed') {
+          throw StateError('leave committed artifacts for recovery');
+        }
+      },
+    );
+    final prepared = await coordinator.prepare([
+      BackupImportSource(relativePath: 'history.db', source: imported),
+    ]);
+
+    await expectLater(coordinator.commit(prepared), throwsA(isA<StateError>()));
+    await coordinator.rollback(prepared);
+
+    expect(target.readAsStringSync(), 'new-history');
+    _expectNoTransactionArtifacts(root);
+  });
+
+  test(
+    'partial committed-journal cleanup never exposes installed state',
+    () async {
+      final target = File(p.join(root.path, 'history.db'))
+        ..writeAsStringSync('old-history');
+      final imported = File(p.join(source.path, 'history.db'))
+        ..writeAsStringSync('new-history');
+      final coordinator = BackupImportCoordinator(
+        root,
+        operationId: 'partial-cleanup',
+        afterStep: (step) async {
+          if (step == 'committed') {
+            throw StateError('leave committed artifacts for recovery');
+          }
+        },
+      );
+      final prepared = await coordinator.prepare([
+        BackupImportSource(relativePath: 'history.db', source: imported),
+      ]);
+
+      await expectLater(
+        coordinator.commit(prepared),
+        throwsA(isA<StateError>()),
+      );
+      // Cleanup removes older candidates first. Simulate a process stop after
+      // that deletion but before the committed journal is removed.
+      await File(
+        p.join(root.path, '.venera-backup-import.json.previous'),
+      ).delete();
+
+      await BackupImportCoordinator(root).recoverInterruptedImport();
+
+      expect(target.readAsStringSync(), 'new-history');
+      _expectNoTransactionArtifacts(root);
+    },
+  );
+
   test('prepare rejects traversal and overlapping targets', () async {
     final file = File(p.join(source.path, 'data'))..writeAsStringSync('data');
     final directory = Directory(p.join(source.path, 'directory'))..createSync();
@@ -152,6 +240,14 @@ void main() {
       BackupImportCoordinator(root).prepare([
         BackupImportSource(relativePath: 'comic_source', source: directory),
         BackupImportSource(relativePath: 'comic_source/a.json', source: file),
+      ]),
+      throwsA(isA<FormatException>()),
+    );
+    await expectLater(
+      BackupImportCoordinator(root).prepare([
+        BackupImportSource(relativePath: 'a', source: directory),
+        BackupImportSource(relativePath: 'a-b', source: file),
+        BackupImportSource(relativePath: 'a/c', source: file),
       ]),
       throwsA(isA<FormatException>()),
     );

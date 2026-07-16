@@ -282,6 +282,14 @@ class ComicSource {
     );
   }
 
+  /// Waits for an already scheduled source-state write without starting a
+  /// sync upload or creating a new file.
+  Future<void> flushPendingDataWrite() async {
+    while (_isSaving || _haveWaitingTask) {
+      await Future<void>.delayed(const Duration(milliseconds: 20));
+    }
+  }
+
   Future<bool> reLogin() async {
     final accountCredentials = storedAccountCredentials;
     if (accountCredentials == null || account?.login == null) {

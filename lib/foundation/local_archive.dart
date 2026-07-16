@@ -21,6 +21,7 @@ enum LocalArchiveOperation {
   verify,
   restore,
   finalize,
+  confirm,
   cleanup,
   reconcile,
 }
@@ -63,7 +64,8 @@ double localArchiveOverallProgress(LocalArchiveProgress progress) {
     LocalArchiveOperation.verify => 0.6 + fraction * 0.28,
     LocalArchiveOperation.reconcile => 0.88 + fraction * 0.02,
     LocalArchiveOperation.restore => fraction * 0.85,
-    LocalArchiveOperation.finalize => 0.85 + fraction * 0.15,
+    LocalArchiveOperation.finalize => 0.85 + fraction * 0.1,
+    LocalArchiveOperation.confirm => 0.95 + fraction * 0.05,
     LocalArchiveOperation.cleanup => 0.9 + fraction * 0.1,
   };
 }
@@ -106,6 +108,7 @@ String localArchiveProgressStageKey(LocalArchiveOperation operation) {
     LocalArchiveOperation.verify => 'Verifying compressed file',
     LocalArchiveOperation.restore => 'Opening compressed comic',
     LocalArchiveOperation.finalize => 'Preparing comic',
+    LocalArchiveOperation.confirm => 'Checking source files',
     LocalArchiveOperation.cleanup => 'Cleaning source files',
     LocalArchiveOperation.reconcile => 'Checking source files',
   };
@@ -632,7 +635,14 @@ class LocalArchiveService {
         final pair = await _readValidPair(root, comic, throwOnInvalid: true);
         if (pair == null) {
           return _resultFromSnapshot(
-            await _inspectRoot(root, comic),
+            await _inspectRoot(
+              root,
+              comic,
+              cancellationToken: token,
+              onProgress: onProgress,
+              operation: LocalArchiveOperation.confirm,
+              knownPair: pair,
+            ),
             rebuiltArchive: false,
           );
         }
@@ -641,7 +651,14 @@ class LocalArchiveService {
         // resurrect content. Writers must call restore before markDirty.
         if (await _dirtyMarker(root).exists()) {
           return _resultFromSnapshot(
-            await _inspectRoot(root, comic),
+            await _inspectRoot(
+              root,
+              comic,
+              cancellationToken: token,
+              onProgress: onProgress,
+              operation: LocalArchiveOperation.confirm,
+              knownPair: pair,
+            ),
             rebuiltArchive: false,
           );
         }
@@ -650,7 +667,14 @@ class LocalArchiveService {
               pair.manifest.identity,
             ) &&
             !await _cleanupMarker(root).exists()) {
-          final expandedSnapshot = await _inspectRoot(root, comic);
+          final expandedSnapshot = await _inspectRoot(
+            root,
+            comic,
+            cancellationToken: token,
+            onProgress: onProgress,
+            operation: LocalArchiveOperation.confirm,
+            knownPair: pair,
+          );
           if (expandedSnapshot.state == LocalStorageState.expanded) {
             return _resultFromSnapshot(expandedSnapshot, rebuiltArchive: false);
           }
@@ -669,7 +693,14 @@ class LocalArchiveService {
         await _cleanupMarker(root).deleteIgnoreError();
         await _writeMarker(_expandedMarker(root), pair.manifest.identity);
         return _resultFromSnapshot(
-          await _inspectRoot(root, comic),
+          await _inspectRoot(
+            root,
+            comic,
+            cancellationToken: token,
+            onProgress: onProgress,
+            operation: LocalArchiveOperation.confirm,
+            knownPair: pair,
+          ),
           rebuiltArchive: false,
         );
       });
@@ -1026,8 +1057,12 @@ class LocalArchiveService {
 
   Future<LocalArchiveSnapshot> _inspectRoot(
     Directory root,
-    LocalComic comic,
-  ) async {
+    LocalComic comic, {
+    LocalArchiveCancellationToken? cancellationToken,
+    LocalArchiveProgressCallback? onProgress,
+    LocalArchiveOperation operation = LocalArchiveOperation.inspect,
+    _ArchivePair? knownPair,
+  }) async {
     if (!await root.exists()) {
       return const LocalArchiveSnapshot(
         state: LocalStorageState.missing,
@@ -1040,8 +1075,9 @@ class LocalArchiveService {
       root,
       comic,
       hashFiles: false,
-      cancellationToken: LocalArchiveCancellationToken(),
-      operation: LocalArchiveOperation.inspect,
+      cancellationToken: cancellationToken ?? LocalArchiveCancellationToken(),
+      onProgress: onProgress,
+      operation: operation,
     );
     final looseBytes = files.fold(0, (sum, file) => sum + file.size);
     final archive = _archiveFile(root);
@@ -1058,7 +1094,8 @@ class LocalArchiveService {
       );
     }
     try {
-      final pair = await _readValidPair(root, comic, throwOnInvalid: true);
+      final pair =
+          knownPair ?? await _readValidPair(root, comic, throwOnInvalid: true);
       if (pair == null) {
         throw const LocalArchiveException('Archive manifest is missing');
       }

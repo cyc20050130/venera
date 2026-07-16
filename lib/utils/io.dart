@@ -530,7 +530,7 @@ Future<String?> selectDirectoryIOS() async {
   return IOSDirectoryPicker.selectDirectory();
 }
 
-Future<void> saveFile({
+Future<String?> saveFile({
   Uint8List? data,
   required String filename,
   File? file,
@@ -552,7 +552,7 @@ Future<void> saveFile({
     }
     if (App.isMobile) {
       final params = SaveFileDialogParams(sourceFilePath: file!.path);
-      await FlutterFileDialog.saveFile(params: params);
+      return await FlutterFileDialog.saveFile(params: params);
     } else {
       final result = await file_selector.getSaveLocation(
         suggestedName: filename,
@@ -560,7 +560,9 @@ Future<void> saveFile({
       if (result != null) {
         var xFile = file_selector.XFile(file!.path);
         await xFile.saveTo(result.path);
+        return result.path;
       }
+      return null;
     }
   } finally {
     await cacheDir?.deleteIgnoreError(recursive: true);

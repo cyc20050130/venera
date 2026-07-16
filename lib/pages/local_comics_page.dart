@@ -307,7 +307,7 @@ class _LocalComicsPageState extends State<LocalComicsPage> {
     final snapshot = _archiveSnapshots[key];
     return localArchiveBadgeKey(
       snapshot?.state ??
-          (comic.hasArchiveMetadataOnDisk
+          (comic.hasArchiveMetadataOnDisk && !comic.hasDirtyArchiveMarkerOnDisk
               ? LocalStorageState.archived
               : LocalStorageState.loose),
       operationRunning: _activeArchiveKeys.contains(key),
@@ -319,7 +319,7 @@ class _LocalComicsPageState extends State<LocalComicsPage> {
     final snapshot = _archiveSnapshots[_archiveKey(comic)];
     final action = localArchiveUiActionForState(
       snapshot?.state ??
-          (comic.hasArchiveMetadataOnDisk
+          (comic.hasArchiveMetadataOnDisk && !comic.hasDirtyArchiveMarkerOnDisk
               ? LocalStorageState.archived
               : LocalStorageState.loose),
     );
@@ -929,7 +929,8 @@ class _LocalComicsPageState extends State<LocalComicsPage> {
       // For each comic, export it to a file
       for (var comic in comics) {
         if (canceled) return;
-        if (comic.hasArchiveMetadataOnDisk) {
+        if (comic.hasArchiveMetadataOnDisk &&
+            !comic.hasDirtyArchiveMarkerOnDisk) {
           // PDF export reads the loose tree directly, while CBZ/EPUB use
           // LocalManager.getImages. Restore here so every export format has
           // identical archived-comic behavior and the retained ZIP stays

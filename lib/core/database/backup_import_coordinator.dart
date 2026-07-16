@@ -140,6 +140,7 @@ final class BackupImportCoordinator {
     }
     journal = journal.next(_ImportPhase.committing);
     await _writeJournal(journal);
+    var durablyCommitted = false;
     try {
       await _backup.create(recursive: true);
       for (final entry in journal.entries) {
@@ -164,10 +165,20 @@ final class BackupImportCoordinator {
       await verify?.call();
       journal = journal.next(_ImportPhase.committed);
       await _writeJournal(journal);
+      durablyCommitted = true;
       await _notify('committed');
       await _cleanupTransactionFiles();
     } catch (error, stackTrace) {
-      await _rollbackJournal(journal);
+      // Once the committed journal is durable, the imported data is
+      // authoritative. Cleanup can be retried at startup, but rolling back
+      // after some retained originals have already been deleted could create
+      // an unrecoverable mixture of old and new files.
+      if (!durablyCommitted) {
+        final latest = await _readLatestJournal();
+        if (latest?.phase != _ImportPhase.committed) {
+          await _rollbackJournal(latest ?? journal);
+        }
+      }
       Error.throwWithStackTrace(error, stackTrace);
     }
   }
@@ -180,6 +191,14 @@ final class BackupImportCoordinator {
     }
     if (prepared != null && prepared.operationId != journal.operationId) {
       throw StateError('Prepared backup import does not match the journal');
+    }
+    // A committed journal is the transaction's durable commit point. Callers
+    // can still reach rollback from a broad error handler when only the
+    // post-commit cleanup failed; restoring retained originals at that point
+    // would turn a successful import into a mixed or reverted data set.
+    if (journal.phase == _ImportPhase.committed) {
+      await _cleanupTransactionFiles();
+      return;
     }
     await _rollbackJournal(journal);
   }
@@ -273,9 +292,29 @@ final class BackupImportCoordinator {
   }
 
   Future<void> _deleteJournalCandidates() async {
-    await _journal.deleteIfExists();
-    await _journalTemp.deleteIfExists();
-    await _journalPrevious.deleteIfExists();
+    final candidates = <({File file, int sequence})>[];
+    for (final file in [_journalPrevious, _journalTemp, _journal]) {
+      var sequence = -1;
+      if (await file.exists()) {
+        try {
+          final parsed = _ImportJournal.tryParse(
+            jsonDecode(await file.readAsString()),
+          );
+          sequence = parsed?.sequence ?? -1;
+        } catch (_) {
+          // Invalid candidates cannot be used for recovery and are removed
+          // before every valid journal.
+        }
+      }
+      candidates.add((file: file, sequence: sequence));
+    }
+    // Keep the newest durable state until last. If the process stops during
+    // cleanup, recovery therefore never observes an older pre-commit journal
+    // after the committed journal has already disappeared.
+    candidates.sort((a, b) => a.sequence.compareTo(b.sequence));
+    for (final candidate in candidates) {
+      await candidate.file.deleteIfExists();
+    }
   }
 
   Future<void> _notify(String step) async {
@@ -402,12 +441,17 @@ String _normalizeRelativePath(String value) {
 }
 
 void _rejectOverlappingPaths(Iterable<String> paths) {
-  final normalized = paths.map((path) => path.toLowerCase()).toList()..sort();
-  for (var index = 1; index < normalized.length; index++) {
-    if (normalized[index].startsWith('${normalized[index - 1]}/')) {
-      throw FormatException(
-        'Overlapping backup import paths: ${normalized[index - 1]}',
-      );
+  final normalized = paths.map((path) => path.toLowerCase()).toSet();
+  if (normalized.length != paths.length) {
+    throw const FormatException('Duplicate backup import path');
+  }
+  for (final path in normalized) {
+    final segments = path.split('/');
+    for (var index = 1; index < segments.length; index++) {
+      final ancestor = segments.take(index).join('/');
+      if (normalized.contains(ancestor)) {
+        throw FormatException('Overlapping backup import paths: $ancestor');
+      }
     }
   }
 }

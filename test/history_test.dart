@@ -1,12 +1,15 @@
 import 'dart:convert';
 import 'dart:io';
 import 'dart:isolate';
+import 'dart:typed_data';
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:sqlite3/sqlite3.dart';
 import 'package:venera/foundation/comic_type.dart';
 import 'package:venera/foundation/app.dart';
 import 'package:venera/foundation/history.dart';
+import 'package:venera/foundation/local.dart';
+import 'package:venera/utils/backup_v2.dart';
 import 'package:venera/utils/data.dart';
 import 'package:zip_flutter/zip_flutter.dart';
 
@@ -599,7 +602,6 @@ void main() {
         'searchHistory': <String>[],
       }),
     );
-    await File('${tempDir.path}/cookie.db').writeAsBytes([]);
     await File('${tempDir.path}/local_favorite.db').writeAsBytes([]);
     await Directory('${tempDir.path}/comic_source').create(recursive: true);
 
@@ -621,6 +623,8 @@ void main() {
     );
 
     final exported = await exportAppData(false);
+    final manifest = await validateBackupV2Archive(exported);
+    expect(manifest.isCompleteRewriteBackup, isTrue);
     final extractDir = await Directory.systemTemp.createTemp(
       'venera-history-export-extract-',
     );
@@ -729,6 +733,203 @@ void main() {
       await targetCacheDir.delete(recursive: true);
     },
   );
+
+  test(
+    'full Backup V2 restores local index and image favorite bytes',
+    () async {
+      final source = await Directory.systemTemp.createTemp(
+        'venera-full-backup-source-',
+      );
+      final importedLocalRoot = Directory('${source.path}/local')..createSync();
+      Directory('${importedLocalRoot.path}/comic-dir').createSync();
+      final sourceAssets = Directory('${source.path}/image_favorites')
+        ..createSync();
+      const assetName = '0123456789abcdef0123456789abcdef';
+      final expectedBytes = Uint8List.fromList([0, 1, 2, 127, 128, 254, 255]);
+      File('${sourceAssets.path}/$assetName').writeAsBytesSync(expectedBytes);
+      File('${source.path}/appdata.json').writeAsStringSync(
+        jsonEncode({
+          'settings': <String, dynamic>{},
+          'searchHistory': <String>[],
+        }),
+      );
+      final sourceLocalDatabase = sqlite3.open('${source.path}/local.db');
+      sourceLocalDatabase.execute('''
+      CREATE TABLE comics(
+        id TEXT NOT NULL,
+        title TEXT NOT NULL,
+        subtitle TEXT NOT NULL,
+        tags TEXT NOT NULL,
+        directory TEXT NOT NULL,
+        chapters TEXT NOT NULL,
+        cover TEXT NOT NULL,
+        comic_type INTEGER NOT NULL,
+        downloadedChapters TEXT NOT NULL,
+        created_at INTEGER,
+        PRIMARY KEY (id, comic_type)
+      );
+    ''');
+      sourceLocalDatabase.execute(
+        'INSERT INTO comics VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+        [
+          'local-import',
+          'Imported',
+          '',
+          '[]',
+          'comic-dir',
+          '',
+          '',
+          42,
+          '[]',
+          1,
+        ],
+      );
+      sourceLocalDatabase.close();
+
+      final logical = buildBackupV2Payload(
+        dataPath: source.path,
+        appVersion: '2.0.0-test',
+        localRoot: importedLocalRoot.path,
+        imageFavoriteAssetsPath: sourceAssets.path,
+      );
+      final payload = extendBackupV2Payload(logical, {
+        'local.db': File('${source.path}/local.db').readAsBytesSync(),
+        'local_path': Uint8List.fromList(utf8.encode(importedLocalRoot.path)),
+      });
+      final backup = File('${source.path}/full-backup.venera');
+      _writeBackupV2Archive(backup, payload);
+
+      final targetLocalRoot = Directory('${tempDir.path}/old-local')
+        ..createSync();
+      File(
+        '${tempDir.path}/local_path',
+      ).writeAsStringSync(targetLocalRoot.path);
+      final oldAssets = Directory('${tempCacheDir.path}/image_favorites')
+        ..createSync();
+      File('${oldAssets.path}/stale').writeAsBytesSync([9, 9, 9]);
+      await LocalManager().init();
+      addTearDown(() async {
+        if (LocalManager().isInitialized) {
+          await LocalManager().prepareFullDataImport();
+        }
+      });
+
+      await importAppData(backup);
+
+      expect(
+        File('${tempDir.path}/local_path').readAsStringSync(),
+        importedLocalRoot.path,
+      );
+      final importedLocalDatabase = sqlite3.open('${tempDir.path}/local.db');
+      final importedRows = importedLocalDatabase.select(
+        "SELECT id, title FROM comics WHERE id = 'local-import'",
+      );
+      importedLocalDatabase.close();
+      expect(importedRows.single['title'], 'Imported');
+      expect(LocalManager().path, importedLocalRoot.path);
+      expect(
+        LocalManager().find('local-import', const ComicType(42))?.title,
+        'Imported',
+      );
+      expect(File('${oldAssets.path}/stale').existsSync(), isFalse);
+      expect(
+        File('${oldAssets.path}/$assetName').readAsBytesSync(),
+        expectedBytes,
+      );
+
+      await source.delete(recursive: true);
+    },
+  );
+
+  test(
+    'full backup keeps current local path when imported path is unavailable',
+    () async {
+      final source = await Directory.systemTemp.createTemp(
+        'venera-unavailable-local-path-',
+      );
+      final unavailable = '${source.path}/missing-local-root';
+      File('${source.path}/appdata.json').writeAsStringSync(
+        jsonEncode({
+          'settings': <String, dynamic>{},
+          'searchHistory': <String>[],
+        }),
+      );
+      final logical = buildBackupV2Payload(
+        dataPath: source.path,
+        appVersion: '2.0.0-test',
+        localRoot: unavailable,
+      );
+      final payload = extendBackupV2Payload(logical, {
+        'local_path': Uint8List.fromList(utf8.encode(unavailable)),
+      });
+      final backup = File('${source.path}/full-backup.venera');
+      _writeBackupV2Archive(backup, payload);
+
+      final currentRoot = Directory('${tempDir.path}/current-local')
+        ..createSync();
+      File('${tempDir.path}/local_path').writeAsStringSync(currentRoot.path);
+
+      await importAppData(backup);
+
+      expect(
+        File('${tempDir.path}/local_path').readAsStringSync(),
+        currentRoot.path,
+      );
+      await source.delete(recursive: true);
+    },
+  );
+
+  test('full backup ignores an empty imported local path', () async {
+    final source = await Directory.systemTemp.createTemp(
+      'venera-empty-imported-local-path-',
+    );
+    final importedEmptyRoot = Directory('${source.path}/empty-local')
+      ..createSync();
+    File('${source.path}/appdata.json').writeAsStringSync(
+      jsonEncode({
+        'settings': <String, dynamic>{},
+        'searchHistory': <String>[],
+      }),
+    );
+    final logical = buildBackupV2Payload(
+      dataPath: source.path,
+      appVersion: '2.0.0-test',
+      localRoot: importedEmptyRoot.path,
+    );
+    final payload = extendBackupV2Payload(logical, {
+      'local_path': Uint8List.fromList(utf8.encode(importedEmptyRoot.path)),
+    });
+    final backup = File('${source.path}/full-backup.venera');
+    _writeBackupV2Archive(backup, payload);
+
+    final currentRoot = Directory('${tempDir.path}/current-local-with-data')
+      ..createSync();
+    File('${currentRoot.path}/existing.jpg').writeAsBytesSync([1]);
+    File('${tempDir.path}/local_path').writeAsStringSync(currentRoot.path);
+
+    await importAppData(backup);
+
+    expect(
+      File('${tempDir.path}/local_path').readAsStringSync(),
+      currentRoot.path,
+    );
+    await source.delete(recursive: true);
+  });
+}
+
+void _writeBackupV2Archive(File output, BackupV2Payload payload) {
+  final zip = ZipFile.open(output.path);
+  try {
+    for (final entry in payload.entries.entries) {
+      zip.addFileFromBytes(entry.key, entry.value);
+    }
+    zip.addFileFromBytes(
+      backupManifestEntryName,
+      Uint8List.fromList(utf8.encode(jsonEncode(payload.manifest.toJson()))),
+    );
+  } finally {
+    zip.close();
+  }
 }
 
 class _TestHistoryMetadata with HistoryMixin {

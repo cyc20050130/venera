@@ -2,7 +2,9 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:isolate';
 
+import 'package:crypto/crypto.dart';
 import 'package:flutter/foundation.dart' show visibleForTesting;
+import 'package:path/path.dart' as p;
 import 'package:sqlite3/sqlite3.dart';
 import 'package:venera/core/database/app_database.dart';
 import 'package:venera/core/database/backup_import_coordinator.dart';
@@ -13,6 +15,7 @@ import 'package:venera/foundation/comic_source/comic_source.dart';
 import 'package:venera/foundation/comic_type.dart';
 import 'package:venera/foundation/favorites.dart';
 import 'package:venera/foundation/history.dart';
+import 'package:venera/foundation/local.dart';
 import 'package:venera/foundation/log.dart';
 import 'package:venera/network/cookie_jar.dart';
 import 'package:venera/utils/ext.dart';
@@ -167,6 +170,20 @@ List<({String archiveName, String path})> buildAppDataExportEntries(
     ),
     (archiveName: "appdata.json", path: appdataPath),
     (archiveName: "cookie.db", path: FilePath.join(dataPath, "cookie.db")),
+    if (!sync)
+      (
+        archiveName: "implicitData.json",
+        path: FilePath.join(dataPath, "implicitData.json"),
+      ),
+    if (!sync)
+      (
+        archiveName: "downloading_tasks.json",
+        path: FilePath.join(dataPath, "downloading_tasks.json"),
+      ),
+    if (!sync)
+      (archiveName: "local.db", path: FilePath.join(dataPath, "local.db")),
+    if (!sync)
+      (archiveName: "local_path", path: FilePath.join(dataPath, "local_path")),
   ];
   return entries.where((entry) => File(entry.path).existsSync()).toList();
 }
@@ -191,24 +208,12 @@ File createAppDataImportCacheFile() {
 
 @visibleForTesting
 String? normalizeDataArchiveEntryName(Object? rawName) {
-  if (rawName is! String || rawName.isEmpty || rawName.contains('\u0000')) {
-    return null;
-  }
-  final normalized = rawName.replaceAll('\\', '/');
-  if (normalized.startsWith('/') ||
-      RegExp(r'^[A-Za-z]:').hasMatch(normalized)) {
-    return null;
-  }
-  final segments = normalized.split('/');
-  if (segments.any((segment) => segment == '..' || segment == '.')) {
-    return null;
-  }
-  final cleanSegments = segments
-      .where((segment) => segment.isNotEmpty)
-      .toList();
-  if (cleanSegments.isEmpty) return null;
-  return cleanSegments.join('/');
+  return normalizeBackupEntryPath(rawName);
 }
+
+const int _maxDataArchiveEntries = 100000;
+const int _maxDataArchiveEntryBytes = 2 * 1024 * 1024 * 1024;
+const int _maxDataArchiveExpandedBytes = 8 * 1024 * 1024 * 1024;
 
 Future<void> _extractDataArchiveSafely(
   String archivePath,
@@ -220,10 +225,13 @@ Future<void> _extractDataArchiveSafely(
     final seen = <String>{};
     try {
       final entries = archive.getAllEntries();
-      if (entries.length > 100000) {
+      if (entries.length > _maxDataArchiveEntries) {
         throw const FormatException('Archive contains too many entries');
       }
-      for (final entry in entries) {
+      final plannedEntries = <({int index, String relative})>[];
+      var expandedBytes = 0;
+      for (var index = 0; index < entries.length; index++) {
+        final entry = entries[index];
         final relative = normalizeDataArchiveEntryName(entry.name);
         if (relative == null) {
           throw FormatException('Unsafe archive entry: ${entry.name}');
@@ -235,16 +243,39 @@ Future<void> _extractDataArchiveSafely(
         if (!seen.add(duplicateKey)) {
           throw FormatException('Duplicate archive entry: ${entry.name}');
         }
+        if (entry.size < 0 || entry.size > _maxDataArchiveEntryBytes) {
+          throw FormatException('Archive entry is too large: ${entry.name}');
+        }
+        if (relative == backupManifestEntryName &&
+            entry.size > maxBackupManifestBytes) {
+          throw const FormatException('Backup manifest is too large');
+        }
+        expandedBytes += entry.size;
+        if (expandedBytes > _maxDataArchiveExpandedBytes) {
+          throw const FormatException('Archive expands beyond the size limit');
+        }
         final outputPath = FilePath.join(destinationPath, relative);
         if (!isPathInsideDirectory(outputPath, destinationPath)) {
           throw FormatException(
             'Archive entry escapes destination: ${entry.name}',
           );
         }
+        plannedEntries.add((index: index, relative: relative));
+      }
+      // Complete validation before writing the first byte. A malformed or
+      // oversized archive therefore cannot leave a partially expanded tree.
+      for (final planned in plannedEntries) {
+        final entry = entries[planned.index];
+        final outputPath = FilePath.join(destinationPath, planned.relative);
         if (entry.isDir) {
           Directory(outputPath).createSync(recursive: true);
         } else {
           entry.writeToFile(outputPath);
+          if (File(outputPath).lengthSync() != entry.size) {
+            throw FormatException(
+              'Archive entry length mismatch: ${entry.name}',
+            );
+          }
         }
       }
     } finally {
@@ -263,7 +294,21 @@ Directory buildAppDataImportDirectory(
   return Directory(FilePath.join(cachePath, '$prefix-$id'));
 }
 
-Future<File> exportAppData([bool sync = true]) async {
+Future<File> exportAppData([bool sync = true]) {
+  return _exportAppData(sync: sync, flushRuntimeState: true);
+}
+
+/// Creates the mandatory rewrite backup before legacy managers are opened.
+/// Persisting [appdata] here would overwrite the legacy on-disk settings with
+/// constructor defaults, so this entry point snapshots disk state as-is.
+Future<File> exportAppDataForRewrite() {
+  return _exportAppData(sync: false, flushRuntimeState: false);
+}
+
+Future<File> _exportAppData({
+  required bool sync,
+  required bool flushRuntimeState,
+}) async {
   var cacheFile = buildAppDataExportFile(App.cachePath);
   var tempFile = File('${cacheFile.path}.tmp');
   final snapshotDirectory = buildAppDataImportDirectory(
@@ -271,10 +316,33 @@ Future<File> exportAppData([bool sync = true]) async {
     'appdata-export-snapshot',
   );
   var dataPath = App.dataPath;
+  final imageFavoriteAssetsPath = FilePath.join(
+    App.cachePath,
+    'image_favorites',
+  );
   var exported = false;
-  await appdata.saveData(false);
-  if (HistoryManager().isInitialized) {
-    HistoryManager().flush();
+  if (flushRuntimeState) {
+    await appdata.saveData(false);
+    await appdata.writeImplicitData();
+    if (HistoryManager().isInitialized) {
+      HistoryManager().flush();
+    }
+  }
+  String? localRoot;
+  final configuredLocalPath = File(FilePath.join(dataPath, 'local_path'));
+  if (await configuredLocalPath.exists()) {
+    localRoot = (await configuredLocalPath.readAsString()).trim();
+  }
+  if (localRoot == null || localRoot.isEmpty) {
+    localRoot = await LocalManager().findDefaultPath();
+  }
+  if (flushRuntimeState && LocalManager().isInitialized) {
+    await LocalManager().flushCurrentDownloadingTasks();
+  }
+  if (flushRuntimeState) {
+    await Future.wait(
+      ComicSource.all().map((source) => source.flushPendingDataWrite()),
+    );
   }
   try {
     await tempFile.deleteIgnoreError();
@@ -284,37 +352,63 @@ Future<File> exportAppData([bool sync = true]) async {
         sourceDataPath: dataPath,
         snapshotPath: snapshotDirectory.path,
       );
-      await zip_flutter.loadLibrary();
-      var zipFile = zip_flutter.ZipFile.open(tempFile.path);
+      final logical = buildBackupV2Payload(
+        dataPath: snapshotDirectory.path,
+        appVersion: App.version,
+        useSyncAppdata: sync,
+        strict: true,
+        localRoot: localRoot,
+        imageFavoriteAssetsPath: imageFavoriteAssetsPath,
+      );
+      final compatibilityEntries = <String, Uint8List>{};
       for (final entry in buildAppDataExportEntries(
         snapshotDirectory.path,
         sync: sync,
       )) {
-        zipFile.addFile(entry.archiveName, entry.path);
+        compatibilityEntries[entry.archiveName] = File(
+          entry.path,
+        ).readAsBytesSync();
+      }
+      if (!sync && !compatibilityEntries.containsKey('local_path')) {
+        compatibilityEntries['local_path'] = Uint8List.fromList(
+          utf8.encode(localRoot!),
+        );
       }
       final comicSourceDir = Directory(
         FilePath.join(snapshotDirectory.path, "comic_source"),
       );
       if (comicSourceDir.existsSync()) {
-        for (var file in comicSourceDir.listSync()) {
-          if (file is File) {
-            zipFile.addFile("comic_source/${file.name}", file.path);
-          }
+        for (final file in comicSourceDir.listSync().whereType<File>()) {
+          compatibilityEntries['comic_source/${file.name}'] = file
+              .readAsBytesSync();
         }
       }
-      final logical = buildBackupV2Payload(
-        dataPath: snapshotDirectory.path,
-        appVersion: App.version,
-        useSyncAppdata: sync,
+      final payload = extendBackupV2Payload(
+        logical,
+        compatibilityEntries,
+        kindForPath: (path) {
+          if (path.startsWith('comic_source/')) {
+            return 'compatibility_source_document';
+          }
+          if (path.endsWith('.db')) return 'compatibility_database';
+          return 'compatibility_json';
+        },
       );
-      for (final entry in logical.entries.entries) {
-        zipFile.addFileFromBytes(entry.key, entry.value);
+      await zip_flutter.loadLibrary();
+      final zipFile = zip_flutter.ZipFile.open(tempFile.path);
+      try {
+        for (final entry in payload.entries.entries) {
+          zipFile.addFileFromBytes(entry.key, entry.value);
+        }
+        zipFile.addFileFromBytes(
+          backupManifestEntryName,
+          Uint8List.fromList(
+            utf8.encode(jsonEncode(payload.manifest.toJson())),
+          ),
+        );
+      } finally {
+        zipFile.close();
       }
-      zipFile.addFileFromBytes(
-        backupManifestEntryName,
-        Uint8List.fromList(utf8.encode(jsonEncode(logical.manifest.toJson()))),
-      );
-      zipFile.close();
     });
     await tempFile.rename(cacheFile.path);
     exported = true;
@@ -326,6 +420,70 @@ Future<File> exportAppData([bool sync = true]) async {
       await cacheFile.deleteIgnoreError();
     }
   }
+}
+
+/// Extracts and validates a complete V2 backup without mutating application
+/// data. Upgrade gates use this before accepting an externally saved backup.
+Future<BackupManifestV2> validateBackupV2Archive(File file) async {
+  final cacheDir = buildAppDataImportDirectory(
+    App.cachePath,
+    'appdata-validation',
+  );
+  final validationDatabaseFile = File(
+    FilePath.join(
+      App.cachePath,
+      'venera-backup-validation-${_nextAppDataOperationId()}.db',
+    ),
+  );
+  await cacheDir.create(recursive: true);
+  try {
+    await _extractDataArchiveSafely(file.path, cacheDir.path);
+    final manifest = validateCompleteExtractedBackupV2(cacheDir);
+    final rawLocalPath = File(FilePath.join(cacheDir.path, 'local_path'));
+    final rebuilt = buildBackupV2Payload(
+      dataPath: cacheDir.path,
+      appVersion: manifest.appVersion,
+      strict: true,
+      localRoot: await rawLocalPath.exists()
+          ? (await rawLocalPath.readAsString()).trim()
+          : null,
+    );
+    for (final path in requiredRewriteBackupPaths) {
+      if (path == '$backupLogicalDirectory/image_favorite_assets.json') {
+        continue;
+      }
+      final actual = await File(
+        FilePath.join(cacheDir.path, path),
+      ).readAsBytes();
+      final expected = rebuilt.entries[path];
+      if (expected == null || !_bytesEqual(actual, expected)) {
+        throw FormatException(
+          'Logical backup does not match compatibility data: $path',
+        );
+      }
+    }
+    final database = AppDatabase(path: validationDatabaseFile.path);
+    try {
+      await database.initialize();
+      await BackupV2Importer(database).importDirectory(cacheDir);
+    } finally {
+      await database.close();
+    }
+    return manifest;
+  } finally {
+    await validationDatabaseFile.deleteIgnoreError();
+    await File('${validationDatabaseFile.path}-wal').deleteIgnoreError();
+    await File('${validationDatabaseFile.path}-shm').deleteIgnoreError();
+    await cacheDir.deleteIgnoreError(recursive: true);
+  }
+}
+
+bool _bytesEqual(List<int> left, List<int> right) {
+  if (left.length != right.length) return false;
+  for (var index = 0; index < left.length; index++) {
+    if (left[index] != right[index]) return false;
+  }
+  return true;
 }
 
 Future<void> importAppData(File file, [bool checkVersion = false]) {
@@ -343,6 +501,8 @@ Future<void> _importAppDataLocked(File file, bool checkVersion) async {
       'venera-import-${_nextAppDataOperationId()}.db',
     ),
   );
+  File? normalizedLocalPathFile;
+  Directory? stagedImageFavoriteAssets;
   cacheDir.createSync();
   try {
     await _extractDataArchiveSafely(file.path, cacheDirPath);
@@ -351,6 +511,10 @@ Future<void> _importAppDataLocked(File file, bool checkVersion) async {
     var localFavoriteFile = cacheDir.joinFile("local_favorite.db");
     var appdataFile = cacheDir.joinFile("appdata.json");
     var cookieFile = cacheDir.joinFile("cookie.db");
+    var localDatabaseFile = cacheDir.joinFile("local.db");
+    var localPathFile = cacheDir.joinFile("local_path");
+    var implicitDataFile = cacheDir.joinFile("implicitData.json");
+    var downloadingTasksFile = cacheDir.joinFile("downloading_tasks.json");
     if (checkVersion && appdataFile.existsSync()) {
       var data = decodeImportedAppData(await appdataFile.readAsString());
       if (data == null) {
@@ -370,8 +534,29 @@ Future<void> _importAppDataLocked(File file, bool checkVersion) async {
         return;
       }
     }
+    final importedLocalRoot = await _readExistingLocalRoot(localPathFile);
+    final currentLocalRoot = await _readExistingLocalRoot(
+      File(FilePath.join(App.dataPath, 'local_path')),
+    );
+    final effectiveLocalRoot =
+        importedLocalRoot ??
+        currentLocalRoot ??
+        (LocalManager().isInitialized && await LocalManager().directory.exists()
+            ? LocalManager().path
+            : null);
+    normalizedLocalPathFile = importedLocalRoot == null
+        ? null
+        : await _writeNormalizedLocalPath(importedLocalRoot);
     if (backupV2Manifest != null) {
-      await _buildImportedRewriteDatabase(cacheDir, rewriteStagingFile);
+      await _buildImportedRewriteDatabase(
+        cacheDir,
+        rewriteStagingFile,
+        localRoot: effectiveLocalRoot,
+      );
+      stagedImageFavoriteAssets = await _stageImageFavoriteAssets(
+        cacheDir,
+        backupV2Manifest,
+      );
     }
 
     final comicSourceDirectory = Directory(
@@ -387,6 +572,23 @@ Future<void> _importAppDataLocked(File file, bool checkVersion) async {
         ),
       if (await cookieFile.exists())
         BackupImportSource(relativePath: 'cookie.db', source: cookieFile),
+      if (await localDatabaseFile.exists())
+        BackupImportSource(relativePath: 'local.db', source: localDatabaseFile),
+      if (normalizedLocalPathFile != null)
+        BackupImportSource(
+          relativePath: 'local_path',
+          source: normalizedLocalPathFile,
+        ),
+      if (await implicitDataFile.exists())
+        BackupImportSource(
+          relativePath: 'implicitData.json',
+          source: implicitDataFile,
+        ),
+      if (await downloadingTasksFile.exists())
+        BackupImportSource(
+          relativePath: 'downloading_tasks.json',
+          source: downloadingTasksFile,
+        ),
       if (await comicSourceDirectory.exists())
         BackupImportSource(
           relativePath: 'comic_source',
@@ -403,6 +605,18 @@ Future<void> _importAppDataLocked(File file, bool checkVersion) async {
     final importsCookies = importSources.any(
       (source) => source.relativePath == 'cookie.db',
     );
+    final importsLocalDatabase = importSources.any(
+      (source) => source.relativePath == 'local.db',
+    );
+    final importsLocalPath = importSources.any(
+      (source) => source.relativePath == 'local_path',
+    );
+    final importsImplicitData = importSources.any(
+      (source) => source.relativePath == 'implicitData.json',
+    );
+    final importsDownloadingTasks = importSources.any(
+      (source) => source.relativePath == 'downloading_tasks.json',
+    );
     final importsSources = importSources.any(
       (source) => source.relativePath == 'comic_source',
     );
@@ -413,12 +627,23 @@ Future<void> _importAppDataLocked(File file, bool checkVersion) async {
         operationId: _nextAppDataOperationId(),
       );
       final prepared = await coordinator.prepare(importSources);
+      var resumeDownloadsOnFailure = false;
+      var importCommitted = false;
+      var localManagerWasPrepared = false;
 
       if (importsHistory) HistoryManager().close();
       if (importsFavorites) LocalFavoritesManager().close();
       if (importsCookies) {
         SingleInstanceCookieJar.instance?.dispose();
         SingleInstanceCookieJar.instance = null;
+      }
+      if ((importsLocalDatabase || importsLocalPath) &&
+          LocalManager().isInitialized) {
+        resumeDownloadsOnFailure = await LocalManager().prepareFullDataImport();
+        localManagerWasPrepared = true;
+      } else if (importsDownloadingTasks && LocalManager().isInitialized) {
+        resumeDownloadsOnFailure = await LocalManager()
+            .prepareDownloadingTasksImport();
       }
       try {
         await coordinator.commit(
@@ -427,6 +652,7 @@ Future<void> _importAppDataLocked(File file, bool checkVersion) async {
             importSources.map((source) => source.relativePath),
           ),
         );
+        importCommitted = true;
       } finally {
         if (importsHistory) {
           await HistoryManager().init();
@@ -443,7 +669,45 @@ Future<void> _importAppDataLocked(File file, bool checkVersion) async {
         if (importsSources) {
           await ComicSourceManager().reload();
         }
+        if (importsImplicitData && importCommitted) {
+          final decoded = jsonDecode(
+            await File(
+              FilePath.join(App.dataPath, 'implicitData.json'),
+            ).readAsString(),
+          );
+          appdata.implicitData = normalizeImplicitData(decoded);
+        }
+        if (localManagerWasPrepared) {
+          await LocalManager().reloadAfterFullDataImport(
+            resumeFirst:
+                resumeDownloadsOnFailure &&
+                (!importCommitted || !importsDownloadingTasks),
+          );
+        } else if (importsDownloadingTasks && LocalManager().isInitialized) {
+          if (importCommitted) {
+            await LocalManager().reloadDownloadingTasksFromDisk();
+          } else if (resumeDownloadsOnFailure) {
+            LocalManager().resumeFirstDownloadingTask();
+          }
+        }
       }
+    }
+    if (stagedImageFavoriteAssets != null) {
+      final imageCoordinator = BackupImportCoordinator(
+        Directory(App.cachePath),
+        operationId: _nextAppDataOperationId(),
+      );
+      final prepared = await imageCoordinator.prepare([
+        BackupImportSource(
+          relativePath: 'image_favorites',
+          source: stagedImageFavoriteAssets,
+        ),
+      ]);
+      await imageCoordinator.commit(
+        prepared,
+        verify: () =>
+            _verifyInstalledImageFavoriteAssets(stagedImageFavoriteAssets!),
+      );
     }
     if (backupV2Manifest != null) {
       // The rewrite database is already kept open by its Riverpod provider.
@@ -456,7 +720,9 @@ Future<void> _importAppDataLocked(File file, bool checkVersion) async {
       );
       try {
         await rewriteDatabase.initialize();
-        await BackupV2Importer(rewriteDatabase).importDirectory(cacheDir);
+        await BackupV2Importer(
+          rewriteDatabase,
+        ).importDirectory(cacheDir, localRoot: effectiveLocalRoot);
       } finally {
         await rewriteDatabase.close();
       }
@@ -467,7 +733,11 @@ Future<void> _importAppDataLocked(File file, bool checkVersion) async {
       if (data == null) {
         Log.warning("Import Data", "Skip malformed appdata.json");
       } else {
-        appdata.syncData(data);
+        if (backupV2Manifest?.isFullBackup ?? false) {
+          await appdata.restoreFullData(data);
+        } else {
+          appdata.syncData(data);
+        }
         await _sanitizeImportedSourceSettings();
       }
     }
@@ -475,6 +745,8 @@ Future<void> _importAppDataLocked(File file, bool checkVersion) async {
     await rewriteStagingFile.deleteIgnoreError();
     await File('${rewriteStagingFile.path}-wal').deleteIgnoreError();
     await File('${rewriteStagingFile.path}-shm').deleteIgnoreError();
+    await normalizedLocalPathFile?.deleteIgnoreError();
+    await stagedImageFavoriteAssets?.deleteIgnoreError(recursive: true);
     await cacheDir.deleteIgnoreError(recursive: true);
   }
 }
@@ -515,7 +787,13 @@ Future<void> _createAppDataExportSnapshot({
     }
   }
 
-  for (final name in ['appdata.json', 'syncdata.json', 'local_path']) {
+  for (final name in [
+    'appdata.json',
+    'syncdata.json',
+    'local_path',
+    'implicitData.json',
+    'downloading_tasks.json',
+  ]) {
     final source = File(FilePath.join(sourceDataPath, name));
     if (await source.exists()) {
       await source.copy(FilePath.join(snapshotPath, name));
@@ -538,10 +816,120 @@ Future<void> _createAppDataExportSnapshot({
   }
 }
 
+Future<String?> _readExistingLocalRoot(File file) async {
+  if (!await file.exists()) return null;
+  try {
+    final path = (await file.readAsString()).trim();
+    final directory = Directory(path);
+    if (path.isEmpty || !p.isAbsolute(path) || !await directory.exists()) {
+      return null;
+    }
+    await for (final entity in directory.list(followLinks: false)) {
+      final name = entity.name;
+      if (name != '.nomedia' && name != 'venera_test') return path;
+    }
+    return null;
+  } catch (_) {
+    return null;
+  }
+}
+
+Future<File> _writeNormalizedLocalPath(String path) async {
+  final file = File(
+    FilePath.join(
+      App.cachePath,
+      'venera-import-local-path-${_nextAppDataOperationId()}',
+    ),
+  );
+  await file.writeAsString(path, flush: true);
+  return file;
+}
+
+Future<Directory?> _stageImageFavoriteAssets(
+  Directory extractedDirectory,
+  BackupManifestV2 manifest,
+) async {
+  const indexPath = '$backupLogicalDirectory/image_favorite_assets.json';
+  if (!manifest.entries.any((entry) => entry.path == indexPath)) return null;
+
+  final decoded = jsonDecode(
+    await File(
+      FilePath.join(extractedDirectory.path, indexPath),
+    ).readAsString(),
+  );
+  if (decoded is! List) {
+    throw const FormatException(
+      'logical/image_favorite_assets.json must be an array',
+    );
+  }
+
+  final staged = Directory(
+    FilePath.join(
+      App.cachePath,
+      'venera-import-image-favorites-${_nextAppDataOperationId()}',
+    ),
+  );
+  await staged.deleteIgnoreError(recursive: true);
+  await staged.create(recursive: true);
+  final names = <String>{};
+  for (var index = 0; index < decoded.length; index++) {
+    final raw = decoded[index];
+    if (raw is! Map) {
+      throw FormatException('Invalid image favorite asset[$index]');
+    }
+    final name = raw['name'];
+    final sourcePath = raw['path'];
+    if (name is! String ||
+        normalizeBackupEntryPath(name) != name ||
+        name.contains('/') ||
+        !names.add(name.toLowerCase()) ||
+        sourcePath is! String) {
+      throw FormatException('Invalid image favorite asset[$index]');
+    }
+    final source = File(FilePath.join(extractedDirectory.path, sourcePath));
+    if (!isPathInsideDirectory(source.path, extractedDirectory.path) ||
+        !await source.exists()) {
+      throw FormatException('Missing image favorite asset: $name');
+    }
+    await source.copy(FilePath.join(staged.path, name));
+  }
+  return staged;
+}
+
+Future<void> _verifyInstalledImageFavoriteAssets(Directory staged) async {
+  final installed = Directory(FilePath.join(App.cachePath, 'image_favorites'));
+  if (!await installed.exists()) {
+    throw const FormatException('Imported image favorite assets are missing');
+  }
+  final expectedFiles = await staged
+      .list(followLinks: false)
+      .where((entity) => entity is File)
+      .cast<File>()
+      .toList();
+  final installedEntities = await installed.list(followLinks: false).toList();
+  if (installedEntities.length != expectedFiles.length ||
+      installedEntities.any((entity) => entity is! File)) {
+    throw const FormatException('Imported image favorite assets mismatch');
+  }
+  for (final expected in expectedFiles) {
+    final actual = File(FilePath.join(installed.path, expected.name));
+    if (!await actual.exists() ||
+        await expected.length() != await actual.length() ||
+        await _fileDigest(expected) != await _fileDigest(actual)) {
+      throw FormatException(
+        'Imported image favorite asset mismatch: ${expected.name}',
+      );
+    }
+  }
+}
+
+Future<Digest> _fileDigest(File file) => sha256.bind(file.openRead()).first;
+
 Future<void> _buildImportedRewriteDatabase(
   Directory extractedDirectory,
-  File stagingFile,
-) async {
+  File stagingFile, {
+  String? localRoot,
+}) async {
   await stagingFile.deleteIgnoreError();
   final currentFile = File(FilePath.join(App.dataPath, AppDatabase.fileName));
   Future<void> snapshotCurrentDatabase() async {
@@ -570,7 +958,7 @@ Future<void> _buildImportedRewriteDatabase(
       await rewriteDatabase.initialize();
       await BackupV2Importer(
         rewriteDatabase,
-      ).importDirectory(extractedDirectory);
+      ).importDirectory(extractedDirectory, localRoot: localRoot);
     } finally {
       await rewriteDatabase.close();
     }
@@ -597,7 +985,12 @@ Future<void> _buildImportedRewriteDatabase(
 Future<void> _verifyInstalledBackupDatabases(
   Iterable<String> relativePaths,
 ) async {
-  const databaseNames = {'history.db', 'local_favorite.db', 'cookie.db'};
+  const databaseNames = {
+    'history.db',
+    'local_favorite.db',
+    'cookie.db',
+    'local.db',
+  };
   for (final relativePath in relativePaths.where(databaseNames.contains)) {
     final path = FilePath.join(App.dataPath, relativePath);
     final database = sqlite3.open(path, mode: OpenMode.readOnly);

@@ -8,12 +8,15 @@ import 'package:flutter_localizations/flutter_localizations.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 import 'package:venera/core/providers/app_providers.dart';
+import 'package:venera/core/upgrade/rewrite_upgrade_coordinator.dart';
 import 'package:venera/foundation/bootstrap.dart';
 import 'package:venera/design_system/app_design_system.dart';
 import 'package:venera/foundation/log.dart';
+import 'package:venera/foundation/rewrite_upgrade.dart';
 import 'package:venera/network/images.dart';
 import 'package:venera/pages/auth_page.dart';
 import 'package:venera/pages/main_page.dart';
+import 'package:venera/pages/rewrite_upgrade_page.dart';
 import 'package:venera/utils/io.dart';
 import 'package:venera/utils/overlay_entry.dart';
 import 'package:window_manager/window_manager.dart';
@@ -28,6 +31,7 @@ const Duration _lifecycleAuthPromptThrottle = Duration(seconds: 2);
 
 abstract final class AppRoutePath {
   static const bootstrap = '/bootstrap';
+  static const rewriteUpgrade = '/rewrite-upgrade';
   static const unlock = '/unlock';
   static const home = '/app';
 }
@@ -35,11 +39,14 @@ abstract final class AppRoutePath {
 @visibleForTesting
 String? resolveRootRouteRedirect({
   required bool phaseAReady,
+  required bool rewriteUpgradeRequired,
   required bool authorizationRequired,
   required bool startupAuthorized,
   required String currentLocation,
 }) {
-  final target = !phaseAReady
+  final target = rewriteUpgradeRequired
+      ? AppRoutePath.rewriteUpgrade
+      : !phaseAReady
       ? AppRoutePath.bootstrap
       : authorizationRequired && !startupAuthorized
       ? AppRoutePath.unlock
@@ -175,19 +182,25 @@ class _MyAppState extends ConsumerState<MyApp> with WidgetsBindingObserver {
   late final GoRouter _router;
   bool _startupAuthorized = false;
   bool _rewriteDatabaseRequested = false;
+  late final RewriteUpgradeFlowController _rewriteUpgradeFlow;
 
   @override
   void initState() {
     super.initState();
+    _rewriteUpgradeFlow = RewriteUpgradeFlowController(
+      bootstrap: bootstrapController,
+    );
     _router = GoRouter(
       navigatorKey: App.rootNavigatorKey,
       initialLocation: AppRoutePath.bootstrap,
       refreshListenable: Listenable.merge([
         bootstrapController,
+        _rewriteUpgradeFlow,
         appdata.settings,
       ]),
       redirect: (context, state) => resolveRootRouteRedirect(
         phaseAReady: bootstrapController.phaseAReady,
+        rewriteUpgradeRequired: bootstrapController.rewriteUpgradeRequired,
         authorizationRequired: shouldRequireAuthorization(
           appdata.settings['authorizationRequired'],
         ),
@@ -198,6 +211,10 @@ class _MyAppState extends ConsumerState<MyApp> with WidgetsBindingObserver {
         GoRoute(
           path: AppRoutePath.bootstrap,
           builder: (context, state) => const _BootstrapPage(),
+        ),
+        GoRoute(
+          path: AppRoutePath.rewriteUpgrade,
+          builder: (context, state) => _buildRewriteUpgradePage(),
         ),
         GoRoute(
           path: AppRoutePath.unlock,
@@ -229,6 +246,63 @@ class _MyAppState extends ConsumerState<MyApp> with WidgetsBindingObserver {
     });
   }
 
+  Widget _buildRewriteUpgradePage() {
+    final state = _stateFromRewriteUpgradeFlow();
+    return RewriteUpgradePage(
+      state: state,
+      onExportBackup: _rewriteUpgradeFlow.exportAndVerifyBackup,
+      onReset: _rewriteUpgradeFlow.resetAfterConfirmation,
+      onRetry: _rewriteUpgradeFlow.retry,
+    );
+  }
+
+  RewriteUpgradePageState _stateFromRewriteUpgradeFlow() {
+    final operation = _rewriteUpgradeFlow.operation;
+    if (operation == RewriteUpgradeOperation.inspecting) {
+      return const RewriteUpgradePageState.checking();
+    }
+    if (operation == RewriteUpgradeOperation.exportingBackup) {
+      return const RewriteUpgradePageState(
+        phase: RewriteUpgradeUiPhase.exportingBackup,
+      );
+    }
+    if (operation == RewriteUpgradeOperation.resetting) {
+      return const RewriteUpgradePageState(
+        phase: RewriteUpgradeUiPhase.resetting,
+      );
+    }
+    final error = _rewriteUpgradeFlow.errorMessage;
+    if (error != null) {
+      return RewriteUpgradePageState(
+        phase: RewriteUpgradeUiPhase.failed,
+        errorMessage: error,
+        failureStep: switch (_rewriteUpgradeFlow.effectiveFailedAction) {
+          RewriteUpgradeFailedAction.exportBackup =>
+            RewriteUpgradeUiFailureStep.backup,
+          RewriteUpgradeFailedAction.reset => RewriteUpgradeUiFailureStep.reset,
+          _ => RewriteUpgradeUiFailureStep.inspection,
+        },
+      );
+    }
+    final snapshot = _rewriteUpgradeFlow.snapshot;
+    return switch (snapshot?.phase) {
+      RewriteUpgradePhase.backupRequired => const RewriteUpgradePageState(
+        phase: RewriteUpgradeUiPhase.backupRequired,
+      ),
+      RewriteUpgradePhase.backupVerified => RewriteUpgradePageState(
+        phase: RewriteUpgradeUiPhase.backupReady,
+        backupPath: snapshot?.savedBackupPath,
+      ),
+      RewriteUpgradePhase.resetting => const RewriteUpgradePageState(
+        phase: RewriteUpgradeUiPhase.resetting,
+      ),
+      RewriteUpgradePhase.resetCompleted => const RewriteUpgradePageState(
+        phase: RewriteUpgradeUiPhase.completed,
+      ),
+      _ => const RewriteUpgradePageState.checking(),
+    };
+  }
+
   bool isAuthPageActive = false;
 
   OverlayEntry? hideContentOverlay;
@@ -239,6 +313,7 @@ class _MyAppState extends ConsumerState<MyApp> with WidgetsBindingObserver {
   void dispose() {
     App.unregisterForceRebuild(_forceRebuildCallback);
     bootstrapController.removeListener(_initializeRewriteDatabaseWhenReady);
+    _rewriteUpgradeFlow.dispose();
     WidgetsBinding.instance.removeObserver(this);
     final overlay = hideContentOverlay;
     hideContentOverlay = null;
@@ -559,6 +634,7 @@ class _BootstrapPage extends StatelessWidget {
       return switch (phase) {
         BootstrapPhase.idle => '正在启动',
         BootstrapPhase.phaseA => '正在准备应用',
+        BootstrapPhase.rewriteUpgrade => '正在准备数据升级',
         BootstrapPhase.phaseB => '正在加载本地数据',
         BootstrapPhase.phaseC => '正在加载漫画源',
         BootstrapPhase.ready => '准备完成',
@@ -567,6 +643,7 @@ class _BootstrapPage extends StatelessWidget {
     return switch (phase) {
       BootstrapPhase.idle => 'Starting',
       BootstrapPhase.phaseA => 'Preparing app',
+      BootstrapPhase.rewriteUpgrade => 'Preparing data upgrade',
       BootstrapPhase.phaseB => 'Loading local data',
       BootstrapPhase.phaseC => 'Loading comic sources',
       BootstrapPhase.ready => 'Ready',

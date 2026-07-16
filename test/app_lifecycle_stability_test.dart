@@ -19,6 +19,7 @@ void main() {
     expect(
       app.resolveRootRouteRedirect(
         phaseAReady: false,
+        rewriteUpgradeRequired: false,
         authorizationRequired: false,
         startupAuthorized: false,
         currentLocation: app.AppRoutePath.home,
@@ -28,6 +29,7 @@ void main() {
     expect(
       app.resolveRootRouteRedirect(
         phaseAReady: true,
+        rewriteUpgradeRequired: false,
         authorizationRequired: true,
         startupAuthorized: false,
         currentLocation: app.AppRoutePath.bootstrap,
@@ -37,6 +39,7 @@ void main() {
     expect(
       app.resolveRootRouteRedirect(
         phaseAReady: true,
+        rewriteUpgradeRequired: false,
         authorizationRequired: true,
         startupAuthorized: true,
         currentLocation: app.AppRoutePath.unlock,
@@ -46,11 +49,22 @@ void main() {
     expect(
       app.resolveRootRouteRedirect(
         phaseAReady: true,
+        rewriteUpgradeRequired: false,
         authorizationRequired: false,
         startupAuthorized: false,
         currentLocation: app.AppRoutePath.home,
       ),
       isNull,
+    );
+    expect(
+      app.resolveRootRouteRedirect(
+        phaseAReady: true,
+        rewriteUpgradeRequired: true,
+        authorizationRequired: true,
+        startupAuthorized: true,
+        currentLocation: app.AppRoutePath.home,
+      ),
+      app.AppRoutePath.rewriteUpgrade,
     );
   });
 

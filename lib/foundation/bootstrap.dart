@@ -6,6 +6,7 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:venera/foundation/app.dart';
 import 'package:venera/core/database/backup_import_coordinator.dart';
+import 'package:venera/core/upgrade/rewrite_upgrade_coordinator.dart';
 import 'package:venera/foundation/appdata.dart';
 import 'package:venera/foundation/cache_manager.dart';
 import 'package:venera/foundation/comic_source/comic_source.dart';
@@ -24,7 +25,7 @@ import 'package:venera/utils/tags_translation.dart';
 import 'package:venera/utils/translations.dart';
 import 'package:flutter_saf/flutter_saf.dart';
 
-enum BootstrapPhase { idle, phaseA, phaseB, phaseC, ready }
+enum BootstrapPhase { idle, phaseA, rewriteUpgrade, phaseB, phaseC, ready }
 
 final bootstrapController = BootstrapController();
 
@@ -102,11 +103,16 @@ class BootstrapController extends ChangeNotifier {
   bool networkReady = false;
   bool homeInteractive = false;
 
+  RewriteUpgradeSnapshot? rewriteUpgradeSnapshot;
+  Object? rewriteUpgradeError;
+  StackTrace? rewriteUpgradeErrorStack;
+
   bool _started = false;
   final Stopwatch _stopwatch = Stopwatch();
   final Completer<void> _phaseBCompleter = Completer<void>();
   final Completer<void> _readyCompleter = Completer<void>();
   final Completer<void> _homeInteractiveCompleter = Completer<void>();
+  final Completer<void> _rewriteUpgradeCompleter = Completer<void>();
 
   Future<void>? _phaseBFuture;
   Future<void>? _phaseCFuture;
@@ -114,6 +120,15 @@ class BootstrapController extends ChangeNotifier {
   final Duration _startupInteractionProtectionWindow;
   final Set<String> _scheduledStartupBackgroundTasks = {};
   DateTime? _lifecycleQuietUntil;
+  RewriteUpgradeCoordinator? _rewriteUpgradeCoordinator;
+
+  bool get rewriteUpgradeRequired =>
+      rewriteUpgradeError != null ||
+      (rewriteUpgradeSnapshot?.blocksStartup ?? false);
+
+  RewriteUpgradeCoordinator get rewriteUpgradeCoordinator =>
+      _rewriteUpgradeCoordinator ??
+      (throw StateError('Rewrite upgrade has not been inspected'));
 
   void start() {
     if (_started) {
@@ -204,6 +219,19 @@ class BootstrapController extends ChangeNotifier {
     await BackupImportCoordinator(
       Directory(App.dataPath),
     ).recoverInterruptedImport();
+    await BackupImportCoordinator(
+      Directory(App.cachePath),
+    ).recoverInterruptedImport();
+    await _inspectRewriteUpgrade();
+    if (rewriteUpgradeRequired) {
+      phase = BootstrapPhase.rewriteUpgrade;
+      notifyListeners();
+      logPerf('rewrite upgrade required');
+      await _rewriteUpgradeCompleter.future;
+      phase = BootstrapPhase.phaseA;
+      notifyListeners();
+      logPerf('rewrite upgrade completed');
+    }
     await appdata.init().wait();
 
     phaseAReady = true;
@@ -231,6 +259,75 @@ class BootstrapController extends ChangeNotifier {
     }
     notifyListeners();
     logPerf('bootstrap ready');
+  }
+
+  Future<void> _inspectRewriteUpgrade() async {
+    String? defaultLocalPath;
+    try {
+      defaultLocalPath = await App.local.findDefaultPath();
+    } catch (error, stackTrace) {
+      Log.warning(
+        'RewriteUpgrade',
+        'Could not resolve the platform local library path: $error\n$stackTrace',
+      );
+    }
+    _rewriteUpgradeCoordinator = RewriteUpgradeCoordinator(
+      dataDirectory: Directory(App.dataPath),
+      cacheDirectory: Directory(App.cachePath),
+      additionalPreservedLocalRoots: [
+        if (defaultLocalPath != null) defaultLocalPath,
+      ],
+    );
+    await retryRewriteUpgradeInspection();
+  }
+
+  Future<void> retryRewriteUpgradeInspection() async {
+    final coordinator = rewriteUpgradeCoordinator;
+    try {
+      final snapshot = await coordinator.inspectAndRecover();
+      rewriteUpgradeSnapshot = snapshot;
+      rewriteUpgradeError = null;
+      rewriteUpgradeErrorStack = null;
+      if (!snapshot.blocksStartup && !_rewriteUpgradeCompleter.isCompleted) {
+        _rewriteUpgradeCompleter.complete();
+      }
+    } catch (error, stackTrace) {
+      rewriteUpgradeSnapshot = null;
+      rewriteUpgradeError = error;
+      rewriteUpgradeErrorStack = stackTrace;
+      Log.error(
+        'RewriteUpgrade',
+        'Failed to inspect rewrite upgrade state: $error',
+        stackTrace,
+      );
+    }
+    notifyListeners();
+  }
+
+  void applyRewriteUpgradeSnapshot(RewriteUpgradeSnapshot snapshot) {
+    rewriteUpgradeSnapshot = snapshot;
+    rewriteUpgradeError = null;
+    rewriteUpgradeErrorStack = null;
+    notifyListeners();
+  }
+
+  Future<void> finishRewriteUpgrade() async {
+    await rewriteUpgradeCoordinator.acknowledgeCompletion();
+    final previous = rewriteUpgradeSnapshot;
+    rewriteUpgradeSnapshot = RewriteUpgradeSnapshot(
+      phase: RewriteUpgradePhase.notRequired,
+      preservedLocalRoots: previous?.preservedLocalRoots ?? const [],
+      savedBackupPath: previous?.savedBackupPath,
+      backupAppVersion: previous?.backupAppVersion,
+      backupCreatedAt: previous?.backupCreatedAt,
+      backupFingerprint: previous?.backupFingerprint,
+    );
+    rewriteUpgradeError = null;
+    rewriteUpgradeErrorStack = null;
+    if (!_rewriteUpgradeCompleter.isCompleted) {
+      _rewriteUpgradeCompleter.complete();
+    }
+    notifyListeners();
   }
 
   Future<void> _runPhaseB() async {
