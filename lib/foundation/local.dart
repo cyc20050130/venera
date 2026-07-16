@@ -14,6 +14,7 @@ import 'package:venera/foundation/log.dart';
 import 'package:venera/network/download.dart';
 import 'package:venera/pages/reader/reader.dart';
 import 'package:venera/utils/io.dart';
+import 'package:venera/utils/translations.dart';
 
 import 'app.dart';
 import 'appdata.dart';
@@ -197,18 +198,58 @@ class LocalComic with HistoryMixin implements Comic {
     // also protects navigation from unrelated refreshes while awaiting I/O.
     final history = HistoryManager().find(id, comicType);
     if (hasArchiveMetadataOnDisk) {
+      final token = LocalArchiveCancellationToken();
+      final stopwatch = Stopwatch()..start();
+      var lastProgress = -1.0;
+      var lastMessageElapsed = Duration.zero;
+      final loadingController = showAppProgressDialog(
+        App.rootContext,
+        message: 'Opening compressed comic'.tl,
+        onCancel: token.cancel,
+      );
       try {
-        await LocalArchiveService().restore(this);
+        await LocalArchiveService().restore(
+          this,
+          cancellationToken: token,
+          onProgress: (progress) {
+            final value = localArchiveOverallProgress(
+              progress,
+            ).clamp(lastProgress < 0 ? 0.0 : lastProgress, 1.0);
+            final elapsed = stopwatch.elapsed;
+            if (value - lastProgress < 0.005 &&
+                elapsed - lastMessageElapsed <
+                    const Duration(milliseconds: 500) &&
+                value != 1.0) {
+              return;
+            }
+            lastProgress = value;
+            lastMessageElapsed = elapsed;
+            loadingController.setProgress(value);
+            final remaining = estimateLocalArchiveRemaining(
+              elapsed: elapsed,
+              progress: value,
+            );
+            final stage = localArchiveProgressStageKey(progress.operation).tl;
+            final eta = remaining == null
+                ? ''
+                : ' · ${'Estimated remaining @time'.tlParams({'time': formatLocalArchiveRemaining(remaining)})}';
+            loadingController.setMessage('$stage$eta');
+          },
+        );
+      } on LocalArchiveCancelledException {
+        return;
       } catch (error, stackTrace) {
         Log.error(
           'LocalArchive',
-          'Failed to restore archived comic $sourceKey@$id: $error',
+          'Failed to open compressed comic $sourceKey@$id: $error',
           stackTrace,
         );
         App.rootContext.showMessage(
-          message: 'Failed to restore archived comic: $error',
+          message: '${'Failed to open compressed comic'.tl}: $error',
         );
         return;
+      } finally {
+        loadingController.close();
       }
     }
     int? firstDownloadedChapter;

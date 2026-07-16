@@ -3,6 +3,35 @@ import 'package:venera/components/components.dart';
 
 import 'app_page_route.dart';
 
+class AppProgressDialogController {
+  AppProgressDialogController._(this._delegate);
+
+  final LoadingDialogController _delegate;
+
+  void setProgress(double? value) => _delegate.setProgress(value);
+
+  void setMessage(String message) => _delegate.setMessage(message);
+
+  void close() => _delegate.close();
+}
+
+AppProgressDialogController showAppProgressDialog(
+  BuildContext context, {
+  required String message,
+  required void Function() onCancel,
+}) {
+  return AppProgressDialogController._(
+    showLoadingDialog(
+      context,
+      barrierDismissible: false,
+      allowCancel: true,
+      withProgress: true,
+      message: message,
+      onCancel: onCancel,
+    ),
+  );
+}
+
 extension Navigation on BuildContext {
   void pop<T>([T? result]) {
     if (mounted) {

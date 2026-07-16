@@ -165,6 +165,90 @@ void main() {
     },
   );
 
+  test('compression and opening report live progress stages', () async {
+    final service = LocalArchiveService.forTesting(libraryRoot: library.path);
+    final compressionProgress = <LocalArchiveProgress>[];
+
+    await service.compress(comic, onProgress: compressionProgress.add);
+
+    expect(
+      compressionProgress.map((value) => value.operation),
+      containsAll([
+        LocalArchiveOperation.inspect,
+        LocalArchiveOperation.compress,
+        LocalArchiveOperation.verify,
+        LocalArchiveOperation.reconcile,
+        LocalArchiveOperation.cleanup,
+      ]),
+    );
+    expect(
+      compressionProgress
+          .where((value) => value.operation == LocalArchiveOperation.compress)
+          .last
+          .fraction,
+      1,
+    );
+
+    final openingProgress = <LocalArchiveProgress>[];
+    await service.restore(comic, onProgress: openingProgress.add);
+
+    expect(
+      openingProgress.map((value) => value.operation),
+      containsAll([
+        LocalArchiveOperation.restore,
+        LocalArchiveOperation.finalize,
+      ]),
+    );
+    expect(openingProgress.last.fraction, 1);
+  });
+
+  test('compression and opening can cancel from live progress', () async {
+    final service = LocalArchiveService.forTesting(libraryRoot: library.path);
+    final compressionToken = LocalArchiveCancellationToken();
+
+    await expectLater(
+      service.compress(
+        comic,
+        cancellationToken: compressionToken,
+        onProgress: (progress) {
+          if (progress.operation == LocalArchiveOperation.compress) {
+            compressionToken.cancel();
+          }
+        },
+      ),
+      throwsA(isA<LocalArchiveCancelledException>()),
+    );
+    expect(service.archiveFileFor(comic).existsSync(), isFalse);
+    expect(
+      File(
+        '${comicDirectory.path}${Platform.pathSeparator}chapter-1${Platform.pathSeparator}1.jpg',
+      ).existsSync(),
+      isTrue,
+    );
+
+    await service.compress(comic);
+    final openingToken = LocalArchiveCancellationToken();
+    await expectLater(
+      service.restore(
+        comic,
+        cancellationToken: openingToken,
+        onProgress: (progress) {
+          if (progress.operation == LocalArchiveOperation.restore) {
+            openingToken.cancel();
+          }
+        },
+      ),
+      throwsA(isA<LocalArchiveCancelledException>()),
+    );
+    expect(service.archiveFileFor(comic).existsSync(), isTrue);
+    expect(
+      File(
+        '${comicDirectory.path}${Platform.pathSeparator}chapter-1${Platform.pathSeparator}1.jpg',
+      ).existsSync(),
+      isFalse,
+    );
+  });
+
   test('dirty expanded content rebuilds and survives another restore', () async {
     final service = LocalArchiveService.forTesting(libraryRoot: library.path);
     await service.compress(comic);

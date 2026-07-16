@@ -14,7 +14,15 @@ import 'package:zip_flutter/zip_flutter.dart';
 /// On-disk state of a locally downloaded comic.
 enum LocalStorageState { loose, archived, expanded, dirty, missing, error }
 
-enum LocalArchiveOperation { inspect, compress, restore, cleanup, reconcile }
+enum LocalArchiveOperation {
+  inspect,
+  compress,
+  verify,
+  restore,
+  finalize,
+  cleanup,
+  reconcile,
+}
 
 class LocalArchiveProgress {
   const LocalArchiveProgress({
@@ -22,18 +30,85 @@ class LocalArchiveProgress {
     required this.completedFiles,
     required this.totalFiles,
     this.currentPath,
+    this.completedBytes,
+    this.totalBytes,
   });
 
   final LocalArchiveOperation operation;
   final int completedFiles;
   final int totalFiles;
   final String? currentPath;
+  final int? completedBytes;
+  final int? totalBytes;
 
-  double get fraction => totalFiles == 0 ? 0 : completedFiles / totalFiles;
+  double get fraction {
+    final bytes = completedBytes;
+    final bytesTotal = totalBytes;
+    if (bytes != null && bytesTotal != null && bytesTotal > 0) {
+      return bytes / bytesTotal;
+    }
+    return totalFiles == 0 ? 0 : completedFiles / totalFiles;
+  }
 }
 
 typedef LocalArchiveProgressCallback =
     void Function(LocalArchiveProgress value);
+
+double localArchiveOverallProgress(LocalArchiveProgress progress) {
+  final fraction = progress.fraction.clamp(0.0, 1.0);
+  return switch (progress.operation) {
+    LocalArchiveOperation.inspect => fraction * 0.15,
+    LocalArchiveOperation.compress => 0.15 + fraction * 0.45,
+    LocalArchiveOperation.verify => 0.6 + fraction * 0.28,
+    LocalArchiveOperation.reconcile => 0.88 + fraction * 0.02,
+    LocalArchiveOperation.restore => fraction * 0.85,
+    LocalArchiveOperation.finalize => 0.85 + fraction * 0.15,
+    LocalArchiveOperation.cleanup => 0.9 + fraction * 0.1,
+  };
+}
+
+Duration? estimateLocalArchiveRemaining({
+  required Duration elapsed,
+  required double progress,
+}) {
+  if (elapsed < const Duration(seconds: 2) ||
+      !progress.isFinite ||
+      progress < 0.01 ||
+      progress >= 1) {
+    return null;
+  }
+  final remainingMillis = (elapsed.inMilliseconds * (1 - progress) / progress)
+      .round();
+  if (remainingMillis <= 0 ||
+      remainingMillis > const Duration(days: 7).inMilliseconds) {
+    return null;
+  }
+  return Duration(milliseconds: remainingMillis);
+}
+
+String formatLocalArchiveRemaining(Duration value) {
+  final seconds = value.inSeconds.clamp(0, const Duration(days: 7).inSeconds);
+  final hours = seconds ~/ 3600;
+  final minutes = (seconds % 3600) ~/ 60;
+  final remainder = seconds % 60;
+  if (hours > 0) {
+    return '$hours:${minutes.toString().padLeft(2, '0')}:'
+        '${remainder.toString().padLeft(2, '0')}';
+  }
+  return '$minutes:${remainder.toString().padLeft(2, '0')}';
+}
+
+String localArchiveProgressStageKey(LocalArchiveOperation operation) {
+  return switch (operation) {
+    LocalArchiveOperation.inspect => 'Scanning files',
+    LocalArchiveOperation.compress => 'Writing compressed file',
+    LocalArchiveOperation.verify => 'Verifying compressed file',
+    LocalArchiveOperation.restore => 'Opening compressed comic',
+    LocalArchiveOperation.finalize => 'Preparing comic',
+    LocalArchiveOperation.cleanup => 'Cleaning source files',
+    LocalArchiveOperation.reconcile => 'Checking source files',
+  };
+}
 
 class LocalArchiveCancellationToken {
   bool _isCancelled = false;
@@ -262,9 +337,9 @@ String normalizeLocalArchiveEntryPath(String value) {
 
 /// Owns the versioned archive stored under `<comic>/.venera/archive.zip`.
 ///
-/// Operations are globally serialized because the current native ZIP writer is
-/// most reliable with one active archive at a time. The cover and `.venera`
-/// metadata directory are never added to the archive.
+/// Operations are globally serialized so compression, opening, download
+/// writes, and destructive cleanup cannot interleave. The cover and `.venera`
+/// metadata directory are never added to the compressed file.
 class LocalArchiveService {
   LocalArchiveService._({String? libraryRootOverride})
     : _libraryRootOverride = libraryRootOverride;
@@ -329,7 +404,10 @@ class LocalArchiveService {
         comic,
         hashFiles: pair != null,
         cancellationToken: token,
-        onProgress: onProgress,
+        // For a new compressed file this is only a quick inventory pass; the
+        // following hash pass reports the real scan progress. Reporting both
+        // would jump to 15% and then appear frozen while hashing.
+        onProgress: pair == null ? null : onProgress,
         operation: LocalArchiveOperation.inspect,
       );
 
@@ -399,15 +477,20 @@ class LocalArchiveService {
         throw const LocalArchiveException('Comic has no archivable files');
       }
 
-      // Re-scan without trusting hashes collected before a possible restore.
-      files = await _scanLooseFiles(
-        root,
-        comic,
-        hashFiles: true,
-        cancellationToken: token,
-        onProgress: onProgress,
-        operation: LocalArchiveOperation.compress,
-      );
+      // A new compressed file still needs its first content hash pass. When a
+      // previous compressed file exists, the initial scan (or the post-restore
+      // scan above) already produced verified hashes, so do not read every
+      // page again.
+      if (pair == null) {
+        files = await _scanLooseFiles(
+          root,
+          comic,
+          hashFiles: true,
+          cancellationToken: token,
+          onProgress: onProgress,
+          operation: LocalArchiveOperation.inspect,
+        );
+      }
       final manifest = ArchiveManifest(
         version: ArchiveManifest.currentVersion,
         comicId: comic.id,
@@ -427,7 +510,7 @@ class LocalArchiveService {
       );
       try {
         token.throwIfCancelled();
-        await _writeZip(archiveTemp, files, token);
+        await _writeZip(archiveTemp, files, token, onProgress);
         // Never remove the loose originals until every generated ZIP entry
         // has been read back and matched against the source checksum.
         await _validateArchive(
@@ -435,6 +518,7 @@ class LocalArchiveService {
           manifest,
           verifyContent: true,
           cancellationToken: token,
+          onProgress: onProgress,
         );
 
         // Detect source changes that happened while the native writer was
@@ -442,12 +526,15 @@ class LocalArchiveService {
         final afterWrite = await _scanLooseFiles(
           root,
           comic,
-          hashFiles: true,
+          // The ZIP was already checked against the pre-write SHA-256
+          // manifest. A metadata pass is enough to detect normal concurrent
+          // edits before cleanup and avoids reading every page a fourth time.
+          hashFiles: false,
           cancellationToken: token,
           onProgress: onProgress,
-          operation: LocalArchiveOperation.compress,
+          operation: LocalArchiveOperation.reconcile,
         );
-        if (!_sameFiles(files, afterWrite)) {
+        if (!_sameFileMetadata(files, afterWrite)) {
           throw const LocalArchiveException(
             'Comic files changed while compression was running',
           );
@@ -960,6 +1047,7 @@ class LocalArchiveService {
     ArchiveManifest manifest, {
     bool verifyContent = false,
     LocalArchiveCancellationToken? cancellationToken,
+    LocalArchiveProgressCallback? onProgress,
   }) async {
     ZipFile? zip;
     try {
@@ -992,14 +1080,16 @@ class LocalArchiveService {
         }
       }
       if (verifyContent) {
-        // Native entry reads and hashing are intentionally isolated from the
-        // UI thread. The worker extracts one entry at a time, bounding scratch
-        // storage and memory to roughly the largest page rather than the whole
-        // comic.
+        // Read and hash one entry at a time in an isolate. This keeps memory
+        // bounded to roughly the largest page and avoids writing every
+        // decompressed page to slow external storage solely for verification.
         zip.close();
         zip = null;
-        final actualHashes = await Isolate.run(
-          () => _hashArchiveEntriesWithBoundedScratch(archive.path),
+        final actualHashes = await _hashArchiveEntries(
+          archive,
+          manifest,
+          cancellationToken ?? LocalArchiveCancellationToken(),
+          onProgress,
         );
         cancellationToken?.throwIfCancelled();
         for (final manifestEntry in manifest.entries) {
@@ -1017,6 +1107,79 @@ class LocalArchiveService {
       throw LocalArchiveException('Invalid archive: $error');
     } finally {
       zip?.close();
+    }
+  }
+
+  Future<Map<String, String>> _hashArchiveEntries(
+    File archive,
+    ArchiveManifest manifest,
+    LocalArchiveCancellationToken cancellationToken,
+    LocalArchiveProgressCallback? onProgress,
+  ) async {
+    cancellationToken.throwIfCancelled();
+    final receivePort = ReceivePort();
+    final completion = Completer<Map<String, String>>();
+    SendPort? controlPort;
+    late final Isolate worker;
+    late final StreamSubscription<Object?> subscription;
+    worker = await Isolate.spawn<List<Object?>>(_hashArchiveWorker, [
+      receivePort.sendPort,
+      archive.path,
+    ], onExit: receivePort.sendPort);
+    subscription = receivePort.listen((message) {
+      if (completion.isCompleted) return;
+      if (message == null) {
+        completion.completeError(
+          const LocalArchiveException(
+            'Compressed file verification worker stopped unexpectedly',
+          ),
+        );
+        return;
+      }
+      if (message is! List || message.isEmpty) return;
+      switch (message[0]) {
+        case _archiveWorkerReady:
+          controlPort = message[1] as SendPort;
+          controlPort!.send(!cancellationToken.isCancelled);
+          break;
+        case _archiveWorkerProgress:
+          onProgress?.call(
+            LocalArchiveProgress(
+              operation: LocalArchiveOperation.verify,
+              completedFiles: message[1] as int,
+              totalFiles: manifest.entries.length,
+              currentPath: message[3] as String,
+              completedBytes: message[2] as int,
+              totalBytes: manifest.uncompressedBytes,
+            ),
+          );
+          controlPort?.send(!cancellationToken.isCancelled);
+          break;
+        case _archiveWorkerDone:
+          completion.complete(Map<String, String>.from(message[1] as Map));
+          break;
+        case _archiveWorkerError:
+          completion.completeError(
+            LocalArchiveException(message[1].toString()),
+            StackTrace.fromString(message[2].toString()),
+          );
+          break;
+        case _archiveWorkerCancelled:
+          completion.completeError(const LocalArchiveCancelledException());
+          break;
+      }
+    });
+    unawaited(
+      cancellationToken.whenCancelled.then((_) {
+        controlPort?.send(false);
+      }),
+    );
+    try {
+      return await completion.future;
+    } finally {
+      worker.kill(priority: Isolate.immediate);
+      await subscription.cancel();
+      receivePort.close();
     }
   }
 
@@ -1052,20 +1215,32 @@ class LocalArchiveService {
       paths.add(entity);
     }
     paths.sort((a, b) => a.path.compareTo(b.path));
-    final result = <_LooseFile>[];
-    for (var i = 0; i < paths.length; i++) {
+    final candidates = <({File file, FileStat stat})>[];
+    for (final file in paths) {
       cancellationToken.throwIfCancelled();
-      final file = paths[i];
-      final relative = p
-          .relative(file.path, from: root.path)
-          .replaceAll('\\', '/');
-      final archivePath = normalizeLocalArchiveEntryPath(relative);
       final stat = await file.stat();
       if (stat.type != FileSystemEntityType.file) {
         throw LocalArchiveException(
           'Comic file changed during scan: ${file.path}',
         );
       }
+      candidates.add((file: file, stat: stat));
+    }
+    final totalBytes = candidates.fold<int>(
+      0,
+      (sum, candidate) => sum + candidate.stat.size,
+    );
+    var completedBytes = 0;
+    final result = <_LooseFile>[];
+    for (var i = 0; i < candidates.length; i++) {
+      cancellationToken.throwIfCancelled();
+      final candidate = candidates[i];
+      final file = candidate.file;
+      final relative = p
+          .relative(file.path, from: root.path)
+          .replaceAll('\\', '/');
+      final archivePath = normalizeLocalArchiveEntryPath(relative);
+      final stat = candidate.stat;
       final hash = hashFiles ? await _hashFile(file, cancellationToken) : null;
       result.add(
         _LooseFile(
@@ -1076,12 +1251,15 @@ class LocalArchiveService {
           sha256: hash,
         ),
       );
+      completedBytes += stat.size;
       onProgress?.call(
         LocalArchiveProgress(
           operation: operation,
           completedFiles: i + 1,
-          totalFiles: paths.length,
+          totalFiles: candidates.length,
           currentPath: archivePath,
+          completedBytes: completedBytes,
+          totalBytes: totalBytes,
         ),
       );
     }
@@ -1110,6 +1288,7 @@ class LocalArchiveService {
     File output,
     List<_LooseFile> files,
     LocalArchiveCancellationToken cancellationToken,
+    LocalArchiveProgressCallback? onProgress,
   ) async {
     await output.deleteIgnoreError();
     cancellationToken.throwIfCancelled();
@@ -1117,15 +1296,85 @@ class LocalArchiveService {
     final sourceFiles = files
         .map((file) => file.file.path)
         .toList(growable: false);
+    final sizes = files.map((file) => file.size).toList(growable: false);
+    final totalBytes = sizes.fold<int>(0, (sum, size) => sum + size);
     // Use archive's streaming Dart IO writer instead of zip_flutter's native
     // writer. The latter can fail for an entire Android library when native
     // code cannot reopen app-readable source paths, and its async worker can
-    // remain permanently busy after extraction on Windows. InputFileStream
-    // keeps memory bounded while the isolate keeps compression off the UI.
-    await Isolate.run(
-      () => _writeZipSynchronously(output.path, names, sourceFiles),
+    // remain permanently busy after extraction on Windows. A dedicated
+    // isolate keeps compression off the UI and reports each completed page.
+    final receivePort = ReceivePort();
+    final completion = Completer<void>();
+    SendPort? controlPort;
+    late final Isolate worker;
+    late final StreamSubscription<Object?> subscription;
+    worker = await Isolate.spawn<List<Object?>>(_writeZipWorker, [
+      receivePort.sendPort,
+      output.path,
+      names,
+      sourceFiles,
+      sizes,
+    ], onExit: receivePort.sendPort);
+    subscription = receivePort.listen((message) {
+      if (completion.isCompleted) return;
+      if (message == null) {
+        completion.completeError(
+          const LocalArchiveException(
+            'Compressed file worker stopped unexpectedly',
+          ),
+        );
+        return;
+      }
+      if (message is! List || message.isEmpty) return;
+      switch (message[0]) {
+        case _archiveWorkerReady:
+          controlPort = message[1] as SendPort;
+          controlPort!.send(!cancellationToken.isCancelled);
+          break;
+        case _archiveWorkerProgress:
+          final completedFiles = message[1] as int;
+          onProgress?.call(
+            LocalArchiveProgress(
+              operation: LocalArchiveOperation.compress,
+              completedFiles: completedFiles,
+              totalFiles: files.length,
+              currentPath: names[completedFiles - 1],
+              completedBytes: message[2] as int,
+              totalBytes: totalBytes,
+            ),
+          );
+          controlPort?.send(!cancellationToken.isCancelled);
+          break;
+        case _archiveWorkerDone:
+          completion.complete();
+          break;
+        case _archiveWorkerError:
+          completion.completeError(
+            LocalArchiveException(message[1].toString()),
+            StackTrace.fromString(message[2].toString()),
+          );
+          break;
+        case _archiveWorkerCancelled:
+          completion.completeError(const LocalArchiveCancelledException());
+          break;
+      }
+    });
+    unawaited(
+      cancellationToken.whenCancelled.then((_) {
+        // Let the worker finish the current file and close all file handles.
+        // Killing it in the middle of InputFileStream work can leave Windows
+        // source files locked for the lifetime of the process.
+        controlPort?.send(false);
+      }),
     );
-    cancellationToken.throwIfCancelled();
+    try {
+      await completion.future;
+      cancellationToken.throwIfCancelled();
+    } finally {
+      worker.kill(priority: Isolate.immediate);
+      await subscription.cancel();
+      receivePort.close();
+    }
   }
 
   Future<void> _restorePair(
@@ -1143,20 +1392,16 @@ class LocalArchiveService {
     );
     await staging.create(recursive: true);
     try {
-      // Keep extraction in its own isolate. Besides avoiding UI work, this
-      // mirrors the download extractor and ensures native read handles are
-      // fully released before this operation may immediately open a writer
-      // for recompression on Windows.
-      await Isolate.run(() {
-        ZipFile.openAndExtract(pair.archive.path, staging.path);
-      });
-      cancellationToken.throwIfCancelled();
-      final stagedFiles = await _scanExtractedFiles(
+      await _extractArchive(
+        pair.archive,
         staging,
+        pair.manifest,
         cancellationToken,
         onProgress,
       );
-      if (!_compareFiles(stagedFiles, pair.manifest, requireAll: true)) {
+      cancellationToken.throwIfCancelled();
+      final stagedFiles = await _scanExtractedFiles(staging, cancellationToken);
+      if (!_compareExtractedFiles(stagedFiles, pair.manifest)) {
         throw const LocalArchiveException(
           'Extracted files do not match the archive manifest',
         );
@@ -1164,6 +1409,7 @@ class LocalArchiveService {
       final manifestByPath = {
         for (final entry in pair.manifest.entries) entry.path: entry,
       };
+      var completedBytes = 0;
       for (var i = 0; i < stagedFiles.length; i++) {
         cancellationToken.throwIfCancelled();
         final staged = stagedFiles[i];
@@ -1175,31 +1421,36 @@ class LocalArchiveService {
           throw const LocalArchiveException('Unsafe restore destination');
         }
         final destination = File(destinationPath);
+        final manifestEntry = manifestByPath[staged.archivePath]!;
         if (await destination.exists()) {
           if (!preserveExisting) {
             throw LocalArchiveException(
               'Restore destination already exists: ${staged.archivePath}',
             );
           }
-          continue;
+        } else {
+          await destination.parent.create(recursive: true);
+          await staged.file.rename(destination.path);
+          try {
+            await destination.setLastModified(
+              DateTime.fromMillisecondsSinceEpoch(
+                manifestEntry.modifiedAtMillis,
+              ),
+            );
+          } catch (_) {
+            // Some document providers do not support preserving timestamps. A
+            // later compression still verifies content hashes before deletion.
+          }
         }
-        await destination.parent.create(recursive: true);
-        await staged.file.rename(destination.path);
-        final manifestEntry = manifestByPath[staged.archivePath]!;
-        try {
-          await destination.setLastModified(
-            DateTime.fromMillisecondsSinceEpoch(manifestEntry.modifiedAtMillis),
-          );
-        } catch (_) {
-          // Some document providers do not support preserving timestamps. A
-          // later compression still verifies content hashes before deletion.
-        }
+        completedBytes += manifestEntry.size;
         onProgress?.call(
           LocalArchiveProgress(
-            operation: LocalArchiveOperation.restore,
+            operation: LocalArchiveOperation.finalize,
             completedFiles: i + 1,
             totalFiles: stagedFiles.length,
             currentPath: staged.archivePath,
+            completedBytes: completedBytes,
+            totalBytes: pair.manifest.uncompressedBytes,
           ),
         );
       }
@@ -1208,10 +1459,89 @@ class LocalArchiveService {
     }
   }
 
+  Future<void> _extractArchive(
+    File archive,
+    Directory staging,
+    ArchiveManifest manifest,
+    LocalArchiveCancellationToken cancellationToken,
+    LocalArchiveProgressCallback? onProgress,
+  ) async {
+    cancellationToken.throwIfCancelled();
+    final receivePort = ReceivePort();
+    final completion = Completer<void>();
+    SendPort? controlPort;
+    late final Isolate worker;
+    late final StreamSubscription<Object?> subscription;
+    worker = await Isolate.spawn<List<Object?>>(_extractArchiveWorker, [
+      receivePort.sendPort,
+      archive.path,
+      staging.path,
+      {
+        for (final entry in manifest.entries)
+          entry.path: [entry.size, entry.sha256],
+      },
+    ], onExit: receivePort.sendPort);
+    subscription = receivePort.listen((message) {
+      if (completion.isCompleted) return;
+      if (message == null) {
+        completion.completeError(
+          const LocalArchiveException(
+            'Compressed comic opening worker stopped unexpectedly',
+          ),
+        );
+        return;
+      }
+      if (message is! List || message.isEmpty) return;
+      switch (message[0]) {
+        case _archiveWorkerReady:
+          controlPort = message[1] as SendPort;
+          controlPort!.send(!cancellationToken.isCancelled);
+          break;
+        case _archiveWorkerProgress:
+          onProgress?.call(
+            LocalArchiveProgress(
+              operation: LocalArchiveOperation.restore,
+              completedFiles: message[1] as int,
+              totalFiles: manifest.entries.length,
+              currentPath: message[3] as String,
+              completedBytes: message[2] as int,
+              totalBytes: manifest.uncompressedBytes,
+            ),
+          );
+          controlPort?.send(!cancellationToken.isCancelled);
+          break;
+        case _archiveWorkerDone:
+          completion.complete();
+          break;
+        case _archiveWorkerError:
+          completion.completeError(
+            LocalArchiveException(message[1].toString()),
+            StackTrace.fromString(message[2].toString()),
+          );
+          break;
+        case _archiveWorkerCancelled:
+          completion.completeError(const LocalArchiveCancelledException());
+          break;
+      }
+    });
+    unawaited(
+      cancellationToken.whenCancelled.then((_) {
+        controlPort?.send(false);
+      }),
+    );
+    try {
+      await completion.future;
+      cancellationToken.throwIfCancelled();
+    } finally {
+      worker.kill(priority: Isolate.immediate);
+      await subscription.cancel();
+      receivePort.close();
+    }
+  }
+
   Future<List<_LooseFile>> _scanExtractedFiles(
     Directory root,
     LocalArchiveCancellationToken cancellationToken,
-    LocalArchiveProgressCallback? onProgress,
   ) async {
     final files = <File>[];
     await for (final entity in root.list(recursive: true, followLinks: false)) {
@@ -1238,19 +1568,25 @@ class LocalArchiveService {
           archivePath: path,
           size: stat.size,
           modifiedAtMillis: stat.modified.millisecondsSinceEpoch,
-          sha256: await _hashFile(file, cancellationToken),
-        ),
-      );
-      onProgress?.call(
-        LocalArchiveProgress(
-          operation: LocalArchiveOperation.restore,
-          completedFiles: i + 1,
-          totalFiles: files.length,
-          currentPath: path,
+          // Extraction verifies each entry before writing it to staging.
+          sha256: null,
         ),
       );
     }
     return result;
+  }
+
+  bool _compareExtractedFiles(
+    List<_LooseFile> files,
+    ArchiveManifest manifest,
+  ) {
+    if (files.length != manifest.entries.length) return false;
+    final expected = {for (final entry in manifest.entries) entry.path: entry};
+    for (final file in files) {
+      final entry = expected[file.archivePath];
+      if (entry == null || entry.size != file.size) return false;
+    }
+    return true;
   }
 
   Future<void> _deleteVerifiedLooseFiles(
@@ -1275,8 +1611,12 @@ class LocalArchiveService {
         continue;
       }
       final stat = await file.file.stat();
-      final currentHash = await _hashFile(file.file, cancellationToken);
-      if (stat.size != expected.size || currentHash != expected.sha256) {
+      // Content was already checked against the manifest before and after ZIP
+      // creation. Re-check metadata at the deletion boundary so a normal
+      // concurrent edit is never removed, without reading every page yet
+      // another time.
+      if (stat.size != expected.size ||
+          stat.modified.millisecondsSinceEpoch != expected.modifiedAtMillis) {
         throw LocalArchiveException(
           'Comic file changed before cleanup: ${file.archivePath}',
         );
@@ -1360,14 +1700,14 @@ class LocalArchiveService {
     return true;
   }
 
-  bool _sameFiles(List<_LooseFile> before, List<_LooseFile> after) {
+  bool _sameFileMetadata(List<_LooseFile> before, List<_LooseFile> after) {
     if (before.length != after.length) return false;
     for (var i = 0; i < before.length; i++) {
       final a = before[i];
       final b = after[i];
       if (a.archivePath != b.archivePath ||
           a.size != b.size ||
-          a.sha256 != b.sha256) {
+          a.modifiedAtMillis != b.modifiedAtMillis) {
         return false;
       }
     }
@@ -1578,17 +1918,24 @@ class LocalArchiveService {
   }
 }
 
-Future<Map<String, String>> _hashArchiveEntriesWithBoundedScratch(
-  String archivePath,
-) async {
-  final scratch = Directory('$archivePath.verify-${const Uuid().v4()}');
-  await scratch.create(recursive: true);
+void _hashArchiveWorker(List<Object?> request) async {
+  final sendPort = request[0] as SendPort;
+  final archivePath = request[1] as String;
+  final controlPort = ReceivePort();
+  final control = StreamIterator<Object?>(controlPort);
+  sendPort.send([_archiveWorkerReady, controlPort.sendPort]);
   ZipFile? zip;
+  final hashes = <String, String>{};
+  Object? pendingError;
+  StackTrace? pendingStackTrace;
   try {
+    if (!await control.moveNext() || control.current != true) {
+      throw const LocalArchiveCancelledException();
+    }
     zip = ZipFile.openRead(archivePath);
-    final hashes = <String, String>{};
     final caseInsensitivePaths = <String>{};
     final entries = zip.getAllEntries();
+    var completedBytes = 0;
     for (var index = 0; index < entries.length; index++) {
       final entry = entries[index];
       if (entry.isDir) {
@@ -1598,39 +1945,151 @@ Future<Map<String, String>> _hashArchiveEntriesWithBoundedScratch(
       if (!caseInsensitivePaths.add(path.toLowerCase())) {
         throw LocalArchiveException('Duplicate archive entry: $path');
       }
-      final extracted = File(p.join(scratch.path, 'entry-$index'));
-      try {
-        entry.writeToFile(extracted.path);
-        hashes[path] = (await sha256.bind(extracted.openRead()).first)
-            .toString();
-      } finally {
-        await extracted.deleteIgnoreError();
+      final bytes = entry.read();
+      hashes[path] = sha256.convert(bytes).toString();
+      completedBytes += entry.size;
+      sendPort.send([_archiveWorkerProgress, index + 1, completedBytes, path]);
+      if (!await control.moveNext() || control.current != true) {
+        throw const LocalArchiveCancelledException();
       }
     }
-    return hashes;
+  } catch (error, stackTrace) {
+    pendingError = error;
+    pendingStackTrace = stackTrace;
   } finally {
     zip?.close();
-    await scratch.deleteIgnoreError(recursive: true);
+    await control.cancel();
+    controlPort.close();
+  }
+  if (pendingError is LocalArchiveCancelledException) {
+    sendPort.send(const [_archiveWorkerCancelled]);
+  } else if (pendingError != null) {
+    sendPort.send([
+      _archiveWorkerError,
+      pendingError.toString(),
+      pendingStackTrace.toString(),
+    ]);
+  } else {
+    sendPort.send([_archiveWorkerDone, hashes]);
   }
 }
 
-void _writeZipSynchronously(
-  String outputPath,
-  List<String> names,
-  List<String> sourceFiles,
-) {
-  if (names.length != sourceFiles.length) {
-    throw const LocalArchiveException('Archive input list length mismatch');
+void _extractArchiveWorker(List<Object?> request) async {
+  final sendPort = request[0] as SendPort;
+  final archivePath = request[1] as String;
+  final stagingPath = p.normalize(p.absolute(request[2] as String));
+  final expected = Map<String, Object?>.from(request[3] as Map);
+  final controlPort = ReceivePort();
+  final control = StreamIterator<Object?>(controlPort);
+  sendPort.send([_archiveWorkerReady, controlPort.sendPort]);
+  ZipFile? zip;
+  Object? pendingError;
+  StackTrace? pendingStackTrace;
+  try {
+    if (!await control.moveNext() || control.current != true) {
+      throw const LocalArchiveCancelledException();
+    }
+    zip = ZipFile.openRead(archivePath);
+    final entries = zip.getAllEntries();
+    if (entries.length != expected.length) {
+      throw const LocalArchiveException('Archive entry count does not match');
+    }
+    final seen = <String>{};
+    var completedBytes = 0;
+    for (var index = 0; index < entries.length; index++) {
+      final entry = entries[index];
+      if (entry.isDir) {
+        throw const LocalArchiveException('Archive contains a directory entry');
+      }
+      final path = normalizeLocalArchiveEntryPath(entry.name);
+      if (!seen.add(path.toLowerCase())) {
+        throw LocalArchiveException('Duplicate archive entry: $path');
+      }
+      final expectedValue = expected[path];
+      if (expectedValue is! List || expectedValue.length != 2) {
+        throw LocalArchiveException('Unexpected archive entry: $path');
+      }
+      final expectedSize = expectedValue[0] as int;
+      final expectedHash = expectedValue[1] as String;
+      final bytes = entry.read();
+      if (bytes.length != expectedSize ||
+          sha256.convert(bytes).toString() != expectedHash) {
+        throw LocalArchiveException(
+          'Archive entry checksum does not match manifest: $path',
+        );
+      }
+      final destination = p.normalize(
+        p.absolute(p.joinAll([stagingPath, ...path.split('/')])),
+      );
+      if (!p.isWithin(stagingPath, destination)) {
+        throw const LocalArchiveException('Unsafe restore destination');
+      }
+      final output = File(destination);
+      output.parent.createSync(recursive: true);
+      output.writeAsBytesSync(bytes);
+      completedBytes += expectedSize;
+      sendPort.send([_archiveWorkerProgress, index + 1, completedBytes, path]);
+      if (!await control.moveNext() || control.current != true) {
+        throw const LocalArchiveCancelledException();
+      }
+    }
+  } catch (error, stackTrace) {
+    pendingError = error;
+    pendingStackTrace = stackTrace;
+  } finally {
+    zip?.close();
+    await control.cancel();
+    controlPort.close();
   }
+  if (pendingError is LocalArchiveCancelledException) {
+    sendPort.send(const [_archiveWorkerCancelled]);
+  } else if (pendingError != null) {
+    sendPort.send([
+      _archiveWorkerError,
+      pendingError.toString(),
+      pendingStackTrace.toString(),
+    ]);
+  } else {
+    sendPort.send(const [_archiveWorkerDone]);
+  }
+}
+
+const int _archiveWorkerProgress = 0;
+const int _archiveWorkerDone = 1;
+const int _archiveWorkerError = 2;
+const int _archiveWorkerReady = 3;
+const int _archiveWorkerCancelled = 4;
+
+void _writeZipWorker(List<Object?> request) async {
+  final sendPort = request[0] as SendPort;
+  final outputPath = request[1] as String;
+  final names = (request[2] as List).cast<String>();
+  final sourceFiles = (request[3] as List).cast<String>();
+  final sizes = (request[4] as List).cast<int>();
+  final controlPort = ReceivePort();
+  final control = StreamIterator<Object?>(controlPort);
+  sendPort.send([_archiveWorkerReady, controlPort.sendPort]);
   final encoder = archive_io.ZipFileEncoder();
+  var completedBytes = 0;
   var opened = false;
   Object? pendingError;
   StackTrace? pendingStackTrace;
   try {
+    if (names.length != sourceFiles.length || names.length != sizes.length) {
+      throw const LocalArchiveException('Archive input list length mismatch');
+    }
+    if (!await control.moveNext() || control.current != true) {
+      throw const LocalArchiveCancelledException();
+    }
     encoder.create(outputPath, level: 1);
     opened = true;
     for (var index = 0; index < names.length; index++) {
       encoder.addFileSync(File(sourceFiles[index]), names[index], 1);
+      completedBytes += sizes[index];
+      sendPort.send([_archiveWorkerProgress, index + 1, completedBytes]);
+      if (!await control.moveNext() || control.current != true) {
+        throw const LocalArchiveCancelledException();
+      }
     }
   } catch (error, stackTrace) {
     pendingError = error;
@@ -1644,8 +2103,18 @@ void _writeZipSynchronously(
       pendingStackTrace ??= stackTrace;
     }
   }
-  if (pendingError != null) {
-    Error.throwWithStackTrace(pendingError, pendingStackTrace!);
+  await control.cancel();
+  controlPort.close();
+  if (pendingError is LocalArchiveCancelledException) {
+    sendPort.send(const [_archiveWorkerCancelled]);
+  } else if (pendingError != null) {
+    sendPort.send([
+      _archiveWorkerError,
+      pendingError.toString(),
+      pendingStackTrace.toString(),
+    ]);
+  } else {
+    sendPort.send(const [_archiveWorkerDone]);
   }
 }
 

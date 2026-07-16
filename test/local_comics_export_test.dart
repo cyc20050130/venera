@@ -55,7 +55,7 @@ void main() {
     );
     expect(
       localArchiveUiActionForState(LocalStorageState.expanded),
-      LocalArchiveUiAction.releaseExtracted,
+      LocalArchiveUiAction.recompress,
     );
     expect(
       localArchiveUiActionForState(LocalStorageState.dirty),
@@ -73,13 +73,14 @@ void main() {
 
   test('archive badges expose persistent and active states', () {
     expect(localArchiveBadgeKey(null), isNull);
-    expect(localArchiveBadgeKey(LocalStorageState.archived), 'Archived');
-    expect(localArchiveBadgeKey(LocalStorageState.expanded), 'Expanded');
-    expect(localArchiveBadgeKey(LocalStorageState.dirty), 'Archive modified');
-    expect(localArchiveBadgeKey(LocalStorageState.error), 'Archive error');
+    expect(localArchiveBadgeKey(LocalStorageState.loose), 'Uncompressed');
+    expect(localArchiveBadgeKey(LocalStorageState.archived), 'Compressed');
+    expect(localArchiveBadgeKey(LocalStorageState.expanded), 'Compressed');
+    expect(localArchiveBadgeKey(LocalStorageState.dirty), 'Uncompressed');
+    expect(localArchiveBadgeKey(LocalStorageState.error), 'Compression error');
     expect(
       localArchiveBadgeKey(LocalStorageState.archived, operationRunning: true),
-      'Archiving',
+      'Processing',
     );
   });
 
@@ -121,7 +122,7 @@ void main() {
           totalFiles: 10,
         ),
       ),
-      closeTo(0.1, 0.0001),
+      closeTo(0.075, 0.0001),
     );
     expect(
       localArchiveOperationProgress(
@@ -131,7 +132,7 @@ void main() {
           totalFiles: 10,
         ),
       ),
-      closeTo(0.5, 0.0001),
+      closeTo(0.375, 0.0001),
     );
     expect(
       localArchiveOperationProgress(
@@ -141,7 +142,37 @@ void main() {
           totalFiles: 10,
         ),
       ),
-      closeTo(0.9, 0.0001),
+      closeTo(0.95, 0.0001),
+    );
+  });
+
+  test('archive progress and remaining time prefer byte progress', () {
+    final progress = const LocalArchiveProgress(
+      operation: LocalArchiveOperation.compress,
+      completedFiles: 1,
+      totalFiles: 10,
+      completedBytes: 500,
+      totalBytes: 1000,
+    );
+    expect(progress.fraction, 0.5);
+    expect(
+      estimateLocalArchiveRemaining(
+        elapsed: const Duration(seconds: 10),
+        progress: 0.25,
+      ),
+      const Duration(seconds: 30),
+    );
+    expect(
+      estimateLocalArchiveRemaining(
+        elapsed: const Duration(seconds: 1),
+        progress: 0.25,
+      ),
+      isNull,
+    );
+    expect(formatLocalArchiveRemaining(const Duration(seconds: 65)), '1:05');
+    expect(
+      formatLocalArchiveRemaining(const Duration(seconds: 3665)),
+      '1:01:05',
     );
   });
 

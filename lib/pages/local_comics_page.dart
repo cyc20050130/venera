@@ -39,7 +39,6 @@ LocalSortType normalizeLocalComicsSortType(Object? value) {
 @visibleForTesting
 enum LocalArchiveUiAction {
   compress,
-  releaseExtracted,
   recompress,
   restore,
   none,
@@ -50,7 +49,7 @@ LocalArchiveUiAction localArchiveUiActionForState(LocalStorageState? state) {
   return switch (state) {
     null || LocalStorageState.loose => LocalArchiveUiAction.compress,
     LocalStorageState.archived => LocalArchiveUiAction.restore,
-    LocalStorageState.expanded => LocalArchiveUiAction.releaseExtracted,
+    LocalStorageState.expanded => LocalArchiveUiAction.recompress,
     LocalStorageState.dirty => LocalArchiveUiAction.recompress,
     LocalStorageState.missing ||
     LocalStorageState.error => LocalArchiveUiAction.none,
@@ -62,28 +61,19 @@ String? localArchiveBadgeKey(
   LocalStorageState? state, {
   bool operationRunning = false,
 }) {
-  if (operationRunning) return 'Archiving';
+  if (operationRunning) return 'Processing';
   return switch (state) {
     null => null,
-    LocalStorageState.loose => 'Not archived',
-    LocalStorageState.archived => 'Archived',
-    LocalStorageState.expanded => 'Expanded',
-    LocalStorageState.dirty => 'Archive modified',
+    LocalStorageState.loose || LocalStorageState.dirty => 'Uncompressed',
+    LocalStorageState.archived || LocalStorageState.expanded => 'Compressed',
     LocalStorageState.missing => 'Files missing',
-    LocalStorageState.error => 'Archive error',
+    LocalStorageState.error => 'Compression error',
   };
 }
 
 @visibleForTesting
 double localArchiveOperationProgress(LocalArchiveProgress progress) {
-  final fraction = progress.fraction.clamp(0.0, 1.0);
-  return switch (progress.operation) {
-    LocalArchiveOperation.inspect => fraction * 0.2,
-    LocalArchiveOperation.compress => 0.2 + fraction * 0.6,
-    LocalArchiveOperation.restore => 0.1 + fraction * 0.8,
-    LocalArchiveOperation.cleanup => 0.8 + fraction * 0.2,
-    LocalArchiveOperation.reconcile => fraction,
-  };
+  return localArchiveOverallProgress(progress);
 }
 
 @visibleForTesting
@@ -97,7 +87,7 @@ String summarizeLocalArchiveFailures(
         .toString()
         .replaceFirst('LocalArchiveException: ', '')
         .trim();
-    final key = reason.isEmpty ? 'Unknown archive error' : reason;
+    final key = reason.isEmpty ? 'Unknown compression error' : reason;
     counts[key] = (counts[key] ?? 0) + 1;
   }
   final entries = counts.entries.toList()
@@ -305,16 +295,7 @@ class _LocalComicsPageState extends State<LocalComicsPage> {
       LocalArchiveUiAction.compress => [
         MenuEntry(
           icon: Icons.archive_outlined,
-          text: 'Compress local files'.tl,
-          onClick: () => unawaited(
-            _runArchiveOperation([comic], _LocalArchiveUiOperation.compress),
-          ),
-        ),
-      ],
-      LocalArchiveUiAction.releaseExtracted => [
-        MenuEntry(
-          icon: Icons.inventory_2_outlined,
-          text: 'Release extracted files'.tl,
+          text: 'Compress comic'.tl,
           onClick: () => unawaited(
             _runArchiveOperation([comic], _LocalArchiveUiOperation.compress),
           ),
@@ -323,7 +304,7 @@ class _LocalComicsPageState extends State<LocalComicsPage> {
       LocalArchiveUiAction.recompress => [
         MenuEntry(
           icon: Icons.sync,
-          text: 'Recompress local files'.tl,
+          text: 'Compress comic'.tl,
           onClick: () => unawaited(
             _runArchiveOperation([comic], _LocalArchiveUiOperation.compress),
           ),
@@ -332,7 +313,7 @@ class _LocalComicsPageState extends State<LocalComicsPage> {
       LocalArchiveUiAction.restore => [
         MenuEntry(
           icon: Icons.unarchive_outlined,
-          text: 'Restore archived files'.tl,
+          text: 'Open compressed comic'.tl,
           onClick: () => unawaited(
             _runArchiveOperation([comic], _LocalArchiveUiOperation.restore),
           ),
@@ -355,7 +336,7 @@ class _LocalComicsPageState extends State<LocalComicsPage> {
     final skipped = requestedComics.length - targets.length;
     if (targets.isEmpty) {
       context.showMessage(
-        message: 'Only Venera-managed comics can be archived.'.tl,
+        message: 'Only Venera-managed comics can be compressed.'.tl,
       );
       return;
     }
@@ -363,7 +344,7 @@ class _LocalComicsPageState extends State<LocalComicsPage> {
     final token = LocalArchiveCancellationToken();
     final operationText = switch (operation) {
       _LocalArchiveUiOperation.compress => 'Compressing'.tl,
-      _LocalArchiveUiOperation.restore => 'Restoring'.tl,
+      _LocalArchiveUiOperation.restore => 'Opening'.tl,
     };
     setState(() {
       _archiveOperationRunning = true;
@@ -387,6 +368,8 @@ class _LocalComicsPageState extends State<LocalComicsPage> {
     var completed = 0;
     var cancelled = false;
     var lastDisplayedProgress = -1.0;
+    var lastMessageElapsed = Duration.zero;
+    final operationStopwatch = Stopwatch()..start();
     try {
       for (var index = 0; index < targets.length; index++) {
         final comic = targets[index];
@@ -407,9 +390,31 @@ class _LocalComicsPageState extends State<LocalComicsPage> {
             0.0,
             1.0,
           );
-          if (overall - lastDisplayedProgress >= 0.01 || overall == 1.0) {
-            lastDisplayedProgress = overall;
-            loadingController.setProgress(overall);
+          final monotonic = overall > lastDisplayedProgress
+              ? overall
+              : lastDisplayedProgress.clamp(0.0, 1.0);
+          final elapsed = operationStopwatch.elapsed;
+          if (monotonic - lastDisplayedProgress >= 0.005 ||
+              elapsed - lastMessageElapsed >=
+                  const Duration(milliseconds: 500) ||
+              monotonic == 1.0) {
+            lastDisplayedProgress = monotonic;
+            lastMessageElapsed = elapsed;
+            loadingController.setProgress(monotonic);
+            final remaining = estimateLocalArchiveRemaining(
+              elapsed: elapsed,
+              progress: monotonic,
+            );
+            final base = '@action @current/@total'.tlParams({
+              'action': operationText,
+              'current': index + 1,
+              'total': targets.length,
+            });
+            final stage = localArchiveProgressStageKey(progress.operation).tl;
+            final eta = remaining == null
+                ? ''
+                : ' · ${'Estimated remaining @time'.tlParams({'time': formatLocalArchiveRemaining(remaining)})}';
+            loadingController.setMessage('$base · $stage$eta');
           }
         }
 
@@ -459,22 +464,22 @@ class _LocalComicsPageState extends State<LocalComicsPage> {
     if (!mounted) return;
     unawaited(_refreshArchiveStates(targetComics: targets));
     if (cancelled || token.isCancelled) {
-      context.showMessage(message: 'Archive operation canceled'.tl);
+      context.showMessage(message: 'Operation canceled'.tl);
       return;
     }
     if (failures.isNotEmpty) {
       final detail = summarizeLocalArchiveFailures(failures);
       context.showMessage(
         message:
-            '${'Archive failed for @count comics'.tlParams({'count': failures.length})}: $detail',
+            '${'Operation failed for @count comics'.tlParams({'count': failures.length})}: $detail',
       );
       return;
     }
     final resultMessage = switch (operation) {
-      _LocalArchiveUiOperation.compress => 'Archived @count comics'.tlParams({
+      _LocalArchiveUiOperation.compress => 'Compressed @count comics'.tlParams({
         'count': completed,
       }),
-      _LocalArchiveUiOperation.restore => 'Restored @count comics'.tlParams({
+      _LocalArchiveUiOperation.restore => 'Opened @count comics'.tlParams({
         'count': completed,
       }),
     };
@@ -491,7 +496,7 @@ class _LocalComicsPageState extends State<LocalComicsPage> {
         if (selected.any(_canArchive))
           MenuEntry(
             icon: Icons.archive_outlined,
-            text: 'Compress local files'.tl,
+            text: 'Compress comic'.tl,
             onClick: () => unawaited(
               _runArchiveOperation(selected, _LocalArchiveUiOperation.compress),
             ),
