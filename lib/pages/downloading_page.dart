@@ -1,6 +1,9 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:venera/components/components.dart';
 import 'package:venera/foundation/app.dart';
+import 'package:venera/foundation/background_task_notification.dart';
 import 'package:venera/foundation/image_provider/cached_image.dart';
 import 'package:venera/foundation/local.dart';
 import 'package:venera/network/download.dart';
@@ -21,6 +24,7 @@ class DownloadingPage extends StatefulWidget {
 
 class _DownloadingPageState extends State<DownloadingPage> {
   DownloadTask? firstTask;
+  final notificationService = BackgroundTaskNotificationService.instance;
 
   @override
   void didChangeDependencies() {
@@ -31,12 +35,15 @@ class _DownloadingPageState extends State<DownloadingPage> {
   @override
   void initState() {
     LocalManager().addListener(update);
+    notificationService.permissionChanges.addListener(update);
+    unawaited(notificationService.refreshPermissionStatus());
     super.initState();
   }
 
   @override
   void dispose() {
     LocalManager().removeListener(update);
+    notificationService.permissionChanges.removeListener(update);
     firstTask?.removeListener(update);
     super.dispose();
   }
@@ -60,15 +67,23 @@ class _DownloadingPageState extends State<DownloadingPage> {
 
   @override
   Widget build(BuildContext context) {
+    final showNotificationWarning =
+        notificationService.notificationNeedsAttention;
     return PopUpWidgetScaffold(
       title: "",
       body: ListView.builder(
-        itemCount: LocalManager().downloadingTasks.length + 1,
+        itemCount:
+            LocalManager().downloadingTasks.length +
+            1 +
+            (showNotificationWarning ? 1 : 0),
         itemBuilder: (BuildContext context, int i) {
           if (i == 0) {
             return buildTop();
           }
-          i--;
+          if (showNotificationWarning && i == 1) {
+            return buildNotificationWarning();
+          }
+          i -= showNotificationWarning ? 2 : 1;
 
           return _DownloadTaskTile(
             key: ValueKey(LocalManager().downloadingTasks[i]),
@@ -76,6 +91,42 @@ class _DownloadingPageState extends State<DownloadingPage> {
           );
         },
       ),
+    );
+  }
+
+  Widget buildNotificationWarning() {
+    final serviceError =
+        notificationService.permission ==
+        BackgroundTaskNotificationPermission.error;
+    return Material(
+      color: context.colorScheme.errorContainer,
+      child: Row(
+        children: [
+          Icon(
+            Icons.notifications_off_outlined,
+            color: context.colorScheme.onErrorContainer,
+          ),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Text(
+              (serviceError
+                      ? 'Android could not start background task notifications. Check system notification settings.'
+                      : 'Notification permission is disabled. Background task notifications are hidden by Android.')
+                  .tl,
+              style: TextStyle(color: context.colorScheme.onErrorContainer),
+            ),
+          ),
+          TextButton(
+            onPressed: () async {
+              final enabled = await notificationService.ensurePermission();
+              if (!enabled) {
+                await notificationService.openNotificationSettings();
+              }
+            },
+            child: Text('Enable notifications'.tl),
+          ),
+        ],
+      ).paddingHorizontal(16).paddingVertical(10),
     );
   }
 

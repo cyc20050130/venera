@@ -472,7 +472,10 @@
     "Compressed @count comics": "已压缩 @count 部漫画",
     "Opened @count comics": "已打开 @count 部漫画",
     "Skipped @count external comics": "已跳过 @count 部外部漫画",
-    "Mouse scroll speed": "鼠标滚动速度"
+    "Mouse scroll speed": "鼠标滚动速度",
+    "Notification permission is disabled. Background task notifications are hidden by Android.": "通知权限未开启，Android 已隐藏后台任务通知。",
+    "Android could not start background task notifications. Check system notification settings.": "Android 无法启动后台任务通知，请检查系统通知设置。",
+    "Enable notifications": "开启通知"
   },
   "zh_TW": {
     "Home": "首頁",
@@ -947,6 +950,9 @@
     "Compressed @count comics": "已壓縮 @count 部漫畫",
     "Opened @count comics": "已開啟 @count 部漫畫",
     "Skipped @count external comics": "已略過 @count 部外部漫畫",
-    "Mouse scroll speed": "滑鼠滾動速度"
+    "Mouse scroll speed": "滑鼠滾動速度",
+    "Notification permission is disabled. Background task notifications are hidden by Android.": "通知權限未開啟，Android 已隱藏背景工作通知。",
+    "Android could not start background task notifications. Check system notification settings.": "Android 無法啟動背景工作通知，請檢查系統通知設定。",
+    "Enable notifications": "開啟通知"
   }
 }

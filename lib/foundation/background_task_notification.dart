@@ -1,6 +1,7 @@
 import 'dart:async';
 
 import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:venera/foundation/app.dart';
 import 'package:venera/foundation/log.dart';
@@ -82,6 +83,7 @@ final class BackgroundTaskNotificationService {
   static const _notificationId = 4101;
   static const _channelId = 'venera_background_tasks';
   static const _updateInterval = Duration(milliseconds: 350);
+  static const _methodChannel = MethodChannel('venera/method_channel');
 
   final FlutterLocalNotificationsPlugin _notifications =
       FlutterLocalNotificationsPlugin();
@@ -92,6 +94,16 @@ final class BackgroundTaskNotificationService {
   bool _initialized = false;
   bool _permissionRequested = false;
   bool _serviceRunning = false;
+  BackgroundTaskNotificationPermission _permission =
+      BackgroundTaskNotificationPermission.unknown;
+  Future<bool>? _permissionCheck;
+
+  BackgroundTaskNotificationPermission get permission => _permission;
+
+  bool get notificationNeedsAttention =>
+      App.isAndroid &&
+      (_permission == BackgroundTaskNotificationPermission.disabled ||
+          _permission == BackgroundTaskNotificationPermission.error);
 
   Future<void> initialize() async {
     if (!App.isAndroid || _initialized) return;
@@ -109,6 +121,77 @@ final class BackgroundTaskNotificationService {
       );
     }
   }
+
+  Future<bool> refreshPermissionStatus() {
+    return ensurePermission(requestIfNeeded: false);
+  }
+
+  Future<bool> ensurePermission({bool requestIfNeeded = true}) {
+    if (!App.isAndroid) return Future<bool>.value(true);
+    final pending = _permissionCheck;
+    if (pending != null) return pending;
+    final check = _ensurePermission(requestIfNeeded: requestIfNeeded);
+    _permissionCheck = check;
+    return check.whenComplete(() {
+      if (identical(_permissionCheck, check)) _permissionCheck = null;
+    });
+  }
+
+  Future<bool> _ensurePermission({required bool requestIfNeeded}) async {
+    try {
+      final plugin = await _androidPlugin();
+      if (plugin == null) {
+        _setPermission(BackgroundTaskNotificationPermission.error);
+        return false;
+      }
+      var enabled = await plugin.areNotificationsEnabled() == true;
+      if (!enabled && requestIfNeeded && !_permissionRequested) {
+        _permissionRequested = true;
+        enabled = await plugin.requestNotificationsPermission() == true;
+        if (!enabled) {
+          enabled = await plugin.areNotificationsEnabled() == true;
+        }
+      }
+      _setPermission(
+        enabled
+            ? BackgroundTaskNotificationPermission.enabled
+            : BackgroundTaskNotificationPermission.disabled,
+      );
+      return enabled;
+    } catch (error, stackTrace) {
+      _setPermission(BackgroundTaskNotificationPermission.error);
+      Log.error(
+        'BackgroundTask',
+        'Notification permission check failed: $error',
+        stackTrace,
+      );
+      return false;
+    }
+  }
+
+  Future<void> openNotificationSettings() async {
+    if (!App.isAndroid) return;
+    try {
+      await _methodChannel.invokeMethod<void>('openNotificationSettings');
+    } catch (error, stackTrace) {
+      Log.error(
+        'BackgroundTask',
+        'Opening notification settings failed: $error',
+        stackTrace,
+      );
+    } finally {
+      await refreshPermissionStatus();
+    }
+  }
+
+  void _setPermission(BackgroundTaskNotificationPermission value) {
+    if (_permission == value) return;
+    _permission = value;
+    permissionChanges.value = value;
+  }
+
+  final ValueNotifier<BackgroundTaskNotificationPermission> permissionChanges =
+      ValueNotifier(BackgroundTaskNotificationPermission.unknown);
 
   void setCurrentTaskKey(String? value) {
     if (_currentTaskKey == value) return;
@@ -167,11 +250,8 @@ final class BackgroundTaskNotificationService {
     }
     final plugin = await _androidPlugin();
     if (plugin == null || data.taskKey != _currentTaskKey) return;
-    if (!_permissionRequested) {
-      _permissionRequested = true;
-      await plugin.requestNotificationsPermission();
-      if (data.taskKey != _currentTaskKey) return;
-    }
+    await ensurePermission();
+    if (data.taskKey != _currentTaskKey) return;
     final determinate = data.hasDeterminateProgress && data.progress.isFinite;
     final progress = determinate
         ? (data.progress.clamp(0.0, 1.0) * 1000).round()
@@ -192,18 +272,23 @@ final class BackgroundTaskNotificationService {
       indeterminate: !determinate,
       showWhen: false,
     );
-    await plugin.startForegroundService(
-      id: _notificationId,
-      title: buildBackgroundTaskNotificationTitle(data),
-      body: buildBackgroundTaskNotificationBody(data),
-      notificationDetails: details,
-      payload: '/downloads',
-      startType: AndroidServiceStartType.startSticky,
-      foregroundServiceTypes: const {
-        AndroidServiceForegroundType.foregroundServiceTypeDataSync,
-      },
-    );
-    _serviceRunning = true;
+    try {
+      await plugin.startForegroundService(
+        id: _notificationId,
+        title: buildBackgroundTaskNotificationTitle(data),
+        body: buildBackgroundTaskNotificationBody(data),
+        notificationDetails: details,
+        payload: '/downloads',
+        startType: AndroidServiceStartType.startSticky,
+        foregroundServiceTypes: const {
+          AndroidServiceForegroundType.foregroundServiceTypeDataSync,
+        },
+      );
+      _serviceRunning = true;
+    } catch (_) {
+      _setPermission(BackgroundTaskNotificationPermission.error);
+      rethrow;
+    }
   }
 
   Future<void> _stopService() async {
@@ -213,3 +298,5 @@ final class BackgroundTaskNotificationService {
     _serviceRunning = false;
   }
 }
+
+enum BackgroundTaskNotificationPermission { unknown, enabled, disabled, error }

@@ -136,6 +136,27 @@ class MainActivity : FlutterFragmentActivity() {
                     }
                 }
 
+                "openNotificationSettings" -> {
+                    val intent = Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS).apply {
+                        putExtra(Settings.EXTRA_APP_PACKAGE, packageName)
+                    }
+                    try {
+                        startContractForResult(
+                            ActivityResultContracts.StartActivityForResult(),
+                            intent
+                        ) { res.success(null) }
+                    } catch (error: Exception) {
+                        val fallback = Intent(
+                            Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                            Uri.parse("package:$packageName")
+                        )
+                        startContractForResult(
+                            ActivityResultContracts.StartActivityForResult(),
+                            fallback
+                        ) { res.success(null) }
+                    }
+                }
+
                 else -> res.notImplemented()
             }
         }
