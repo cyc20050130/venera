@@ -1033,8 +1033,11 @@ class LocalArchiveService {
     final paths = <File>[];
     await for (final entity in root.list(recursive: true, followLinks: false)) {
       cancellationToken.throwIfCancelled();
-      final type = await FileSystemEntity.type(entity.path, followLinks: false);
-      if (type == FileSystemEntityType.link) {
+      // Directory.list already resolves the entry kind. Re-statting every
+      // entry can report notFound for otherwise readable files on some
+      // Android external-storage providers, which made a populated comic look
+      // empty and prevented compression from ever reaching the ZIP writer.
+      if (entity is Link) {
         throw LocalArchiveException('Links are not supported: ${entity.path}');
       }
       final normalizedPath = p.normalize(entity.path);
@@ -1042,11 +1045,11 @@ class LocalArchiveService {
           p.isWithin(metadataPath, normalizedPath)) {
         continue;
       }
-      if (type != FileSystemEntityType.file ||
+      if (entity is! File ||
           _normalizedComparablePath(normalizedPath) == coverPath) {
         continue;
       }
-      paths.add(File(normalizedPath));
+      paths.add(entity);
     }
     paths.sort((a, b) => a.path.compareTo(b.path));
     final result = <_LooseFile>[];
@@ -1213,12 +1216,11 @@ class LocalArchiveService {
     final files = <File>[];
     await for (final entity in root.list(recursive: true, followLinks: false)) {
       cancellationToken.throwIfCancelled();
-      final type = await FileSystemEntity.type(entity.path, followLinks: false);
-      if (type == FileSystemEntityType.link) {
+      if (entity is Link) {
         throw const LocalArchiveException('Extracted archive contains a link');
       }
-      if (type == FileSystemEntityType.file) {
-        files.add(File(entity.path));
+      if (entity is File) {
+        files.add(entity);
       }
     }
     files.sort((a, b) => a.path.compareTo(b.path));

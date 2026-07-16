@@ -42,6 +42,10 @@ function(APPLY_STANDARD_SETTINGS TARGET)
   target_compile_options(${TARGET} PRIVATE /W4 /WX /wd"4100" /wd4267)
   target_compile_options(${TARGET} PRIVATE /EHsc)
   target_compile_definitions(${TARGET} PRIVATE "_HAS_EXCEPTIONS=0")
+  # cppwinrt still includes <experimental/coroutine> for some Flutter plugins.
+  # MSVC 14.51 turns that deprecation into STL1011 unless it is acknowledged.
+  target_compile_definitions(${TARGET} PRIVATE
+    "_SILENCE_EXPERIMENTAL_COROUTINE_DEPRECATION_WARNINGS")
   target_compile_definitions(${TARGET} PRIVATE "$<$<CONFIG:Debug>:_DEBUG>")
 endfunction()
 
@@ -56,6 +60,13 @@ add_subdirectory("runner")
 # Generated plugin build rules, which manage building the plugins and adding
 # them to the application.
 include(flutter/generated_plugins.cmake)
+
+# flutter_inappwebview_windows uses its own standard-settings function, so it
+# does not inherit the MSVC coroutine compatibility definition above.
+if(TARGET flutter_inappwebview_windows_plugin)
+  target_compile_definitions(flutter_inappwebview_windows_plugin PRIVATE
+    _SILENCE_EXPERIMENTAL_COROUTINE_DEPRECATION_WARNINGS)
+endif()
 
 
 # === Installation ===
