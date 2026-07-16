@@ -6,6 +6,7 @@ import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:venera/foundation/app.dart';
 import 'package:venera/foundation/log.dart';
 import 'package:venera/utils/io.dart';
+import 'package:venera/utils/translations.dart';
 
 @immutable
 final class BackgroundTaskNotificationData {
@@ -39,7 +40,8 @@ String buildBackgroundTaskNotificationTitle(
   BackgroundTaskNotificationData data,
 ) {
   final title = data.title.trim();
-  return title.isEmpty ? data.operation : '${data.operation}: $title';
+  final operation = translateBackgroundTaskProgressText(data.operation);
+  return title.isEmpty ? operation : '$operation: $title';
 }
 
 @visibleForTesting
@@ -51,14 +53,73 @@ String buildBackgroundTaskNotificationBody(
     final percent = (data.progress.clamp(0.0, 1.0) * 100).floor();
     parts.add('$percent%');
   }
-  final message = data.message.trim();
+  final message = translateBackgroundTaskProgressText(data.message.trim());
   if (message.isNotEmpty) parts.add(message);
   if (data.speed > 0) parts.add('${bytesToReadableString(data.speed)}/s');
   final remaining = data.estimatedRemaining;
   if (remaining != null && remaining > Duration.zero) {
-    parts.add('Remaining ${_formatRemaining(remaining)}');
+    parts.add(
+      '${_translateBackgroundTaskKey('Remaining')} ${_formatRemaining(remaining)}',
+    );
   }
-  return parts.isEmpty ? data.operation : parts.join(' - ');
+  return parts.isEmpty
+      ? translateBackgroundTaskProgressText(data.operation)
+      : parts.join(' - ');
+}
+
+const _backgroundTaskProgressKeys = <String>[
+  'Preparing compression...',
+  'Compression complete',
+  'Waiting to compress',
+  'Writing compressed file',
+  'Verifying compressed file',
+  'Opening compressed comic',
+  'Cleaning source files',
+  'Checking source files',
+  'Scanning files',
+  'Preparing comic',
+  'Fetching comic info...',
+  'Downloading cover...',
+  'Fetching image list',
+  'Downloading...',
+  'Resuming...',
+  'Compressing',
+  'Downloading',
+  'Paused',
+  'Skipped',
+  'Error',
+];
+
+String translateBackgroundTaskProgressText(
+  String value, {
+  String Function(String key)? translate,
+}) {
+  if (value.isEmpty) return value;
+  final translateKey = translate ?? _translateBackgroundTaskKey;
+  return value
+      .split('\n')
+      .map((line) {
+        for (final key in _backgroundTaskProgressKeys) {
+          if (line == key) return translateKey(key);
+          if (line.startsWith('$key ')) {
+            return '${translateKey(key)}${line.substring(key.length)}';
+          }
+          if (line.startsWith('$key:')) {
+            return '${translateKey(key)}${line.substring(key.length)}';
+          }
+        }
+        return line;
+      })
+      .join('\n');
+}
+
+String _translateBackgroundTaskKey(String key) {
+  try {
+    return key.tl;
+  } catch (_) {
+    // Translation assets are not initialized in headless isolates and unit tests.
+    return key;
+  }
 }
 
 String _formatRemaining(Duration value) {

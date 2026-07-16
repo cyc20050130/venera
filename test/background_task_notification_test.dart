@@ -61,4 +61,18 @@ void main() {
       isFalse,
     );
   });
+
+  test('background progress translation preserves counters and errors', () {
+    expect(
+      translateBackgroundTaskProgressText(
+        'Writing compressed file 4/10',
+        translate: (key) => key == 'Writing compressed file' ? '写入压缩文件' : key,
+      ),
+      '写入压缩文件 4/10',
+    );
+    expect(
+      translateBackgroundTaskProgressText('Error: disk full'),
+      endsWith(': disk full'),
+    );
+  });
 }

@@ -476,6 +476,16 @@
     "Notification permission is disabled. Background task notifications are hidden by Android.": "通知权限未开启，Android 已隐藏后台任务通知。",
     "Android could not start background task notifications. Check system notification settings.": "Android 无法启动后台任务通知，请检查系统通知设置。",
     "The downloads and compression notification channel is disabled.": "下载和压缩通知渠道未开启。",
+    "Preparing compression...": "正在准备压缩……",
+    "Compression complete": "压缩完成",
+    "Waiting to compress": "等待压缩",
+    "Fetching comic info...": "正在获取漫画信息……",
+    "Downloading cover...": "正在下载封面……",
+    "Fetching image list": "正在获取图片列表",
+    "Downloading...": "正在下载……",
+    "Resuming...": "正在继续……",
+    "Skipped": "已跳过",
+    "Remaining": "剩余",
     "Enable notifications": "开启通知"
   },
   "zh_TW": {
@@ -955,6 +965,16 @@
     "Notification permission is disabled. Background task notifications are hidden by Android.": "通知權限未開啟，Android 已隱藏背景工作通知。",
     "Android could not start background task notifications. Check system notification settings.": "Android 無法啟動背景工作通知，請檢查系統通知設定。",
     "The downloads and compression notification channel is disabled.": "下載和壓縮通知頻道未開啟。",
+    "Preparing compression...": "正在準備壓縮……",
+    "Compression complete": "壓縮完成",
+    "Waiting to compress": "等待壓縮",
+    "Fetching comic info...": "正在取得漫畫資訊……",
+    "Downloading cover...": "正在下載封面……",
+    "Fetching image list": "正在取得圖片清單",
+    "Downloading...": "正在下載……",
+    "Resuming...": "正在繼續……",
+    "Skipped": "已略過",
+    "Remaining": "剩餘",
     "Enable notifications": "開啟通知"
   }
 }

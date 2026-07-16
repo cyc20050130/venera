@@ -308,7 +308,11 @@ class _DownloadTaskTileState extends State<_DownloadTaskTile> {
                 ),
                 const Spacer(),
                 if (!widget.task.isPaused || widget.task.isError)
-                  Text(widget.task.message, style: ts.s12, maxLines: 3),
+                  Text(
+                    translateBackgroundTaskProgressText(widget.task.message),
+                    style: ts.s12,
+                    maxLines: 3,
+                  ),
                 const SizedBox(height: 4),
                 LinearProgressIndicator(value: widget.task.progress),
                 const SizedBox(height: 8),
